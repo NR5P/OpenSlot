@@ -179,6 +179,14 @@ pub struct KissConnection {
     writer: tokio::io::WriteHalf<TcpStream>,
     /// Received AX.25 frames `(kiss_command, frame)`, without KISS framing.
     pub frame_rx: mpsc::Receiver<(u8, Vec<u8>)>,
+    /// Holds the read half: stopped on drop, so the socket closes with the connection.
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for KissConnection {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl KissConnection {
@@ -186,7 +194,7 @@ impl KissConnection {
         let stream = TcpStream::connect((host, port)).await?;
         let (mut reader, writer) = tokio::io::split(stream);
         let (tx, frame_rx) = mpsc::channel(64);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut dec = KissDecoder::default();
             let mut buf = vec![0u8; 4096];
             loop {
@@ -202,7 +210,7 @@ impl KissConnection {
                 }
             }
         });
-        Ok(Self { writer, frame_rx })
+        Ok(Self { writer, frame_rx, reader })
     }
 
     /// Send VarAC's ADVANCED beacon (KISS 0x02).

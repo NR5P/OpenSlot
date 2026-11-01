@@ -12,6 +12,17 @@ pub struct VaraConnection {
     data_writer: tokio::io::WriteHalf<TcpStream>,
     pub event_rx: mpsc::Receiver<VaraEvent>,
     pub data_rx: mpsc::Receiver<Vec<u8>>,
+    /// The tasks holding the read halves: stopped on drop, so both sockets close with the
+    /// connection (else the modem keeps a stale client until it next writes to it)
+    readers: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl Drop for VaraConnection {
+    fn drop(&mut self) {
+        for r in &self.readers {
+            r.abort();
+        }
+    }
 }
 
 impl VaraConnection {
@@ -31,7 +42,7 @@ impl VaraConnection {
 
         // Read command port lines. VARA terminates them with CR only (no LF), so
         // line readers that wait for '\n' never see an event; split on either.
-        tokio::spawn(async move {
+        let cmd_task = tokio::spawn(async move {
             let mut reader = BufReader::new(cmd_reader);
             let mut buf = Vec::new();
             loop {
@@ -52,7 +63,7 @@ impl VaraConnection {
         });
 
         // Read data port as raw bytes
-        tokio::spawn(async move {
+        let data_task = tokio::spawn(async move {
             let mut reader = BufReader::new(data_reader);
             let mut buf = vec![0u8; 4096];
             loop {
@@ -73,6 +84,7 @@ impl VaraConnection {
             data_writer,
             event_rx,
             data_rx,
+            readers: [cmd_task, data_task],
         })
     }
 
@@ -154,5 +166,28 @@ mod tests {
         assert_eq!(got[1], VaraEvent::Ptt(true));
         assert!(matches!(got[2], VaraEvent::Connected { .. }));
         assert_eq!(got[3], VaraEvent::Ptt(false));
+    }
+
+    /// Dropping the connection (disconnecting from the modem) closes both sockets, so the
+    /// modem sees its client go at once.
+    #[tokio::test]
+    async fn drop_closes_both_sockets() {
+        use tokio::io::AsyncReadExt;
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut c, _) = cmd.accept().await.unwrap();
+            let (mut d, _) = data.accept().await.unwrap();
+            let mut b = [0u8; 16];
+            let wait = std::time::Duration::from_secs(2);
+            let c_eof = tokio::time::timeout(wait, c.read(&mut b)).await;
+            let d_eof = tokio::time::timeout(wait, d.read(&mut b)).await;
+            (matches!(c_eof, Ok(Ok(0))), matches!(d_eof, Ok(Ok(0))))
+        });
+        let v = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(v);
+        assert_eq!(server.await.unwrap(), (true, true));
     }
 }
