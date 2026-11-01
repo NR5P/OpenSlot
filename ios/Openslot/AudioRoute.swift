@@ -14,6 +14,12 @@ enum AudioRoute {
         try s.setPreferredSampleRate(48_000)
         try s.setPreferredIOBufferDuration(0.01)
         try s.setActive(true)
+        // On the iPhone's own speaker (testing only), measurement mode plays far too quietly for
+        // another device to decode; the default mode plays at full volume. A USB interface keeps
+        // measurement mode's untouched levels.
+        if s.currentRoute.outputs.contains(where: { $0.portType == .builtInSpeaker }) {
+            try? s.setMode(.default)
+        }
         // The built-in mic at the bottom, beside the speaker: where another phone's speaker faces.
         // This only picks among the built-in mics; it does not take the route from an interface.
         if let mic = s.availableInputs?.first(where: { $0.portType == .builtInMic }),
