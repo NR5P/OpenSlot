@@ -1,7 +1,7 @@
 # Openslot encryption and signing (Openslot ↔ Openslot only)
 
 Optional, off by default, and not part of VarAC: a VarAC station shows these tags as text.
-With both options off, Openslot never sends any of them. It still reads them from a
+With all its options off, Openslot never sends any of them. It still reads them from a
 partner, to check signatures and to hide the key announcement.
 Code: `src/varac/secure.rs`, with the session hooks in `src/varac/session.rs`
 (`secure_in`, `pump_tx`, `send_typed`).
@@ -27,9 +27,27 @@ encryption, 98 bytes without.
 The receiver trusts an identity key on first use, per base callsign. A different key later
 is kept aside and flagged until the operator accepts it.
 
+## Shared-key announcement `<OSP:…>`
+
+Sent instead of `<OSK:>` when *Use shared keys* is on and a shared key is set for the
+partner (by callsign, else one for `*`). Nothing in it is readable without that key: no
+identity key is sent.
+
+    version (1) = 1 | salt (16, random)
+      | ChaCha20-Poly1305(key, nonce = 12 zero bytes, aad = "OSP1", X25519 link key (32))
+
+`key` = HKDF-SHA256(salt, shared key bytes), info `"OSP1 " FROM ">" TO`. The shared key's
+bytes are PBKDF2-HMAC-SHA256 (100 000 rounds, salt `openslot shared key v1`) of the key as
+typed, upper-cased, with whitespace and `-` removed. 65 bytes, 87 characters.
+
+When both sides sent one that opens with their key, the link is encrypted as below, with
+the shared key's bytes as the HKDF salt (so both the shared key and the exchange are
+needed). An `<OSP:>` that doesn't open, an `<OSK:>` in answer to ours, or no announcement
+at all leaves the link in the clear, and what was held goes out as it is.
+
 ## Encrypted link `<OSE:…>`
 
-Only when both announcements carry flag 1. Until the partner's first frame arrives, the
+Only when both announcements carry flag 1, or both sides opened each other's `<OSP:>`. Until the partner's first frame arrives, the
 side with encryption on holds everything it would send, except its announcement and the
 callee's own first handshake frames (`<Q>` / opening, queued on `CONNECTED`). If that first
 frame is not an `<OSK:>` with flag 1, the link stays in the clear and the held frames go out

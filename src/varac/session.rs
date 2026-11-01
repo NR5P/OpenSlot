@@ -1583,11 +1583,17 @@ impl VaracSession {
     /// announcement, note when its first frame has none, and decrypt an encrypted frame.
     /// None when nothing is left to read.
     fn secure_in(&mut self, mut message: String) -> Option<String> {
-        use crate::varac::secure::{ENC_TAG, KEY_TAG};
+        use crate::varac::secure::{ENC_TAG, KEY_TAG, SHARED_TAG};
         let mut notes = Vec::new();
-        if let Some(rest) = message.strip_prefix(KEY_TAG) {
+        let announced = message.strip_prefix(KEY_TAG).map(|r| (r, false))
+            .or_else(|| message.strip_prefix(SHARED_TAG).map(|r| (r, true)));
+        if let Some((rest, shared)) = announced {
             let (payload, after) = rest.split_once('>').unwrap_or((rest, ""));
-            notes = self.secure.partner_key(&self.config.policy.secure, payload);
+            notes = if shared {
+                self.secure.partner_shared(payload)
+            } else {
+                self.secure.partner_key(&self.config.policy.secure, payload)
+            };
             let after = after.trim_start_matches("\r\n").to_string();
             // (VarAC numbers every frame: so do we, this one too)
             if after.trim().is_empty() {
@@ -2228,14 +2234,14 @@ impl VaracSession {
     /// What waits to be sent (VarAC's "In queue"): the frame in the modem first, then the queue.
     pub fn queued_texts(&self) -> Vec<String> {
         self.tx_inflight_text.iter().chain(self.tx_queue.iter().map(|(t, _, _)| t))
-            .filter(|t| !t.starts_with(crate::varac::secure::KEY_TAG))
+            .filter(|t| !crate::varac::secure::is_announcement(t))
             .map(|t| crate::varac::secure::strip_signatures(t)).collect()
     }
 
     /// CLR / EDIT: drop what hasn't been handed to the modem yet, returning its texts.
     pub fn take_queue(&mut self) -> Vec<String> {
         // (a signature is made again when the text is sent again)
-        let (key, rest): (Vec<_>, Vec<_>) = self.tx_queue.drain(..).partition(|(t, _, _)| t.starts_with(crate::varac::secure::KEY_TAG));
+        let (key, rest): (Vec<_>, Vec<_>) = self.tx_queue.drain(..).partition(|(t, _, _)| crate::varac::secure::is_announcement(t));
         self.tx_queue.extend(key);
         rest.into_iter().map(|(t, _, _)| crate::varac::secure::strip_signatures(&t)).collect()
     }
@@ -2262,9 +2268,9 @@ impl VaracSession {
             // list or an AI question, and the next can't be a file frame, a reply, a like,
             // typing or an AI question (as VarAC does)
             // (Openslot's key announcement always goes alone: it's never encrypted)
-            let head_ok = |t: &str| !["&IT&", "<SF:", "<SFM:", "<QSYU>", "<QSYD>", "<QSYF>", "<Q:", "<QF:", "<C:", "&L", "<BL:", crate::varac::secure::KEY_TAG]
+            let head_ok = |t: &str| !["&IT&", "<SF:", "<SFM:", "<QSYU>", "<QSYD>", "<QSYF>", "<Q:", "<QF:", "<C:", "&L", "<BL:", crate::varac::secure::KEY_TAG, crate::varac::secure::SHARED_TAG]
                 .iter().any(|p| t.starts_with(p)) && !t.to_ascii_uppercase().starts_with("AI:");
-            let next_ok = |t: &str| !["<SF", "<C:", "&L", "&IT&", crate::varac::secure::KEY_TAG].iter().any(|p| t.starts_with(p))
+            let next_ok = |t: &str| !["<SF", "<C:", "&L", "&IT&", crate::varac::secure::KEY_TAG, crate::varac::secure::SHARED_TAG].iter().any(|p| t.starts_with(p))
                 && !t.to_ascii_uppercase().starts_with("AI:");
             if head_ok(&text) && !text.starts_with("<SF") {
                 let mut joined = 1;
@@ -2278,7 +2284,7 @@ impl VaracSession {
                 }
             }
             // (our key announcement and a station ID on its own stay in the clear)
-            if self.secure.is_encrypted() && !text.starts_with(crate::varac::secure::KEY_TAG) && !crate::varac::secure::is_station_id(&text) {
+            if self.secure.is_encrypted() && !crate::varac::secure::is_announcement(&text) && !crate::varac::secure::is_station_id(&text) {
                 let sealed = self.secure.seal(&text).ok_or_else(|| std::io::Error::other("encryption failed: frame not sent"))?;
                 frame = framing::encode_frame(&sealed);
             }
@@ -4493,6 +4499,36 @@ mod secure_tests {
         s.send_chat("de W5TST <R+05>").await.unwrap();
         run(&mut s, 1300).await;
         assert_eq!(sent(&mut d, 1000).await.as_deref(), Some("de W5TST <R+05>"));
+    }
+
+    #[tokio::test]
+    async fn shared_key_link_sends_no_readable_key() {
+        let (mut s, mut c, mut d) = linked(false, false).await;
+        let secret = secure::generate_shared_secret();
+        s.config.policy.secure.set_shared(true);
+        s.config.policy.secure.add_shared(secure::SharedKey::new("club", "NR5P", &secret).unwrap());
+        run(&mut s, 300).await;
+        let ours = sent(&mut d, 1000).await.unwrap();
+        assert!(ours.starts_with(secure::SHARED_TAG), "{ours}");
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        run(&mut s, 1300).await;
+        assert!(sent(&mut d, 1000).await.unwrap().starts_with("de W5TST"));
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        s.send_typed("meet at the usual place").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 200).await, None);
+
+        let ps = SecurePolicy::default();
+        ps.set_shared(true);
+        ps.add_shared(secure::SharedKey::new("club", "W5TST", &secret).unwrap());
+        let (mut peer, theirs) = secure::Link::start(&ps, "NR5P", "W5TST");
+        let inner = ours.strip_prefix(secure::SHARED_TAG).and_then(|r| r.strip_suffix('>')).unwrap();
+        assert!(matches!(peer.partner_shared(inner)[..], [SecureNote::Link { encrypted: true, .. }]));
+        send(&mut d, &theirs.unwrap()).await;
+        let events = run(&mut s, 300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: true, .. }))), "{events:?}");
+        let frame = sent(&mut d, 1000).await.unwrap();
+        assert_eq!(peer.open(&frame).unwrap(), "meet at the usual place");
     }
 
     #[tokio::test]

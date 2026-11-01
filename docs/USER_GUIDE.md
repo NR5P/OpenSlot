@@ -343,10 +343,11 @@ Right-click **FREQ SCHEDULE** to edit the lists. All three need rig control.
 
 ## Encryption and signing
 
-Two separate options in **Settings → Security**, both off unless you turn them on. They
-work only between Openslot stations. With both off, Openslot works exactly as it always
-has. Turning one on is all there is to it: your key is made for you, and keys are swapped
-by themselves when you link.
+Three separate options in **Settings → Security**, all off unless you turn them on. They
+work only between Openslot stations. With all three off, Openslot works exactly as it always
+has. For the first two, turning one on is all there is to it: your key is made for you,
+and keys are swapped by themselves when you link. Shared keys are for when you'd rather
+arrange a key with the other station beforehand.
 
 > **Encryption is not allowed on amateur radio frequencies** (FCC §97.113(a)(4) in the US,
 > and the rules of most countries). Use it only where it is permitted, such as MARS, SHARES
@@ -361,9 +362,22 @@ by themselves when you link.
   time.
 - **Sign my messages and VMail.** Adds a signature to what you type and to your VMail
   (VMail with attachments isn't signed). The text stays readable. Openslot stations check
-  it even with both options off: **✔** in green means it's from that station's key, **⚠**
+  it even with all the options off: **✔** in green means it's from that station's key, **⚠**
   means it isn't the key saved for that station, or the text was changed. On an encrypted
   link no separate signature is sent: the encryption already proves who is talking.
+
+- **Use shared keys.** For stations you've arranged a key with beforehand. Add a key under
+  this option: a name, the callsigns it's for (or `*` for any station without a key of its
+  own), and the key itself. **Generate** makes a strong one to pass on. Give it to the other
+  operator some other way (in person, by phone or email), never over the radio. Letter
+  case, spaces and dashes don't matter when it's typed in. With a key on both sides, the
+  link is encrypted from the start, and no key of any kind is readable on the air: each side
+  sends only a fresh link key, itself encrypted with the shared key. A new link key every
+  time also means that even if a shared key leaks later, recordings of earlier links can't
+  be read with it alone. If the other station has no key for you, or a different one, the
+  chat says **🔓 this link is NOT encrypted**. Like the option above, what you typed waits
+  until that's known, then goes out in the clear. This option works on its own, whether or
+  not *Encrypt links* is on.
 
 **Keys.** Each station's key is saved the first time you link with it (Settings →
 Security lists them). If a station later sends a different key, the chat warns you, and
@@ -374,7 +388,7 @@ voice or email. Your own key is kept in `keys.json` next to the config file. Kee
 private.
 
 Stations running VarAC see Openslot's key and signature tags (`<OSK:…>`, `<OSG:…>`) as
-text, so leave both options off when you work VarAC stations.
+text, so leave the options off when you work VarAC stations.
 
 ## Extras
 
@@ -495,8 +509,9 @@ HamPlay invitations, and the AI gateway (API key, model, timeout, answer length,
 
 ### Security
 
-**Encrypt links with other Openslot stations**, **Sign my messages and VMail**, your key's
-fingerprint, and the keys saved for other stations (accept a new key, or forget one). See
+**Encrypt links with other Openslot stations**, **Sign my messages and VMail**, **Use
+shared keys** with its list of keys, your key's fingerprint, and the keys saved for other
+stations (accept a new key, or forget one). See
 [Encryption and signing](#encryption-and-signing).
 
 ### Appearance

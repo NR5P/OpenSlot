@@ -515,6 +515,9 @@ pub struct SettingsForm {
     /// Openslot encryption / signing (Security tab)
     pub encrypt_link: bool,
     pub sign_messages: bool,
+    pub use_shared_keys: bool,
+    /// A shared key being added: name, callsigns, key, and why it wasn't taken
+    pub shared_new: (String, String, String, Option<String>),
     pub incoming_files_size_limit: String,
     pub emcomm_auto_reply_checkin: bool,
     pub email: String,
@@ -1419,6 +1422,8 @@ impl GuiState {
                 allow_parking: true,
                 encrypt_link: false,
                 sign_messages: false,
+                use_shared_keys: false,
+                shared_new: Default::default(),
                 incoming_files_size_limit: "5000".into(),
                 emcomm_auto_reply_checkin: true,
                 email: String::new(),

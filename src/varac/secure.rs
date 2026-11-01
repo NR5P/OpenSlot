@@ -1,5 +1,5 @@
-//! Optional encryption and message signing between Openslot stations. Both are off until
-//! the operator turns them on in Settings; with both off nothing here is ever sent, and
+//! Optional encryption and message signing between Openslot stations. All are off until
+//! the operator turns them on in Settings; with all off nothing here is ever sent, and
 //! the link runs exactly as before.
 //!
 //! Encryption is not allowed on amateur frequencies (FCC §97.113(a)(4), ITU RR 25.2A). It
@@ -14,6 +14,10 @@
 //!   when that's shorter). Only when both stations have encryption on.
 //! - `<OSG:…>` an Ed25519 signature at the end of a typed message or VMail sent in the
 //!   clear (an encrypted link already proves who is talking).
+//! - `<OSP:…>` instead of `<OSK:…>` when both stations have a shared key for each other
+//!   (typed in beforehand): a fresh X25519 key for this link, itself encrypted with the
+//!   shared key, so no key of any kind is readable on the air. The link keys come from
+//!   both the shared key and the X25519 exchange.
 //!
 //! Keys travel as unpadded URL-safe base64 (no `<`, `>` or `/`, so they can't close a tag
 //! or form VarAC's `//n`). Station keys are trusted on first use, per base callsign.
@@ -31,6 +35,12 @@ use std::sync::{Arc, RwLock};
 pub const KEY_TAG: &str = "<OSK:";
 pub const ENC_TAG: &str = "<OSE:";
 pub const SIG_TAG: &str = "<OSG:";
+pub const SHARED_TAG: &str = "<OSP:";
+
+/// A link-opening announcement (`<OSK:>` or `<OSP:>`): never encrypted, never joined.
+pub fn is_announcement(text: &str) -> bool {
+    text.starts_with(KEY_TAG) || text.starts_with(SHARED_TAG)
+}
 
 const VERSION: u8 = 1;
 const FLAG_ENCRYPT: u8 = 1;
@@ -55,11 +65,13 @@ pub fn fingerprint(key: &[u8]) -> String {
 
 // === Settings and keys ===
 
-/// The two switches and the key store, shared with the session like the other policy.
+/// The switches and the key store, shared with the session like the other policy.
 #[derive(Clone, Default, Debug)]
 pub struct SecurePolicy {
     pub encrypt: Arc<AtomicBool>,
     pub sign: Arc<AtomicBool>,
+    /// Use the shared keys typed in for stations (encrypted from the first frame)
+    pub shared: Arc<AtomicBool>,
     pub keyring: Arc<RwLock<Keyring>>,
 }
 
@@ -80,6 +92,41 @@ impl SecurePolicy {
         if encrypt || sign {
             let _ = self.identity();
         }
+    }
+
+    pub fn shared_on(&self) -> bool {
+        self.shared.load(Relaxed)
+    }
+
+    pub fn set_shared(&self, on: bool) {
+        self.shared.store(on, Relaxed);
+    }
+
+    pub fn shared_keys(&self) -> Vec<SharedKey> {
+        self.keyring.read().map(|k| k.file.shared.clone()).unwrap_or_default()
+    }
+
+    /// Add a shared key (or replace the one with the same name).
+    pub fn add_shared(&self, key: SharedKey) {
+        if let Ok(mut k) = self.keyring.write() {
+            k.file.shared.retain(|s| !s.name.eq_ignore_ascii_case(&key.name));
+            k.file.shared.push(key);
+            k.save();
+        }
+    }
+
+    pub fn remove_shared(&self, name: &str) {
+        if let Ok(mut k) = self.keyring.write() {
+            k.file.shared.retain(|s| s.name != name);
+            k.save();
+        }
+    }
+
+    /// The shared key for this station: one that names it, else one for any station.
+    fn shared_for(&self, call: &str) -> Option<SharedKey> {
+        let k = self.keyring.read().ok()?;
+        let names = |s: &&SharedKey, c: &str| s.calls.iter().any(|x| x.eq_ignore_ascii_case(c));
+        k.file.shared.iter().find(|s| names(s, call)).or_else(|| k.file.shared.iter().find(|s| names(s, "*"))).cloned()
     }
 
     /// Keep keys in this file (else only in memory, for this run).
@@ -161,6 +208,65 @@ struct KeyringFile {
     identity: Option<String>,
     #[serde(default)]
     stations: BTreeMap<String, KnownStation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shared: Vec<SharedKey>,
+}
+
+/// A key both operators typed in beforehand, for some stations (or `*`: any station).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedKey {
+    pub name: String,
+    /// Base callsigns, upper case; `*` = any station
+    pub calls: Vec<String>,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedKey({} for {:?})", self.name, self.calls)
+    }
+}
+
+impl SharedKey {
+    /// From what the operator typed (callsigns split on spaces or commas), or why not.
+    pub fn new(name: &str, calls: &str, secret: &str) -> Result<Self, &'static str> {
+        let calls: Vec<String> = calls.split([' ', ',', ';']).map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty()).map(|c| c.split('-').next().unwrap_or("").to_string()).collect();
+        if name.trim().is_empty() {
+            return Err("Give it a name");
+        }
+        if calls.is_empty() {
+            return Err("Add the callsigns it's for (or * for any station)");
+        }
+        if normalized_secret(secret).len() < 16 {
+            return Err("The key must be at least 16 letters or digits (Generate makes one)");
+        }
+        Ok(Self { name: name.trim().to_string(), calls, secret: secret.trim().to_string() })
+    }
+}
+
+/// A new key to share: 40 letters and digits in groups of four (200 bits), easy to read
+/// out or type. Case, spaces and dashes don't matter when it's typed in.
+pub fn generate_shared_secret() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut bytes = [0u8; 40];
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        return String::new();
+    }
+    let chars: Vec<char> = bytes.iter().map(|b| ALPHABET[(b & 31) as usize] as char).collect();
+    chars.chunks(4).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("-")
+}
+
+fn normalized_secret(secret: &str) -> String {
+    secret.chars().filter(|c| !c.is_whitespace() && *c != '-').flat_map(char::to_uppercase).collect()
+}
+
+/// The shared key's 32 bytes (PBKDF2-HMAC-SHA256, so a weak typed key is slow to guess).
+fn shared_key_bytes(secret: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let rounds = std::num::NonZeroU32::new(100_000).unwrap_or(std::num::NonZeroU32::MIN);
+    ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, rounds, b"openslot shared key v1", normalized_secret(secret).as_bytes(), &mut out);
+    out
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -391,7 +497,7 @@ impl SecureNote {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
-    /// We announced nothing (both options off)
+    /// We announced nothing (all options off)
     Off,
     /// We announced encryption and wait for the partner's first frame
     Waiting,
@@ -411,6 +517,8 @@ pub struct Link {
     eph: Option<(agreement::EphemeralPrivateKey, [u8; 32])>,
     /// The partner's identity key from this link's announcement
     partner_key: Option<([u8; 32], KeyTrust)>,
+    /// The shared key this link uses (its name, its bytes)
+    shared: Option<(String, [u8; 32])>,
     tx: Option<(aead::LessSafeKey, u32)>,
     rx: Option<(aead::LessSafeKey, Option<u32>)>,
 }
@@ -425,10 +533,24 @@ impl Default for Link {
             heard_partner: false,
             eph: None,
             partner_key: None,
+            shared: None,
             tx: None,
             rx: None,
         }
     }
+}
+
+fn new_link_key() -> Option<([u8; 32], agreement::EphemeralPrivateKey)> {
+    let k = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &SystemRandom::new()).ok()?;
+    Some((key32(k.compute_public_key().ok()?.as_ref())?, k))
+}
+
+/// The key that hides a `<OSP:>` link key: from the shared key and the announcement's salt.
+fn announcement_key(psk: &[u8; 32], salt: &[u8], from: &str, to: &str) -> Option<aead::LessSafeKey> {
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(psk);
+    let info = [b"OSP1 ".as_slice(), from.as_bytes(), b">", to.as_bytes()];
+    let okm = prk.expand(&info, &aead::CHACHA20_POLY1305).ok()?;
+    Some(aead::LessSafeKey::new(aead::UnboundKey::from(okm)))
 }
 
 impl Link {
@@ -436,6 +558,22 @@ impl Link {
     /// send first when an option is on.
     pub fn start(policy: &SecurePolicy, me: &str, partner: &str) -> (Self, Option<String>) {
         let mut link = Self { me: me.to_string(), partner: partner.to_string(), connecting: true, ..Self::default() };
+        // A shared key for this station: our link key goes hidden under it
+        if let Some(sk) = policy.shared_on().then(|| policy.shared_for(partner)).flatten() {
+            let psk = shared_key_bytes(&sk.secret);
+            let mut salt = [0u8; 16];
+            let announced = SystemRandom::new().fill(&mut salt).ok().and_then(|_| {
+                let (public, private) = new_link_key()?;
+                let mut sealed = public.to_vec();
+                announcement_key(&psk, &salt, me, partner)?
+                    .seal_in_place_append_tag(nonce(0), aead::Aad::from(b"OSP1"), &mut sealed).ok()?;
+                Some(((private, public), [&[VERSION][..], &salt, &sealed].concat()))
+            });
+            if let Some((eph, body)) = announced {
+                (link.eph, link.shared, link.state) = (Some(eph), Some((sk.name, psk)), LinkState::Waiting);
+                return (link, Some(format!("{SHARED_TAG}{}>", b64().encode(body))));
+            }
+        }
         let (encrypt, sign) = (policy.encrypt_on(), policy.sign_on());
         if !encrypt && !sign {
             return (link, None);
@@ -444,10 +582,7 @@ impl Link {
         let mut body = vec![VERSION, if encrypt { FLAG_ENCRYPT } else { 0 } | if sign { FLAG_SIGN } else { 0 }];
         body.extend_from_slice(&id.public());
         if encrypt {
-            let rng = SystemRandom::new();
-            let eph = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).ok();
-            let eph = eph.and_then(|k| Some((key32(k.compute_public_key().ok()?.as_ref())?, k)));
-            let Some((public, private)) = eph else { return (link, None) };
+            let Some((public, private)) = new_link_key() else { return (link, None) };
             body.extend_from_slice(&public);
             link.eph = Some((private, public));
         }
@@ -519,10 +654,18 @@ impl Link {
             KeyTrust::Changed => format!("⚠ NEW KEY {fp}, not the one saved for {}: check with them before trusting it (Settings → Security)", self.partner),
         };
         match self.state {
+            // (we offered our shared key: an open key announcement means they have none for us)
+            LinkState::Waiting if self.shared.is_some() => {
+                self.state = LinkState::Clear;
+                notes.push(SecureNote::Link {
+                    encrypted: false,
+                    text: format!("🔓 {} has no shared key for you: this link is NOT encrypted", self.partner),
+                });
+            }
             LinkState::Waiting if partner_encrypts => {
                 let theirs = key32(&b[34..66]);
                 let keys = self.eph.take().zip(theirs).and_then(|((mine, my_pub), theirs)| {
-                    derive_keys(mine, &my_pub, &theirs, &self.me, &self.partner)
+                    derive_keys(mine, &my_pub, &theirs, &self.me, &self.partner, b"openslot link v1")
                 });
                 match keys {
                     Some((tx, rx)) => {
@@ -550,6 +693,41 @@ impl Link {
             _ => {}
         }
         notes
+    }
+
+    /// The partner's `<OSP:…>` (the base64 inside the tag): its link key, hidden under the
+    /// shared key we should both have.
+    pub fn partner_shared(&mut self, payload: &str) -> Vec<SecureNote> {
+        self.heard_partner = true;
+        let p = self.partner.clone();
+        let clear = |link: &mut Self, why: String| {
+            let was_waiting = link.state == LinkState::Waiting;
+            if was_waiting {
+                link.state = LinkState::Clear;
+            }
+            vec![SecureNote::Link { encrypted: false, text: format!("🔓 {why}: this link is NOT encrypted") }]
+        };
+        let Some((name, psk)) = self.shared.clone().filter(|_| self.state == LinkState::Waiting) else {
+            return clear(self, format!("{p} uses a shared key, but you have none for {p} turned on (Settings → Security)"));
+        };
+        let theirs = b64().decode(payload.trim()).ok()
+            .filter(|b| b.len() == 1 + 16 + 32 + aead::CHACHA20_POLY1305.tag_len() && b[0] == VERSION)
+            .and_then(|mut b| {
+                let (salt, sealed) = b[1..].split_at_mut(16);
+                let key = announcement_key(&psk, salt, &p, &self.me)?;
+                key32(key.open_in_place(nonce(0), aead::Aad::from(b"OSP1"), sealed).ok()?)
+            });
+        let Some(theirs) = theirs else {
+            return clear(self, format!("{p}'s shared key isn't the same as yours (“{name}”)"));
+        };
+        let keys = self.eph.take().and_then(|(mine, my_pub)| derive_keys(mine, &my_pub, &theirs, &self.me, &p, &psk));
+        match keys {
+            Some((tx, rx)) => {
+                (self.tx, self.rx, self.state) = (Some((tx, 0)), Some((rx, None)), LinkState::Encrypted);
+                vec![SecureNote::Link { encrypted: true, text: format!("🔒 Encrypted link with {p} (shared key “{name}”)") }]
+            }
+            None => clear(self, "Key exchange failed".into()),
+        }
     }
 
     /// The frame text sealed for the partner (None when the link isn't encrypted).
@@ -624,18 +802,20 @@ fn nonce(counter: u32) -> aead::Nonce {
     aead::Nonce::assume_unique_for_key(n)
 }
 
-/// (our sending key, our receiving key)
+/// (our sending key, our receiving key), from the X25519 exchange and `salt` (fixed, or
+/// the shared key's bytes, so both are needed).
 fn derive_keys(
     mine: agreement::EphemeralPrivateKey,
     my_pub: &[u8; 32],
     theirs: &[u8; 32],
     me: &str,
     partner: &str,
+    salt: &[u8],
 ) -> Option<(aead::LessSafeKey, aead::LessSafeKey)> {
     let peer = agreement::UnparsedPublicKey::new(&agreement::X25519, theirs);
     agreement::agree_ephemeral(mine, &peer, |shared| {
         let (lo, hi) = if my_pub <= theirs { (my_pub, theirs) } else { (theirs, my_pub) };
-        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, b"openslot link v1").extract(shared);
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(shared);
         let key = |from: &str, to: &str| {
             let info = [b"OSE1 ".as_slice(), from.as_bytes(), b">", to.as_bytes(), lo, hi];
             let okm = prk.expand(&info, &aead::CHACHA20_POLY1305).ok()?;
@@ -789,6 +969,58 @@ mod tests {
         assert!(pb.stations()[0].new_fingerprint.is_none());
         pb.forget("W1AW");
         assert!(pb.stations().is_empty());
+    }
+
+    fn shared(secret: &str, calls: &str) -> SecurePolicy {
+        let p = SecurePolicy::default();
+        p.set_shared(true);
+        p.add_shared(SharedKey::new("net", calls, secret).unwrap());
+        p
+    }
+
+    fn shared_payload(frame: &str) -> &str {
+        frame.strip_prefix(SHARED_TAG).and_then(|r| r.strip_suffix('>')).unwrap()
+    }
+
+    #[test]
+    fn shared_key_link() {
+        let secret = generate_shared_secret();
+        assert_eq!(secret.len(), 49);
+        // (typed in another way: case, spaces and dashes don't matter)
+        let (pa, pb) = (shared(&secret, "K1ABC"), shared(&secret.to_lowercase().replace('-', " "), "*"));
+        let (mut a, ka) = Link::start(&pa, "W1AW", "K1ABC");
+        let (mut b, kb) = Link::start(&pb, "K1ABC", "W1AW");
+        let (ka, kb) = (ka.unwrap(), kb.unwrap());
+        assert!(ka.starts_with(SHARED_TAG) && ka.len() < 100, "{ka}");
+        assert!(pa.my_fingerprint().is_none(), "no identity key is made or sent");
+        assert!(matches!(a.partner_shared(shared_payload(&kb))[..], [SecureNote::Link { encrypted: true, .. }]));
+        assert!(matches!(b.partner_shared(shared_payload(&ka))[..], [SecureNote::Link { encrypted: true, .. }]));
+        assert_eq!(b.open(&a.seal("from the first frame").unwrap()).unwrap(), "from the first frame");
+        assert_eq!(a.open(&b.seal("roger").unwrap()).unwrap(), "roger");
+        // the same announcement can't be read without the key
+        let (mut c, _) = Link::start(&shared("ZZZZ-ZZZZ-ZZZZ-ZZZZ", "W1AW"), "K1ABC", "W1AW");
+        assert!(matches!(c.partner_shared(shared_payload(&ka))[..], [SecureNote::Link { encrypted: false, .. }]));
+        assert_eq!(c.state(), LinkState::Clear);
+    }
+
+    #[test]
+    fn shared_key_against_other_modes() {
+        let ps = shared("ABCD-EFGH-JKLM-NPQR", "K1ABC");
+        // the other side announces an open key instead: not encrypted, on both sides
+        let pe = policy(true, false);
+        let (mut a, ka) = Link::start(&ps, "W1AW", "K1ABC");
+        let (mut b, kb) = Link::start(&pe, "K1ABC", "W1AW");
+        assert!(kb.as_deref().unwrap().starts_with(KEY_TAG));
+        assert!(matches!(a.partner_key(&ps, payload(&kb.unwrap()))[..], [SecureNote::Link { encrypted: false, .. }]));
+        assert!(matches!(b.partner_shared(shared_payload(ka.as_deref().unwrap()))[..], [SecureNote::Link { encrypted: false, .. }]));
+        assert_eq!((a.state(), b.state()), (LinkState::Clear, LinkState::Clear));
+        // a station the key isn't for, or with shared keys off: the open key or nothing
+        assert!(Link::start(&ps, "W1AW", "N0CALL").1.is_none());
+        ps.set_shared(false);
+        assert!(Link::start(&ps, "W1AW", "K1ABC").1.is_none());
+        assert!(SharedKey::new("x", "K1ABC", "short").is_err());
+        assert!(SharedKey::new("x", "", "ABCD-EFGH-JKLM-NPQR").is_err());
+        assert_eq!(SharedKey::new(" net ", "k1abc-7, w1aw", "ABCD-EFGH-JKLM-NPQR").unwrap().calls, ["K1ABC", "W1AW"]);
     }
 
     #[test]

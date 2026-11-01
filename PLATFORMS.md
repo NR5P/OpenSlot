@@ -67,9 +67,11 @@ they have their own versions of the desktop's main-screen controls, on the Chat 
    calling frequency brings up VarAC's text with **Switch to 500 Hz** (desktop:
    `draw_bw_refused` in `src/gui/mod.rs`; mobile-core sends a `bw_refused` event).
 4. **Security settings** (desktop: `draw_security_settings` in `src/gui/mod.rs`): the
-   two switches *Encrypt links with other Openslot stations* and *Sign my messages and
-   VMail* (both off by default), applied with `policy.secure.set(encrypt, sign)` after
-   `policy.secure.open_keyring(<app data>/keys.json)`; your key's fingerprint and the
+   switches *Encrypt links with other Openslot stations*, *Sign my messages and VMail*
+   and *Use shared keys* (all off by default), applied with `policy.secure.set(encrypt,
+   sign)` and `set_shared(on)` after `policy.secure.open_keyring(<app data>/keys.json)`;
+   the shared keys list (`shared_keys`, `add_shared(SharedKey::new(..))`, `remove_shared`,
+   `generate_shared_secret`); your key's fingerprint and the
    saved stations' keys (`stations()`, `accept_new_key`, `forget`). The phones already
    send typed chat through `send_typed` and show the partner's key and signature notes as
    system lines, so with this they work like the desktop. Desktop chat lines also get a

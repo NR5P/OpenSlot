@@ -311,6 +311,8 @@ pub struct ConfigFile {
     pub encryption: Option<bool>,
     /// Openslot: sign what we type and our VMail (off by default)
     pub signing: Option<bool>,
+    /// Openslot: use the shared keys typed in for stations (kept in keys.json; off by default)
+    pub shared_keys: Option<bool>,
     /// VarAC [APPEARANCE] UITheme: DEFAULT or SCIFI
     pub ui_theme: Option<String>,
     /// VarAC MuteAllSounds and the Play…Sound switches (keys of the sounds switched off)
@@ -862,6 +864,7 @@ pub fn apply_secure(p: &crate::varac::secure::SecurePolicy) {
     }
     let f = read_config_file().unwrap_or_default();
     p.set(f.encryption.unwrap_or(false), f.signing.unwrap_or(false));
+    p.set_shared(f.shared_keys.unwrap_or(false));
 }
 
 pub fn path_finder_enabled() -> bool {

@@ -330,6 +330,7 @@ impl VaracApp {
                 f.allow_parking = cfg.allow_parking.unwrap_or(true);
                 f.encrypt_link = cfg.encryption.unwrap_or(false);
                 f.sign_messages = cfg.signing.unwrap_or(false);
+                f.use_shared_keys = cfg.shared_keys.unwrap_or(false);
                 f.incoming_files_size_limit = cfg.incoming_files_size_limit.unwrap_or(5000).to_string();
                 f.emcomm_auto_reply_checkin = cfg.emcomm_auto_reply_checkin.unwrap_or(true);
                 if let Some(v) = cfg.call_id_minutes { f.call_id_minutes = v.to_string(); }
@@ -4220,7 +4221,7 @@ fn our_lines_in_frame(lines: &std::collections::VecDeque<ChatLine>, text: &str, 
 /// Openslot's encryption and signing switches, our key and the stations' keys.
 fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
     ui.heading("Encryption and signing");
-    ui.label(RichText::new("Both are off unless you turn them on, and work only between Openslot stations. With both off, Openslot works exactly as before.")
+    ui.label(RichText::new("All are off unless you turn them on, and work only between Openslot stations. With all off, Openslot works exactly as before.")
         .small().color(theme::MUTED));
     ui.add_space(6.0);
     ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations")
@@ -4232,6 +4233,13 @@ fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, sec
     ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail")
         .on_hover_text("Adds a signature to what you type and to your VMail, so other Openslot stations can check it's really from you. \
             The text stays readable.");
+    ui.add_space(4.0);
+    ui.checkbox(&mut form.use_shared_keys, "Use shared keys")
+        .on_hover_text("For the stations below: links are encrypted from the start with a key you both typed in beforehand. \\
+            No key of any kind is readable on the air. Works whether or not the box above is on.");
+    if form.use_shared_keys {
+        draw_shared_keys(ui, form, secure);
+    }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("Your key:");
@@ -4269,6 +4277,56 @@ fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, sec
                 ui.end_row();
             }
         });
+    });
+}
+
+/// The shared keys typed in beforehand (kept in keys.json), and a row to add one.
+fn draw_shared_keys(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
+    ui.indent("shared_keys", |ui| {
+        ui.label(RichText::new("Give the other operator the same key some other way (in person, by phone or email), never over the radio. \\
+            A key for * is used with any station that has no key of its own here.").small().color(theme::MUTED));
+        let keys = secure.shared_keys();
+        if !keys.is_empty() {
+            egui::Grid::new("shared_key_list").num_columns(4).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                for k in keys {
+                    ui.label(RichText::new(&k.name).strong());
+                    ui.label(k.calls.join(" "));
+                    // (only the start of the key on screen)
+                    let start: String = k.secret.chars().take(4).collect();
+                    ui.label(RichText::new(format!("{start}-…")).monospace().color(theme::MUTED));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Copy key").clicked() {
+                            ui.ctx().copy_text(k.secret.clone());
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            secure.remove_shared(&k.name);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        }
+        let (name, calls, secret, error) = &mut form.shared_new;
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(name).desired_width(90.0).hint_text("name"));
+            ui.add(TextEdit::singleline(calls).desired_width(150.0).hint_text("callsigns, or *"));
+            ui.add(TextEdit::singleline(secret).desired_width(260.0).hint_text("key").font(egui::TextStyle::Monospace));
+            if ui.small_button("Generate").on_hover_text("Make a new random key to share").clicked() {
+                *secret = crate::varac::secure::generate_shared_secret();
+            }
+            if ui.button("Add").clicked() {
+                match crate::varac::secure::SharedKey::new(name, calls, secret) {
+                    Ok(k) => {
+                        secure.add_shared(k);
+                        (*name, *calls, *secret, *error) = Default::default();
+                    }
+                    Err(why) => *error = Some(why.to_string()),
+                }
+            }
+        });
+        if let Some(why) = error {
+            ui.label(RichText::new(why.as_str()).small().color(theme::RED));
+        }
     });
 }
 
@@ -7410,6 +7468,7 @@ fn draw_settings_window(
                     station_config.policy.auto_file.store(f.emcomm_mode && f.emcomm_auto_file_approval, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.allow_parking.store(f.allow_parking, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.secure.set(f.encrypt_link, f.sign_messages);
+                    station_config.policy.secure.set_shared(f.use_shared_keys);
                     station_config.policy.ai_gateway.store(f.ai_enabled && f.ai_announce, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.set_emcomm(
                         f.emcomm_mode && f.emcomm_disable_snr,
@@ -7785,6 +7844,7 @@ fn save_config_file(state: &GuiState) {
         allow_parking: Some(form.allow_parking),
         encryption: Some(form.encrypt_link),
         signing: Some(form.sign_messages),
+        shared_keys: Some(form.use_shared_keys),
         incoming_files_size_limit: form.incoming_files_size_limit.trim().parse().ok(),
         mute_all_sounds: existing.mute_all_sounds,
         sounds_off: existing.sounds_off.clone(),
