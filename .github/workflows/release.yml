@@ -1,0 +1,49 @@
+# Builds the Linux download and attaches it to a GitHub release. Push a tag to run it:
+#
+#   git tag v0.1.0 && git push openslot v0.1.0
+#
+# The Mac app needs the XARA checkout next to this repository, so it's built with
+# macos/bundle.sh and added to the same release by hand. Releases are marked as
+# pre-releases while Openslot is still in testing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libudev-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          dir="openslot-$TAG-linux-x86_64"
+          mkdir -p "$dir"
+          cp target/release/openslot README.md assets/linux/openslot.desktop "$dir/"
+          cp assets/icon/openslot-256.png "$dir/openslot.png"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --title "Openslot $TAG" \
+            --notes "Test build for Linux (x86_64) and Mac (Apple silicon and Intel). Windows, iPhone/iPad and Android builds come later."
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
