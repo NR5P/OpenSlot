@@ -1,0 +1,4 @@
+module OpenslotCore {
+    header "openslot.h"
+    export *
+}

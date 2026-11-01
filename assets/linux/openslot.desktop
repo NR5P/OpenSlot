@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Openslot
+GenericName=VarAC-compatible ham radio chat
+Comment=Chat, VMail, files and email over the VARA modem, compatible with VarAC
+Keywords=ham;radio;VarAC;VARA;HF;digital;chat;VMail;
+Exec=openslot
+Icon=openslot
+Terminal=false
+Categories=HamRadio;Network;
+StartupWMClass=openslot

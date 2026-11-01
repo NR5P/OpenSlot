@@ -1,0 +1,65 @@
+# The Windows app: the same Openslot GUI as the Linux build (the shared code in ../src is
+# compiled in unchanged), plus the XARA modem built in, installed by install.ps1.
+[package]
+name = "openslot-windows"
+version = "0.1.0"
+edition = "2024"
+description = "Openslot for Windows, with the XARA modem built in"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not part of the root package: this folder builds on its own.
+[workspace]
+
+[[bin]]
+name = "openslot"
+path = "src/main.rs"
+
+[dependencies]
+# Same as ../Cargo.toml (the shared code needs all of them)
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+flate2 = "1"
+base64 = "0.22"
+md-5 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+toml = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+eframe = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+ab_glyph = "0.2"
+notify-rust = "4"
+open = "5"
+rfd = "0.15"
+serialport = "4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+mail-parser = "1.0.0"
+
+# The XARA modem, from a checkout next to this one (Desktop\xara beside Desktop\varac-rust).
+# Registered VARA speeds are built in but used only when the user says they hold a VARA
+# licence, as in XARA's apps.
+xara-ffi = { path = "../../xara/crates/xara-ffi", features = ["registered"] }
+xara = { path = "../../xara/crates/xara", default-features = false }
+
+# For --tui: the window app attaches to the console it was started from.
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+strip = true

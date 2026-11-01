@@ -1,0 +1,42 @@
+[package]
+name = "openslot"
+version = "0.1.0"
+edition = "2024"
+description = "Openslot: independent cross-platform client compatible with VarAC, built on the VARA modem TCP interface"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+flate2 = "1"
+base64 = "0.22"
+md-5 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+toml = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+eframe = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+ab_glyph = "0.2"
+notify-rust = "4"
+open = "5"
+rfd = "0.15"
+serialport = "4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+mail-parser = "1.0.0"
+
+[dev-dependencies]
+tokio-test = "0.4"

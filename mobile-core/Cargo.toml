@@ -1,0 +1,48 @@
+# The shared Rust core of the iOS and Android apps: Openslot's protocol, storage and
+# session code from ../src (compiled in unchanged) plus the XARA modem, behind a small C
+# interface (include/openslot.h) for Swift and a JNI one for Kotlin.
+[package]
+name = "openslot-mobile"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not part of the root package: this folder builds on its own.
+[workspace]
+
+[lib]
+# iOS links the static library, Android loads the shared one.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# What ../src/vara, ../src/varac and ../src/storage use (versions as in ../Cargo.toml)
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+flate2 = "1"
+base64 = "0.22"
+md-5 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+mail-parser = "1.0.0"
+# ../src/varac/images.rs (image shrinker, QSL cards): its overlay font is egui's built-in one,
+# which it reaches as eframe::egui; eframe-fonts/ gives it that path without the windowing.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+ab_glyph = "0.2"
+eframe = { path = "eframe-fonts", package = "openslot-eframe-fonts" }
+
+# The XARA modem, from a checkout next to this one (~/Desktop/xara).
+xara-ffi = { path = "../../xara/crates/xara-ffi", features = ["registered"] }
+
+[profile.release]
+strip = true
+lto = true

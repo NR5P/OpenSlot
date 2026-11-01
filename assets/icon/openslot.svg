@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Openslot</title>
+  <rect width="1024" height="1024" rx="230.4" fill="#121820"/>
+  <rect x="158.72" y="327.68" width="92.16" height="491.52" rx="25.6" fill="#33475B"/>
+  <rect x="312.32" y="327.68" width="92.16" height="491.52" rx="25.6" fill="#33475B"/>
+  <rect x="465.92" y="327.68" width="92.16" height="491.52" rx="25.6" fill="#E8742A"/>
+  <rect x="619.52" y="327.68" width="92.16" height="491.52" rx="25.6" fill="#33475B"/>
+  <rect x="773.12" y="327.68" width="92.16" height="491.52" rx="25.6" fill="#33475B"/>
+  <polyline points="424.96,230.4 512,153.6 599.04,230.4" fill="none" stroke="#E8742A" stroke-width="40.96" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

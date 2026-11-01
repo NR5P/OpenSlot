@@ -1,0 +1,14 @@
+# Stands in for eframe in the phone core: the shared code only takes egui's built-in fonts
+# from it (eframe::egui::FontDefinitions), and the real eframe would bring in a window system.
+[package]
+name = "openslot-eframe-fonts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "eframe"
+
+[dependencies]
+egui = { version = "0.30", default-features = false, features = ["default_fonts"] }

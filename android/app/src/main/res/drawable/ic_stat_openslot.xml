@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Notification icon. Drawn from the shapes in tools/make_icon.py (1024-unit grid). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <group android:scaleX="0.0311" android:scaleY="0.0311" android:translateX="-3.94" android:translateY="-2.83">
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.5" android:pathData="M184.32,327.68 h40.96 a25.6,25.6 0 0 1 25.6,25.6 v440.32 a25.6,25.6 0 0 1 -25.6,25.6 h-40.96 a25.6,25.6 0 0 1 -25.6,-25.6 v-440.32 a25.6,25.6 0 0 1 25.6,-25.6 z" />
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.5" android:pathData="M337.92,327.68 h40.96 a25.6,25.6 0 0 1 25.6,25.6 v440.32 a25.6,25.6 0 0 1 -25.6,25.6 h-40.96 a25.6,25.6 0 0 1 -25.6,-25.6 v-440.32 a25.6,25.6 0 0 1 25.6,-25.6 z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M491.52,327.68 h40.96 a25.6,25.6 0 0 1 25.6,25.6 v440.32 a25.6,25.6 0 0 1 -25.6,25.6 h-40.96 a25.6,25.6 0 0 1 -25.6,-25.6 v-440.32 a25.6,25.6 0 0 1 25.6,-25.6 z" />
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.5" android:pathData="M645.12,327.68 h40.96 a25.6,25.6 0 0 1 25.6,25.6 v440.32 a25.6,25.6 0 0 1 -25.6,25.6 h-40.96 a25.6,25.6 0 0 1 -25.6,-25.6 v-440.32 a25.6,25.6 0 0 1 25.6,-25.6 z" />
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.5" android:pathData="M798.72,327.68 h40.96 a25.6,25.6 0 0 1 25.6,25.6 v440.32 a25.6,25.6 0 0 1 -25.6,25.6 h-40.96 a25.6,25.6 0 0 1 -25.6,-25.6 v-440.32 a25.6,25.6 0 0 1 25.6,-25.6 z" />
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="40.96" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M424.96,230.4 L512,153.6 L599.04,230.4" />
+    </group>
+</vector>
