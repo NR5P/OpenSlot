@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "openslot-windows"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
@@ -5469,6 +5469,7 @@ version = "0.1.1"
 dependencies = [
  "xara",
  "xara-host",
+ "xara-ui",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 # compiled in unchanged), plus the XARA modem built in, packaged as a .app by bundle.sh.
 [package]
 name = "openslot-macos"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Openslot for macOS, with the XARA modem built in"
 license = "MIT OR Apache-2.0"
