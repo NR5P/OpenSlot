@@ -5081,7 +5081,7 @@ fn draw_vmail_folders(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
                             ui.colored_label(style, RichText::new(format!("{marker}{time}")).small());
                             ui.colored_label(GREEN, RichText::new(label_call).small().strong());
                             ui.colored_label(style, RichText::new(subject).small());
-                        }).response;
+                        }).response.interact(egui::Sense::click());
 
                         if resp.clicked() {
                             state.selected_vmail = Some(*i);
@@ -5347,7 +5347,7 @@ fn draw_station_table(ui: &mut egui::Ui, entries: &VecDeque<CqEntry>, callsign_t
             ui.colored_label(WHITE, RichText::new(format!("{}", entry.bandwidth)).small());
             let snr = entry.snr.as_deref().unwrap_or("--");
             ui.colored_label(WHITE, RichText::new(snr).small());
-        }).response;
+        }).response.interact(egui::Sense::click());
 
         let resp = resp.on_hover_ui(|ui| {
             if let Ok(Some(contact)) = db.get_contact(&base_call) {
@@ -6851,7 +6851,7 @@ fn draw_qso_log_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage) 
                                 if let Some(snr) = qso.snr_sent {
                                     ui.colored_label(YELLOW, RichText::new(format!("S:{snr:+}dB")).small());
                                 }
-                            }).response;
+                            }).response.interact(egui::Sense::click());
 
                             if resp.clicked() {
                                 if is_selected {
@@ -7031,7 +7031,7 @@ fn draw_heard_stations_window(ctx: &egui::Context, state: &mut GuiState, db: &St
                                 }
                                 ui.colored_label(GRAY, RichText::new(last_heard.as_str()).small());
                                 ui.colored_label(WHITE, RichText::new(format!("{count}")).small());
-                            }).response;
+                            }).response.interact(egui::Sense::click());
 
                             let ctx_call = callsign.clone();
                             resp.context_menu(|ui| {
@@ -7156,7 +7156,7 @@ fn draw_bbs_listing_window(ctx: &egui::Context, state: &mut GuiState) {
                             } else {
                                 ui.colored_label(GRAY, text);
                             }
-                        }).response;
+                        }).response.interact(egui::Sense::click());
 
                         resp.context_menu(|ui| {
                             if ui.button(format!("Download {name}")).clicked() {
@@ -7394,7 +7394,7 @@ fn draw_bookmarks_window(ctx: &egui::Context, state: &mut GuiState) {
                             ui.colored_label(GRAY, RichText::new(&bm.time).small());
                             ui.colored_label(callsign_color(&bm.callsign), RichText::new(format!("{}:", bm.callsign)).strong());
                             ui.label(&bm.text);
-                        }).response;
+                        }).response.interact(egui::Sense::click());
                         resp.context_menu(|ui| {
                             if ui.button("Copy").clicked() {
                                 ui.output_mut(|o| o.copied_text = format!("[{}] {}: {}", bm.time, bm.callsign, bm.text));
@@ -7610,7 +7610,7 @@ fn draw_contacts_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage)
                             if !notes.is_empty() {
                                 ui.colored_label(GRAY, RichText::new(notes).small().italics());
                             }
-                        }).response;
+                        }).response.interact(egui::Sense::click());
 
                         if resp.double_clicked() && state.modem_connected {
                             let dest = contact.callsign.clone();
