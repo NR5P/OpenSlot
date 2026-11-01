@@ -388,6 +388,10 @@ pub struct SettingsForm {
     pub welcome_message: String,
     pub welcome_always: bool,
     pub allow_path_finder: bool,
+    /// Antenna rotator (PstRotator over UDP), Settings › RIG
+    pub rotator_enabled: bool,
+    pub rotator_host: String,
+    pub rotator_port: String,
     pub adif_log_path: String,
     pub adif_submode: String,
     pub default_log_comment: String,
@@ -1230,6 +1234,9 @@ impl GuiState {
                 welcome_message: String::new(),
                 welcome_always: false,
                 allow_path_finder: true,
+                rotator_enabled: false,
+                rotator_host: "127.0.0.1".into(),
+                rotator_port: "12000".into(),
                 adif_log_path: String::new(),
                 adif_submode: String::new(),
                 default_log_comment: "Made with Openslot".into(),
@@ -1633,6 +1640,17 @@ impl GuiState {
 
     /// Answer a CQ that named a slot: retune there, then connect (as in
     /// VarAC).
+    /// VarAC's "QSY to slot" in the CQ menu: tune to the slot the CQ named, without calling.
+    pub fn qsy_to_slot(&mut self, call: &str, slot: u8) {
+        let Some(f) = crate::varac::slots::frequency(self.current_frequency, slot, self.slot_step()) else { return };
+        self.remember_cf(self.current_frequency);
+        self.tune_to = Some(f);
+        self.add_log(format!("QSY to slot {slot} ({:.3} MHz), where {call} waits", f as f64 / 1e6));
+        if !self.rig_connected {
+            self.status_msg = format!("No rig control: tune your radio to {:.3} MHz (slot {slot})", f as f64 / 1e6);
+        }
+    }
+
     pub fn connect_on_slot(&mut self, call: &str, slot: u8) {
         let Some(f) = crate::varac::slots::frequency(self.current_frequency, slot, self.slot_step()) else { return };
         self.remember_cf(self.current_frequency);

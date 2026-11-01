@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub mod rigctld;
 pub mod cat;
 pub mod flrig;
+pub mod rotator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadioMode {

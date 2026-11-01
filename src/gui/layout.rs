@@ -881,8 +881,10 @@ fn draw_beacons_card(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let my_loc = state.settings_form.locator.clone();
-                if let Some(action) = draw_station_table(ui, &state.beacon_entries, &state.callsign_tags, &my_loc, "", db) {
-                    handle_station_action(action, state);
+                match draw_station_table(ui, &state.beacon_entries, &state.callsign_tags, &my_loc, "", db) {
+                    Some(StationAction::ClearList) => state.beacon_entries.clear(),
+                    Some(action) => handle_station_action(action, state),
+                    None => {}
                 }
             });
 
@@ -940,8 +942,10 @@ fn draw_cq_card(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
             .show(ui, |ui| {
                 let my_loc = state.settings_form.locator.clone();
                 let filt = state.cq_filter.clone();
-                if let Some(action) = draw_station_table(ui, &state.cq_entries, &state.callsign_tags, &my_loc, &filt, db) {
-                    handle_station_action(action, state);
+                match draw_station_table(ui, &state.cq_entries, &state.callsign_tags, &my_loc, &filt, db) {
+                    Some(StationAction::ClearList) => state.cq_entries.clear(),
+                    Some(action) => handle_station_action(action, state),
+                    None => {}
                 }
             });
 

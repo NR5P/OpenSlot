@@ -81,6 +81,8 @@ Choose how Openslot reaches the radio:
 
 The frequency is read from the radio about every 1.5 seconds. If the radio did not reach a frequency it was sent to, Openslot asks again (CAT, up to 10 times).
 
+**Antenna rotator**: with a rotator run by PstRotator, tick **Turn the antenna** and give PstRotator's host and UDP port (default 127.0.0.1:12000), and turn on PstRotator's UDP control. **Rotate Antenna** in the beacon and CQ menus then turns to the station, using your locator and theirs.
+
 ### 4. QSO
 
 The defaults match VarAC; the ones most people change are the welcome message, **Auto log QSO**, and the logging section (ADIF file, logger programs, PSKReporter). See the Settings reference below.
@@ -115,7 +117,7 @@ Type a callsign to connect to, ping or send VMail to. On VARA FM, `CALL VIA DIGI
 
 ### Right column: what you hear
 
-- **Beacons** and **CQ calls** heard, with time, SNR, slot, locator and services. Double-click a CQ to answer it (Openslot moves to the caller's slot and connects); right-click for more choices (connect here, send VMail, look up, tag, block).
+- **Beacons** and **CQ calls** heard, with time, SNR, slot, locator and services. Double-click a beacon to connect, or a CQ to answer it (Openslot moves to the caller's slot and connects). Right-click a station for the same menu as VarAC's: Clear, Copy all, Connect, Rotate Antenna, Ping (get report), Send VMail now, QRZ.COM and PSK Reporter lookups, Block callsign, Callsign history and, on a CQ, QSY to slot (tune there without calling). After those come Openslot's own: connect without moving to the slot, copy the callsign, spot it on the DX cluster, add it to the watchlist.
 - **Broadcasts** heard and sent.
 - **VMail** folders with their counts.
 

@@ -289,6 +289,11 @@ pub struct ConfigFile {
     pub emcomm_auto_reply_checkin: Option<bool>,
     /// Answer Path Finder requests (VarAC [VMAIL] AllowPathFinder, default on).
     pub allow_path_finder: Option<bool>,
+    /// Antenna rotator through PstRotator's UDP port (VarAC [ROTATOR] PstRotatorHost/Port,
+    /// localhost:12000): "Rotate Antenna" in the beacon and CQ menus
+    pub rotator_enabled: Option<bool>,
+    pub rotator_host: Option<String>,
+    pub rotator_port: Option<u16>,
     /// Station ID during a QSO every N minutes (VarAC MycallBroadcastIntervalMinutes, 10; 5–30)
     pub call_id_minutes: Option<u32>,
     /// Disconnect an idle link after N minutes, telling the partner <IE> (VarAC
@@ -764,6 +769,17 @@ pub fn ai_settings() -> crate::varac::ai_gateway::AiSettings {
 /// Folder of the config file (alert tags, schedule and scanner lists live next to it).
 pub fn config_dir() -> Option<PathBuf> {
     active_config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// The PstRotator to turn (host, UDP port), when an antenna rotator is set up.
+pub fn rotator() -> Option<(String, u16)> {
+    let f = read_config_file()?;
+    f.rotator_enabled.unwrap_or(false).then(|| {
+        (
+            f.rotator_host.filter(|h| !h.trim().is_empty()).unwrap_or_else(|| "127.0.0.1".into()),
+            f.rotator_port.unwrap_or(12000),
+        )
+    })
 }
 
 pub fn path_finder_enabled() -> bool {

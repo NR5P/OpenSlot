@@ -232,6 +232,9 @@ impl VaracApp {
                 f.verbose_snr_auto_accept = cfg.verbose_snr_auto_accept.unwrap_or(false);
                 f.allow_last_heard = cfg.allow_last_heard.unwrap_or(true);
                 f.allow_path_finder = cfg.allow_path_finder.unwrap_or(true);
+                f.rotator_enabled = cfg.rotator_enabled.unwrap_or(false);
+                if let Some(v) = &cfg.rotator_host { f.rotator_host = v.clone(); }
+                if let Some(v) = cfg.rotator_port { f.rotator_port = v.to_string(); }
                 f.adif_log_path = cfg.adif_log_path.clone().unwrap_or_default();
                 if let Some(v) = &cfg.adif_submode { f.adif_submode = v.clone(); }
                 if let Some(v) = &cfg.default_log_comment { f.default_log_comment = v.clone(); }
@@ -5078,6 +5081,7 @@ fn draw_vmail_folders(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
                         let style = if *urgent { RED } else if !*read { WHITE } else { GRAY };
                         let label_call = if state.vmail_folder_tab == 0 { from } else { to };
                         let resp = ui.horizontal(|ui| {
+                            ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                             ui.colored_label(style, RichText::new(format!("{marker}{time}")).small());
                             ui.colored_label(GREEN, RichText::new(label_call).small().strong());
                             ui.colored_label(style, RichText::new(subject).small());
@@ -5176,6 +5180,12 @@ enum StationAction {
     History(String),
     /// "DX Cluster spot"
     DxSpot(String),
+    /// VarAC's "Clear" at the top of the beacon and CQ menus: empty that list (its card does it)
+    ClearList,
+    /// "Rotate Antenna": turn to (call, bearing in degrees)
+    Rotate(String, i64),
+    /// "QSY to slot" (CQ menu): tune to the slot the CQ named, without calling
+    QsyToSlot(String, u8),
 }
 
 /// VarAC's "PSK Reporter lookup" (with its default PSKReporterCustomLink).
@@ -5186,21 +5196,23 @@ pub fn open_psk_lookup(call: &str) {
     ));
 }
 
+/// A setting from the config file for a menu, read once a few seconds rather than each frame.
+fn cached_setting(ui: &egui::Ui, key: &str, read: fn() -> bool) -> bool {
+    let id = egui::Id::new(key);
+    let now = ui.ctx().input(|i| i.time);
+    match ui.ctx().data(|d| d.get_temp::<(f64, bool)>(id)) {
+        Some((t, v)) if now - t < 5.0 => v,
+        _ => {
+            let v = read();
+            ui.ctx().data_mut(|d| d.insert_temp(id, (now, v)));
+            v
+        }
+    }
+}
+
 /// The right-click items VarAC adds to every heard list (after Connect and VMail).
 fn station_menu_extras(ui: &mut egui::Ui, call: &str, action: &mut Option<StationAction>) {
-    // (the DX cluster setting, read once a few seconds rather than each frame)
-    let dx_on = {
-        let id = egui::Id::new("dxcluster_enabled_cache");
-        let now = ui.ctx().input(|i| i.time);
-        match ui.ctx().data(|d| d.get_temp::<(f64, bool)>(id)) {
-            Some((t, v)) if now - t < 5.0 => v,
-            _ => {
-                let v = crate::config::read_dxcluster_enabled();
-                ui.ctx().data_mut(|d| d.insert_temp(id, (now, v)));
-                v
-            }
-        }
-    };
+    let dx_on = cached_setting(ui, "dxcluster_enabled_cache", crate::config::read_dxcluster_enabled);
     if ui.button("Ping (get report)").clicked() {
         *action = Some(StationAction::Ping(call.to_string()));
         ui.close_menu();
@@ -5276,6 +5288,19 @@ fn handle_station_action(action: StationAction, state: &mut GuiState) {
                 state.status_msg = format!("{upper} already in watchlist");
             }
         }
+        // (the beacon and CQ cards clear their own list before getting here)
+        StationAction::ClearList => {}
+        StationAction::Rotate(call, bearing) => match crate::config::rotator() {
+            Some((host, port)) => match crate::rig::rotator::turn_to(&host, port, bearing) {
+                Ok(()) => {
+                    state.add_log(format!("Rotating antenna to {bearing}° for {call}"));
+                    state.status_msg = format!("Rotating antenna to {bearing}° ({call})");
+                }
+                Err(e) => state.status_msg = format!("Rotator: can't reach PstRotator at {host}:{port} ({e})"),
+            },
+            None => state.status_msg = "No antenna rotator set up (Settings › RIG)".into(),
+        },
+        StationAction::QsyToSlot(call, slot) => state.qsy_to_slot(&call, slot),
     }
 }
 
@@ -5307,6 +5332,7 @@ fn draw_station_table(ui: &mut egui::Ui, entries: &VecDeque<CqEntry>, callsign_t
         let base_call = entry.callsign.split('-').next().unwrap_or(&entry.callsign).to_string();
 
         let resp = ui.horizontal(|ui| {
+            ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
             let age_secs = (Utc::now() - entry.timestamp).num_seconds().max(0);
             let time_str = entry.time.clone();
             let time_color = if age_secs > 300 {
@@ -5380,29 +5406,108 @@ fn draw_station_table(ui: &mut egui::Ui, entries: &VecDeque<CqEntry>, callsign_t
         }
 
         resp.context_menu(|ui| {
-            if entry.slot != 0 && ui.button(format!("QSY to slot {} and connect to {}", entry.slot, base_call)).clicked() {
+            // VarAC starts the beacon and CQ menus with the list itself
+            if ui.button("Clear").clicked() {
+                action = Some(StationAction::ClearList);
+                ui.close_menu();
+            }
+            if ui.button("Copy all").clicked() {
+                let text: Vec<String> = entries
+                    .iter()
+                    .rev()
+                    .map(|e| {
+                        [
+                            e.band.as_str(),
+                            e.time.as_str(),
+                            e.callsign.as_str(),
+                            e.cq_type.as_deref().unwrap_or(""),
+                            e.locator.as_deref().unwrap_or(""),
+                            &e.bandwidth.to_string(),
+                            e.snr.as_deref().unwrap_or(""),
+                        ]
+                        .join("\t")
+                    })
+                    .collect();
+                ui.output_mut(|o| o.copied_text = text.join("\n"));
+                ui.close_menu();
+            }
+            ui.separator();
+            // Then as VarAC: Connect (to the CQ's slot, as a double-click), Rotate Antenna, Ping
+            if ui.button("Connect").on_hover_text(if entry.slot != 0 {
+                format!("QSY to slot {} and connect to {base_call}", entry.slot)
+            } else {
+                format!("Connect to {base_call}")
+            }).clicked() {
                 action = Some(StationAction::ConnectOnSlot(base_call.clone(), entry.slot, age));
                 ui.close_menu();
             }
-            if ui.button(format!("Connect to {} (here)", base_call)).clicked() {
-                action = Some(StationAction::Connect(base_call.clone()));
+            let rotator_on = cached_setting(ui, "rotator_enabled_cache", || crate::config::rotator().is_some());
+            let their_loc = entry.locator.clone().filter(|l| l.len() >= 4).or_else(|| {
+                db.get_contact(&base_call).ok().flatten().and_then(|c| c.locator).filter(|l| l.len() >= 4)
+            });
+            let bearing = their_loc.as_deref().and_then(|l| crate::varac::messages::loc_distance(my_locator, l)).map(|(_, _, b)| b);
+            let rotate = ui.add_enabled(rotator_on && bearing.is_some(), egui::Button::new("Rotate Antenna"));
+            let rotate = if !rotator_on {
+                rotate.on_disabled_hover_text("Set up an antenna rotator (PstRotator) in Settings › RIG")
+            } else if bearing.is_none() {
+                rotate.on_disabled_hover_text(format!("No locator for {base_call}, or none set for you in Settings › Station"))
+            } else {
+                rotate.on_hover_text(format!("Turn to {}°", bearing.unwrap_or_default()))
+            };
+            if rotate.clicked() {
+                if let Some(b) = bearing {
+                    action = Some(StationAction::Rotate(base_call.clone(), b));
+                }
                 ui.close_menu();
             }
-            if ui.button(format!("Send VMail to {}", base_call)).clicked() {
+            if ui.button("Ping (get report)").clicked() {
+                action = Some(StationAction::Ping(base_call.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Send VMail now").clicked() {
                 action = Some(StationAction::SendVMail(base_call.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("QRZ.COM lookup").clicked() {
+                open_qrz_lookup(&base_call);
+                ui.close_menu();
+            }
+            if ui.button("PSK Reporter lookup").clicked() {
+                open_psk_lookup(&base_call);
+                ui.close_menu();
+            }
+            if ui.button("Block callsign").clicked() {
+                action = Some(StationAction::Block(base_call.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Callsign history").clicked() {
+                action = Some(StationAction::History(base_call.clone()));
+                ui.close_menu();
+            }
+            if entry.slot != 0 && ui.button("QSY to slot").on_hover_text(format!("Tune to slot {} without calling", entry.slot)).clicked() {
+                action = Some(StationAction::QsyToSlot(base_call.clone(), entry.slot));
+                ui.close_menu();
+            }
+            // Openslot's own, after VarAC's
+            ui.separator();
+            if entry.slot != 0 && ui.button(format!("Connect to {base_call} here (no QSY)")).clicked() {
+                action = Some(StationAction::Connect(base_call.clone()));
                 ui.close_menu();
             }
             if ui.button("Copy callsign").clicked() {
                 ui.output_mut(|o| o.copied_text = base_call.clone());
                 ui.close_menu();
             }
-            if ui.button(format!("Lookup {} on QRZ", base_call)).clicked() {
-                open_qrz_lookup(&base_call);
+            if cached_setting(ui, "dxcluster_enabled_cache", crate::config::read_dxcluster_enabled)
+                && ui.button("DX Cluster spot").clicked()
+            {
+                action = Some(StationAction::DxSpot(base_call.clone()));
                 ui.close_menu();
             }
-            station_menu_extras(ui, &base_call, &mut action);
-            ui.separator();
-            if ui.button(format!("Add {} to watchlist", base_call)).clicked() {
+            if ui.button(format!("Add {base_call} to watchlist")).clicked() {
                 action = Some(StationAction::AddToWatchlist(base_call.clone()));
                 ui.close_menu();
             }
@@ -6067,6 +6172,29 @@ fn draw_settings_window(
                             });
                             ui.label(RichText::new("FLRig's XML-RPC server: frequency, mode, PTT and the antenna tuner, as VarAC uses it.").small().color(GRAY));
                         });
+
+                        // ---- Antenna rotator (PstRotator)
+                        group(&mut cols[1], "Antenna rotator (PstRotator)", &mut |ui| {
+                            let f = &mut state.settings_form;
+                            ui.checkbox(&mut f.rotator_enabled, "Turn the antenna with \"Rotate Antenna\" in the beacon and CQ menus");
+                            ui.add_enabled_ui(f.rotator_enabled, |ui| {
+                                egui::Grid::new("rotator_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                    ui.label("Host");
+                                    ui.add(TextEdit::singleline(&mut f.rotator_host).desired_width(160.0));
+                                    ui.end_row();
+                                    ui.label("UDP port");
+                                    ui.horizontal(|ui| {
+                                        ui.add(TextEdit::singleline(&mut f.rotator_port).desired_width(60.0));
+                                        if ui.small_button("Default 12000").clicked() {
+                                            f.rotator_host = "127.0.0.1".into();
+                                            f.rotator_port = "12000".into();
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
+                            });
+                            ui.label(RichText::new("PstRotator drives the rotator; turn on its UDP control. The bearing is worked out from your locator (Settings › Station) and the station's. Applies after Save.").small().color(GRAY));
+                        });
                     });
                 }
                 7 => features::draw_ai_settings(ui, &mut state.settings_form),
@@ -6405,6 +6533,9 @@ fn save_config_file(state: &GuiState) {
         verbose_snr_auto_accept: Some(form.verbose_snr_auto_accept),
         allow_last_heard: Some(form.allow_last_heard),
         allow_path_finder: Some(form.allow_path_finder),
+        rotator_enabled: Some(form.rotator_enabled),
+        rotator_host: Some(form.rotator_host.trim().to_string()).filter(|s| !s.is_empty()),
+        rotator_port: form.rotator_port.trim().parse().ok(),
         adif_log_path: Some(form.adif_log_path.trim().to_string()).filter(|v| !v.is_empty()),
         adif_submode: Some(form.adif_submode.trim().to_string()).filter(|s| !s.is_empty()),
         default_log_comment: Some(form.default_log_comment.clone()),
@@ -6833,6 +6964,7 @@ fn draw_qso_log_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage) 
                             let is_selected = state.qso_notes_guid.as_deref() == Some(&qso.guid);
 
                             let resp = ui.horizontal(|ui| {
+                                ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                                 ui.colored_label(GRAY, RichText::new(&start).small());
                                 ui.colored_label(GREEN, RichText::new(&qso.callsign).small().strong());
                                 if let Some(entity) = dxcc_entity(&qso.callsign) {
@@ -7025,6 +7157,7 @@ fn draw_heard_stations_window(ctx: &egui::Context, state: &mut GuiState, db: &St
                             .collect();
                         for (callsign, last_heard, count) in &hs_snapshot {
                             let resp = ui.horizontal(|ui| {
+                                ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                                 ui.colored_label(GREEN, RichText::new(callsign.as_str()).small().strong());
                                 if let Some(entity) = dxcc_entity(callsign) {
                                     ui.colored_label(theme::MUTED, RichText::new(entity).small());
@@ -7148,6 +7281,7 @@ fn draw_bbs_listing_window(ctx: &egui::Context, state: &mut GuiState) {
                     let mut download = None;
                     for (name, date, size) in &snapshot {
                         let resp = ui.horizontal(|ui| {
+                            ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                             ui.colored_label(GREEN, RichText::new(name).strong());
                             ui.colored_label(GRAY, RichText::new(date).small());
                             let text = RichText::new(format!("{size} bytes")).small();
@@ -7391,6 +7525,7 @@ fn draw_bookmarks_window(ctx: &egui::Context, state: &mut GuiState) {
                 ScrollArea::vertical().show(ui, |ui| {
                     for (i, bm) in state.bookmarked_messages.iter().enumerate() {
                         let resp = ui.horizontal(|ui| {
+                            ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                             ui.colored_label(GRAY, RichText::new(&bm.time).small());
                             ui.colored_label(callsign_color(&bm.callsign), RichText::new(format!("{}:", bm.callsign)).strong());
                             ui.label(&bm.text);
@@ -7602,6 +7737,7 @@ fn draw_contacts_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage)
                         let notes = contact.notes.as_deref().unwrap_or("");
 
                         let resp = ui.horizontal(|ui| {
+                            ui.style_mut().interaction.selectable_labels = false; // (so the row, not its labels, takes the clicks)
                             ui.colored_label(GREEN, RichText::new(&contact.callsign).small().strong());
                             ui.colored_label(WHITE, RichText::new(name).small());
                             ui.colored_label(GRAY, RichText::new(qth).small());
