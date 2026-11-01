@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "openslot-windows"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
