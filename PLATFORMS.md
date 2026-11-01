@@ -31,32 +31,28 @@ How the sharing works:
 Each platform folder is its own Cargo/Xcode/Gradle project with its own `target/` or
 `build/` (git-ignored), so building one never touches the root's `target/`.
 
-## Pending in the phone apps (Android, iOS)
+## The phone apps' main-screen controls (Android, iOS)
 
-The desktop apps (Linux, macOS, Windows) share `src/gui`, so these changes reach them on
-their next build. The phone screens are native, so they still need them done by hand:
+The desktop apps (Linux, macOS, Windows) share `src/gui`; the phone screens are native, so
+they have their own versions of the desktop's main-screen controls, on the Chat screen:
 
-1. **Frequency picker on the main screen** (desktop: `draw_control_column` in
-   `src/gui/layout.rs`). The frequency readout itself opens a list with:
-   - the VarAC calling frequencies (`messages::CALLING_FREQUENCIES_HZ`);
-   - **My frequencies**: the operator's own list, kept in the settings, with an Add button
-     for the frequency you're on (optional name) and a remove button for each entry;
-   - a box to type any frequency, parsed like `messages::parse_frequency_input` (MHz below
-     1000, kHz below 1,000,000, else Hz; `14.105.500` is Hz; 100 kHz to 1.3 GHz). The
-     function is shared Rust, so it can be exposed through mobile-core instead of
-     rewritten.
-   Picking one tunes the radio the way choosing a calling frequency does today. The phones
-   currently set the frequency only in Settings.
-2. **Bandwidth buttons on the main screen** (500 / 2300 / 2750, VARA HF only), sending
-   VARA's `BW…` command like VarAC's main-window buttons. Today the phones choose the
-   bandwidth only in Settings (`prefs.bandwidth`, passed to the built-in XARA as `--hf`).
-3. **"Bandwidth not allowed!"**: when a beacon, CQ, connect or ping is refused at
-   2300/2750 Hz on a calling frequency, show VarAC's text with a **Switch to 500 Hz**
-   button (desktop: `draw_bw_refused` in `src/gui/mod.rs`).
+1. **Frequency picker** (desktop: `draw_control_column` in `src/gui/layout.rs`). The dial
+   readout (with its band, and *CF* on a calling frequency) opens a picker with a box to
+   type any frequency, the VarAC calling frequencies, and **My frequencies** (the
+   operator's own list, with Add for the frequency you're on and remove). Typing is parsed
+   by the desktop's `messages::parse_frequency_input`, and the list and band come from
+   `messages` too, through mobile-core's engine-free queries (`parse_frequency`,
+   `calling_frequencies`, `band`). The phones don't tune the radio: picking a frequency
+   logs it and applies the calling-frequency rules there, and the chat says to tune.
+2. **Bandwidth buttons** (500 / 2300 / 2750, VARA HF), sending VARA's `BW…` command when
+   on the air, else kept for when the modem connects. They follow the modem: VARA HF
+   starts at 500 Hz when the modem connects (as VarAC does), and mobile-core sends a
+   `bandwidth` event so the buttons show it.
+3. **"Bandwidth not allowed!"**: a beacon, CQ, connect or ping refused at 2300 Hz on a
+   calling frequency brings up VarAC's text with **Switch to 500 Hz** (desktop:
+   `draw_bw_refused` in `src/gui/mod.rs`; mobile-core sends a `bw_refused` event).
 
-Already done for every platform: VARA HF starts at 500 Hz when the modem connects
-(as VarAC does). mobile-core always did; the Linux, macOS and Windows start-up code
-now does too.
+VARA HF starts at 500 Hz when the modem connects on every platform (as VarAC does).
 
 Note: the macOS and Windows crates were not compiled after this change on the Linux
 machine (they need the `../xara` checkout with `xara-ffi`). The change there is the same

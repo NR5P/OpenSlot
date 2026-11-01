@@ -14,6 +14,7 @@ enum Keys {
     static let welcome = "welcome", welcomeAlways = "welcomeAlways", email = "email", fullCall = "fullCall"
     static let callIdMinutes = "callIdMinutes", idleMinutes = "idleMinutes"
     static let allowLastHeard = "allowLastHeard", multiBandLastHeard = "multiBandLastHeard"
+    static let myFrequencies = "myFrequencies"  // the picker's "My frequencies" (JSON)
 }
 
 /// VarAC's slot system: QSOs move to slots around the calling frequency, 750 Hz apart for
@@ -40,6 +41,23 @@ func mhz(_ hz: Int) -> String {
     var s = String(format: "%.5f", Double(hz) / 1e6)
     while s.hasSuffix("0"), let dot = s.firstIndex(of: "."), s.distance(from: dot, to: s.endIndex) > 4 { s.removeLast() }
     return s
+}
+
+/// The dial readout as the desktop shows it: 14.105.000.
+func dial(_ hz: Int) -> String {
+    String(format: "%d.%03d.%03d", hz / 1_000_000, (hz / 1000) % 1000, hz % 1000)
+}
+
+/// A frequency the operator keeps in the picker, with an optional name.
+struct SavedFrequency: Codable, Hashable {
+    let hz: Int
+    let name: String
+}
+
+/// One of VarAC's calling frequencies.
+struct CallingFrequency: Hashable {
+    let hz: Int
+    let band: String
 }
 
 struct Settings {
@@ -214,6 +232,8 @@ final class Core: ObservableObject {
     @Published var qsyInvitation: QsyInvitation?
     /// We hold VMail for the partner but the link is on the calling frequency
     @Published var vmailRelayAlert: String?
+    /// VarAC's "Bandwidth not allowed!": a wide link was refused on a calling frequency
+    @Published var bwRefused = false
     @Published private(set) var route = AudioRoute.describe()
 
     private var timer: Timer?
@@ -418,6 +438,51 @@ final class Core: ObservableObject {
         send(["cmd": "vmail", "to": to, "subject": subject, "body": body, "urgent": urgent])
     }
 
+    // MARK: frequency and bandwidth (the main screen's picker and buttons)
+
+    /// The operator tuned to `hz` (the phone doesn't tune the radio): log it and apply the
+    /// calling-frequency rules there.
+    func setFrequency(_ hz: Int) {
+        UserDefaults.standard.set(hz, forKey: Keys.frequency)
+        if engineRunning { send(["cmd": "set_frequency", "hz": hz]) }
+        addSystem("Frequency \(mhz(hz)) MHz\(bandOf(hz).map { " (\($0))" } ?? ""): tune your radio there (USB)")
+    }
+
+    /// VARA HF bandwidth: switches the modem now when it's connected, else applies when it does.
+    func setBandwidth(_ bw: String) {
+        UserDefaults.standard.set(bw, forKey: Keys.bandwidth)
+        if engineRunning { send(["cmd": "bandwidth", "bw": bw]) }
+    }
+
+    /// A frequency typed by the operator (MHz, kHz or Hz, as the desktop reads it), in Hz.
+    func parseFrequency(_ text: String) -> Int? {
+        query(["q": "parse_frequency", "text": text]) as? Int
+    }
+
+    private(set) lazy var callingFrequencies: [CallingFrequency] =
+        (query(["q": "calling_frequencies"]) as? [[String: Any]] ?? []).map {
+            CallingFrequency(hz: $0["hz"] as? Int ?? 0, band: $0["band"] as? String ?? "")
+        }
+
+    /// The ham band of `hz` ("20m"), or nil outside the bands.
+    func bandOf(_ hz: Int) -> String? {
+        (query(["q": "band", "hz": hz]) as? [String: Any])?["band"] as? String
+    }
+
+    func isCallingFrequency(_ hz: Int) -> Bool {
+        (query(["q": "band", "hz": hz]) as? [String: Any])?["calling"] as? Bool ?? false
+    }
+
+    var myFrequencies: [SavedFrequency] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: Keys.myFrequencies) else { return [] }
+            return (try? JSONDecoder().decode([SavedFrequency].self, from: data)) ?? []
+        }
+        set {
+            UserDefaults.standard.set(try? JSONEncoder().encode(newValue.sorted { $0.hz < $1.hz }), forKey: Keys.myFrequencies)
+        }
+    }
+
     func vmails(_ folder: String) -> [VMailItem] {
         let list = query(["q": "vmails", "folder": folder]) as? [[String: Any]] ?? []
         return list.map {
@@ -580,6 +645,10 @@ final class Core: ObservableObject {
             qsyInvitation = nil
         case "vmail_relay_alert":
             vmailRelayAlert = e["call"] as? String
+        case "bw_refused":
+            bwRefused = true
+        case "bandwidth":
+            UserDefaults.standard.set(e["bw"] as? String ?? "500", forKey: Keys.bandwidth)
         case "verbose_snr":
             verboseSnr = e["on"] as? Bool ?? false
         case "verbose_snr_invite":

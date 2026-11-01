@@ -9,7 +9,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -215,7 +221,22 @@ fun Dialogs() {
     val qsyBack by Core.qsyBack.collectAsState()
     val qsyInvitation by Core.qsyInvitation.collectAsState()
     val relayAlert by Core.vmailRelayAlert.collectAsState()
+    val bwRefused by Core.bwRefused.collectAsState()
     val partner by Core.partner.collectAsState()
+    if (bwRefused) {
+        // VarAC's box, with the desktop's one-tap switch to 500 Hz
+        AlertDialog(
+            onDismissRequest = { Core.bwRefused.value = false },
+            title = { Text("Bandwidth not allowed!") },
+            text = {
+                Text("You can't use a 2300/2750Hz Bandwidth on a calling QRG as it may cause QRM to nearby VarAC stations.\n" +
+                    "Please note that 500Hz provides great & fast chat experience.\n\n" +
+                    "PLEASE SWITCH YOUR BANDWIDTH TO 500HZ OR CHANGE FREQUENCY.")
+            },
+            confirmButton = { TextButton({ Core.setBandwidth("500"); Core.bwRefused.value = false }) { Text("Switch to 500 Hz") } },
+            dismissButton = { TextButton({ Core.bwRefused.value = false }) { Text("OK") } },
+        )
+    }
     offer?.let {
         AlertDialog(
             onDismissRequest = {},
@@ -349,6 +370,125 @@ fun CqSlotSelector() {
     )
 }
 
+// ---- frequency and bandwidth ----
+
+/**
+ * The dial frequency (tap it for the picker) and VARA HF's bandwidth buttons, as on the
+ * desktop's main screen. The phone doesn't tune the radio: picking a frequency logs it and
+ * applies the calling-frequency rules there.
+ */
+@Composable
+fun FrequencyBar() {
+    val hz by Core.frequency.collectAsState()
+    val bw by Core.bandwidth.collectAsState()
+    var picker by remember { mutableStateOf(false) }
+    val band = remember(hz) { Core.bandOf(hz) }
+    val onCf = remember(hz) { Core.isCallingFrequency(hz) }
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.clickable { picker = true }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(dial(hz), fontFamily = FontFamily.Monospace, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Icon(Icons.Default.ArrowDropDown, "Change frequency")
+        }
+        band?.let { Pill(it, MaterialTheme.colorScheme.primary) }
+        if (onCf) {
+            Spacer(Modifier.size(4.dp))
+            Pill("CF", Color(0xFFE8742A))
+        }
+        Spacer(Modifier.weight(1f))
+        Row(Modifier.clip(RoundedCornerShape(50)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(50))) {
+            listOf("500", "2300", "2750").forEach { b ->
+                val on = bw == b
+                Text(
+                    b, fontSize = 13.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal, maxLines = 1, softWrap = false,
+                    color = if (on) Color.White else MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.background(if (on) MaterialTheme.colorScheme.primary else Color.Transparent)
+                        .clickable { Core.setBandwidth(b) }.padding(horizontal = 8.dp, vertical = 5.dp),
+                )
+            }
+        }
+    }
+    if (picker) FrequencyPicker(hz) { picker = false }
+}
+
+/** The desktop's frequency picker: type any frequency, a VarAC calling frequency, or one of your own. */
+@Composable
+fun FrequencyPicker(current: Long, close: () -> Unit) {
+    var entry by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var mine by remember { mutableStateOf(Core.myFrequencies) }
+    var name by remember { mutableStateOf("") }
+    fun pick(hz: Long) {
+        if (hz != current) Core.setFrequency(hz)
+        close()
+    }
+    fun tune() {
+        Core.parseFrequency(entry)?.let { pick(it) } ?: run { error = "Not a frequency: ${entry.trim()}" }
+    }
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Frequency") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        entry, { entry = it; error = null }, Modifier.weight(1f), singleLine = true, isError = error != null,
+                        placeholder = { Text("14.1055 or 14105.5") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(onGo = { tune() }),
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Button(::tune, enabled = entry.isNotBlank()) { Text("Tune") }
+                }
+                Text(error ?: "MHz below 1000, kHz below 1,000,000, else Hz", style = MaterialTheme.typography.bodySmall,
+                    color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                PickerLabel("VarAC calling frequencies")
+                Core.callingFrequencies.chunked(2).forEach { row ->
+                    Row {
+                        row.forEach { cf -> FreqChoice("${cf.band} ${mhz(cf.hz)}", cf.hz == current, Modifier.weight(1f)) { pick(cf.hz) } }
+                        if (row.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+                PickerLabel("My frequencies")
+                if (mine.isEmpty()) Text("None yet: add the frequency you're on below.", style = MaterialTheme.typography.bodySmall)
+                mine.forEach { f ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val band = Core.bandOf(f.hz) ?: ""
+                        FreqChoice(listOf(mhz(f.hz), band, f.name).filter { it.isNotEmpty() }.joinToString("  "), f.hz == current, Modifier.weight(1f)) {
+                            pick(f.hz)
+                        }
+                        IconButton({ mine = mine - f; Core.myFrequencies = mine }) { Icon(Icons.Default.Close, "Remove from my frequencies") }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(name, { name = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("Name (optional)") })
+                    TextButton({
+                        mine = (mine + SavedFrequency(current, name.trim())).sortedBy { it.hz }
+                        Core.myFrequencies = mine
+                        name = ""
+                    }, enabled = mine.none { it.hz == current }) { Text("Add ${mhz(current)}") }
+                }
+            }
+        },
+        confirmButton = { TextButton(close) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun PickerLabel(text: String) {
+    Text(text, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp))
+}
+
+@Composable
+private fun FreqChoice(label: String, selected: Boolean, modifier: Modifier = Modifier, pick: () -> Unit) {
+    Text(
+        label, fontFamily = FontFamily.Monospace, fontSize = 13.sp, maxLines = 2,
+        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+        modifier = modifier.clip(RoundedCornerShape(6.dp))
+            .background(if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+            .clickable(onClick = pick).padding(horizontal = 6.dp, vertical = 8.dp),
+    )
+}
+
 // ---- chat ----
 
 @Composable
@@ -382,6 +522,7 @@ fun ChatScreen() {
     LaunchedEffect(chat.size) { if (chat.isNotEmpty()) list.animateScrollToItem(chat.size - 1) }
 
     Column(Modifier.fillMaxSize().imePadding()) {
+        FrequencyBar()
         val p = partner
         if (p != null) {
             Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -714,6 +855,7 @@ fun SettingsScreen() {
         prefs.ptt = ptt; prefs.rigctld = rigctld.trim(); prefs.driveDb = drive.toInt()
         prefs.capture = capture; prefs.playback = playback; prefs.allowBuiltIn = allowBuiltIn; prefs.registered = registered
         Core.send("set_frequency", "hz" to prefs.frequency)
+        Core.settingsSaved()
     }
 
     if (showLog) {
@@ -822,7 +964,7 @@ fun SettingsScreen() {
         Header("Radio")
         OutlinedTextField(frequency, { frequency = it.filter(Char::isDigit) }, Modifier.fillMaxWidth(), label = { Text("Dial frequency (Hz)") },
             singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-        Text("For the QSO log; set your radio to this frequency (USB). The phone doesn't tune the radio. " +
+        Text("For the QSO log (also on the Chat screen: tap the frequency); set your radio to it (USB). The phone doesn't tune the radio. " +
             "On a calling frequency only 500 Hz is allowed for CQ, connect, ping and beacon.", style = MaterialTheme.typography.bodySmall)
 
         Header("Status")

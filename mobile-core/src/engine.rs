@@ -535,6 +535,8 @@ impl Bridge {
                 if self.config.bandwidth.trim() != "500" {
                     self.config.bandwidth = "500".into();
                     system("Modem bandwidth set to 500 Hz (VARA HF starts at 500)");
+                    // (so the app's bandwidth buttons show it)
+                    emit(json!({"type": "bandwidth", "bw": "500"}));
                 }
                 emit(json!({"type": "modem", "connected": true}));
             }
@@ -596,7 +598,16 @@ impl Bridge {
                 "Bandwidth not allowed: you can't use a 2300/2750 Hz bandwidth on a calling QRG as it may \
                  cause QRM to nearby VarAC stations. Switch your bandwidth to 500 Hz or change frequency.",
             );
+            // (the app shows VarAC's box, with a switch to 500 Hz)
+            emit(json!({"type": "bw_refused", "bandwidth": self.config.bandwidth, "frequency": self.frequency}));
             return;
+        }
+        // Off the air the bandwidth is just remembered: the modem gets it when it connects
+        if let Command::Bandwidth { bw } = &cmd {
+            if self.session.is_none() {
+                self.config.bandwidth = bw.clone();
+                return;
+            }
         }
         let call = self.call().to_string();
         let Some(mut session) = self.session.take() else {
@@ -1274,6 +1285,7 @@ impl Bridge {
             SessionEvent::Handshake(step) => log(format!("Handshake: {step}")),
             SessionEvent::Notice(m) => system(m),
             SessionEvent::FrameId { .. } => {}
+            SessionEvent::TxStarted { .. } => {}
             SessionEvent::HandshakeComplete => {
                 self.conduct.link_open = true;
                 self.offer_mail().await;
@@ -1651,6 +1663,26 @@ fn unique_path(path: PathBuf) -> PathBuf {
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|p| !p.exists())
         .unwrap_or(path)
+}
+
+/// The frequency picker's reads, the desktop's own functions; they need no engine, so the
+/// picker works offline too. None for any other query.
+///   parse_frequency {text}: the frequency typed, in Hz (null if it isn't one)
+///   calling_frequencies: VarAC's calling frequencies, [{hz, band}]
+///   band {hz}: {band, calling} (band null outside the ham bands)
+pub fn frequency_query(q: &Value) -> Option<Value> {
+    use crate::varac::messages;
+    Some(match q["q"].as_str()? {
+        "parse_frequency" => json!(messages::parse_frequency_input(q["text"].as_str().unwrap_or(""))),
+        "calling_frequencies" => Value::Array(
+            messages::CALLING_FREQUENCIES_HZ.iter().map(|&(hz, band)| json!({"hz": hz, "band": band})).collect(),
+        ),
+        "band" => {
+            let hz = q["hz"].as_u64().unwrap_or(0);
+            json!({"band": messages::band_name(hz), "calling": messages::is_calling_frequency(hz)})
+        }
+        _ => return None,
+    })
 }
 
 /// Reads for the app's lists (`{"q": "...", ...}`), answered as JSON.

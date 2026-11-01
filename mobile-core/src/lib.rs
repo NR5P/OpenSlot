@@ -64,6 +64,9 @@ pub fn command(json: &str) -> Result<(), String> {
 
 pub fn query(json: &str) -> String {
     let q: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    if let Some(v) = engine::frequency_query(&q) {
+        return v.to_string();
+    }
     let engine = ENGINE.lock().unwrap_or_else(PoisonError::into_inner);
     match engine.as_ref() {
         Some(e) => engine::query(&e.db.lock().unwrap_or_else(PoisonError::into_inner), &q).to_string(),

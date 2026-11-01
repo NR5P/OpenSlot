@@ -93,6 +93,15 @@ class Prefs(context: Context) {
     var idleMinutes by int("idleMinutes", 5)
     var allowLastHeard by bool("allowLastHeard", true)
     var multiBandLastHeard by bool("multiBandLastHeard", false)
+    /** The operator's own frequencies (the picker's "My frequencies"), as a JSON array of {hz, name}. */
+    var myFrequenciesJson by string("myFrequencies", "[]")
+    var myFrequencies: List<SavedFrequency>
+        get() = runCatching { JSONArray(myFrequenciesJson) }.getOrDefault(JSONArray()).let { a ->
+            (0 until a.length()).map { SavedFrequency(a.getJSONObject(it).optLong("hz"), a.getJSONObject(it).optString("name")) }
+        }
+        set(list) {
+            myFrequenciesJson = JSONArray(list.sortedBy { it.hz }.map { JSONObject().put("hz", it.hz).put("name", it.name) }).toString()
+        }
 
     /** Settings → QSO and profile, as the engine's `policy` command and config take them. */
     fun policy(o: JSONObject = JSONObject()): JSONObject = o
@@ -207,6 +216,14 @@ fun mhz(hz: Long): String {
     return s
 }
 
+/** The dial readout as the desktop shows it: 14.105.000. */
+fun dial(hz: Long): String = String.format(Locale.US, "%d.%03d.%03d", hz / 1_000_000, (hz / 1000) % 1000, hz % 1000)
+
+/** A frequency the operator keeps in the picker, with an optional name. */
+data class SavedFrequency(val hz: Long, val name: String)
+/** One of VarAC's calling frequencies. */
+data class CallingFrequency(val hz: Long, val band: String)
+
 /** Standing by on our slot after a CQ, until a reply comes or [until] (epoch ms). */
 data class SlotWait(val slot: Int, val label: String, val hz: Long, val cfHz: Long, val until: Long)
 /** A QSY invitation waiting for the operator (ours or the partner's): move to [targetHz]. */
@@ -270,6 +287,11 @@ object Core {
     val qsyInvitation = MutableStateFlow<QsyInvitation?>(null)
     /** We hold VMail for the partner but the link is on the calling frequency. */
     val vmailRelayAlert = MutableStateFlow<String?>(null)
+    /** The dial frequency (Hz) and VARA HF bandwidth, as the main screen shows them. */
+    val frequency = MutableStateFlow(14_105_000L)
+    val bandwidth = MutableStateFlow("500")
+    /** VarAC's "Bandwidth not allowed!": a wide link was refused on a calling frequency. */
+    val bwRefused = MutableStateFlow(false)
     private var typingUntil = 0L
 
     val version: String get() = Native.version()
@@ -277,6 +299,8 @@ object Core {
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = Prefs(context.applicationContext)
+        frequency.value = prefs.frequency
+        bandwidth.value = prefs.bandwidth
         startEngine()
         scope.launch {
             while (isActive) {
@@ -396,6 +420,53 @@ object Core {
     }
 
     // ---- actions ----
+
+    // ---- frequency and bandwidth (the main screen's picker and buttons) ----
+
+    /** The operator tuned to [hz] (the phone doesn't tune the radio): log it and apply the calling-frequency rules there. */
+    fun setFrequency(hz: Long) {
+        prefs.frequency = hz
+        frequency.value = hz
+        if (engineRunning.value) send("set_frequency", "hz" to hz)
+        val band = bandOf(hz)?.let { " ($it)" } ?: ""
+        addSystem("Frequency ${mhz(hz)} MHz$band: tune your radio there (USB)")
+    }
+
+    /** VARA HF bandwidth: switches the modem now when it's connected, else applies when it does. */
+    fun setBandwidth(bw: String) {
+        prefs.bandwidth = bw
+        bandwidth.value = bw
+        if (engineRunning.value) send("bandwidth", "bw" to bw)
+    }
+
+    /** Settings changed the frequency or bandwidth: show them on the main screen too. */
+    fun settingsSaved() {
+        frequency.value = prefs.frequency
+        bandwidth.value = prefs.bandwidth
+    }
+
+    /** A frequency typed by the operator (MHz, kHz or Hz, as the desktop reads it), in Hz. */
+    fun parseFrequency(text: String): Long? = query(JSONObject().put("q", "parse_frequency").put("text", text)).toLongOrNull()
+
+    val callingFrequencies: List<CallingFrequency> by lazy {
+        val a = runCatching { JSONArray(query(JSONObject().put("q", "calling_frequencies"))) }.getOrDefault(JSONArray())
+        (0 until a.length()).map { CallingFrequency(a.getJSONObject(it).optLong("hz"), a.getJSONObject(it).optString("band")) }
+    }
+
+    /** The ham band of [hz] ("20m"), or null outside the bands. */
+    fun bandOf(hz: Long): String? = runCatching {
+        JSONObject(query(JSONObject().put("q", "band").put("hz", hz))).optString("band").takeIf { it.isNotEmpty() && it != "null" }
+    }.getOrNull()
+
+    fun isCallingFrequency(hz: Long): Boolean = runCatching {
+        JSONObject(query(JSONObject().put("q", "band").put("hz", hz))).optBoolean("calling")
+    }.getOrDefault(false)
+
+    var myFrequencies: List<SavedFrequency>
+        get() = prefs.myFrequencies
+        set(v) {
+            prefs.myFrequencies = v
+        }
 
     fun connect(call: String) = send("connect", "call" to call)
     fun ping(call: String) = send("ping", "call" to call)
@@ -625,6 +696,11 @@ object Core {
                 QsyInvitation(e.optLong("target_hz"), e.optBoolean("inviter"), e.optInt("seconds", 30))
             "qsy_invitation_closed" -> qsyInvitation.value = null
             "vmail_relay_alert" -> vmailRelayAlert.value = e.optString("call")
+            "bw_refused" -> bwRefused.value = true
+            "bandwidth" -> {
+                prefs.bandwidth = e.optString("bw", "500")
+                bandwidth.value = prefs.bandwidth
+            }
             "verbose_snr" -> verboseSnr.value = e.optBoolean("on")
             "verbose_snr_invite" -> verboseSnrInvite.value = e.optString("call").ifEmpty { partner.value ?: "The station" }
             "ptt" -> ptt.value = e.optBoolean("on")

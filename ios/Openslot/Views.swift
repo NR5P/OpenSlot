@@ -31,6 +31,13 @@ struct OpenslotApp: App {
                 let q = core.qsyInvitation
                 Text("A QSY request to \(mhz(q?.targetHz ?? 0)) MHz has been initiated. Tap QSY and retune your radio there now. If you fail to QSY quickly, the link might be closed. Rejected automatically in \(q?.seconds ?? 30) seconds.")
             }
+            // VarAC's box, with the desktop's one-tap switch to 500 Hz
+            .alert("Bandwidth not allowed!", isPresented: $core.bwRefused) {
+                Button("Switch to 500 Hz") { core.setBandwidth("500") }
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("You can't use a 2300/2750Hz Bandwidth on a calling QRG as it may cause QRM to nearby VarAC stations.\nPlease note that 500Hz provides great & fast chat experience.\n\nPLEASE SWITCH YOUR BANDWIDTH TO 500HZ OR CHANGE FREQUENCY.")
+            }
             .alert("QSY back", isPresented: Binding(get: { core.qsyBack != nil }, set: { if !$0 { core.qsyBack = nil } })) {
                 Button("Yes, retuned") { if let hz = core.qsyBack { core.backToCf(hz) } }
                 Button("No", role: .cancel) { core.qsyBack = nil }
@@ -199,6 +206,159 @@ struct OnlineButton: View {
     }
 }
 
+// MARK: frequency and bandwidth
+
+/// A small colored label (band, calling frequency).
+struct Pill: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text).font(.caption.bold()).padding(.horizontal, 6).padding(.vertical, 1)
+            .background(color, in: Capsule()).foregroundStyle(.white)
+    }
+}
+
+/// The dial frequency (tap it for the picker) and VARA HF's bandwidth buttons, as on the
+/// desktop's main screen. The phone doesn't tune the radio: picking a frequency logs it and
+/// applies the calling-frequency rules there.
+struct FrequencyBar: View {
+    @EnvironmentObject var core: Core
+    @AppStorage(Keys.frequency) private var frequency = 14_105_000
+    @AppStorage(Keys.bandwidth) private var bandwidth = "500"
+    @State private var picking = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button { picking = true } label: {
+                HStack(spacing: 2) {
+                    Text(dial(frequency)).font(.system(size: 17, weight: .semibold, design: .monospaced)).fixedSize()
+                    Image(systemName: "chevron.down").font(.caption2.bold())
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Frequency \(mhz(frequency)) MHz, change")
+            if let band = core.bandOf(frequency) { Pill(text: band, color: .accentColor) }
+            if core.isCallingFrequency(frequency) { Pill(text: "CF", color: .orange) }
+            Spacer(minLength: 4)
+            Picker("Bandwidth", selection: Binding(get: { bandwidth }, set: { core.setBandwidth($0) })) {
+                Text("500").tag("500")
+                Text("2300").tag("2300")
+                Text("2750").tag("2750")
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(.horizontal).padding(.vertical, 4)
+        .sheet(isPresented: $picking) { FrequencyPicker(current: frequency).environmentObject(core) }
+    }
+}
+
+/// The desktop's frequency picker: type any frequency, a VarAC calling frequency, or one of your own.
+struct FrequencyPicker: View {
+    @EnvironmentObject var core: Core
+    @Environment(\.dismiss) private var dismiss
+    let current: Int
+    @State private var entry = ""
+    @State private var error: String?
+    @State private var mine: [SavedFrequency] = []
+    @State private var name = ""
+
+    private func pick(_ hz: Int) {
+        if hz != current { core.setFrequency(hz) }
+        dismiss()
+    }
+
+    private func tune() {
+        if let hz = core.parseFrequency(entry) {
+            pick(hz)
+        } else {
+            error = "Not a frequency: \(entry.trimmingCharacters(in: .whitespaces))"
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack {
+                        TextField("14.1055 or 14105.5", text: $entry)
+                            .keyboardType(.decimalPad)
+                            .onChange(of: entry) { error = nil }
+                        Button("Tune", action: tune)
+                            .buttonStyle(.borderless)
+                            .disabled(entry.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                } header: { Text("Enter a frequency") } footer: {
+                    Text(error ?? "MHz below 1000, kHz below 1,000,000, else Hz")
+                        .foregroundStyle(error == nil ? Color.secondary : Color.red)
+                }
+                Section("VarAC calling frequencies") {
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], spacing: 4) {
+                        ForEach(core.callingFrequencies, id: \.self) { cf in
+                            choice("\(cf.band) \(mhz(cf.hz))", selected: cf.hz == current) { pick(cf.hz) }
+                        }
+                    }
+                }
+                Section("My frequencies") {
+                    if mine.isEmpty {
+                        Text("None yet: add the frequency you're on below.").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    ForEach(mine, id: \.self) { f in
+                        Button { pick(f.hz) } label: {
+                            HStack {
+                                Text(mhz(f.hz)).monospacedDigit()
+                                Text(core.bandOf(f.hz) ?? "").foregroundStyle(.secondary)
+                                Text(f.name)
+                                Spacer()
+                                if f.hz == current { Image(systemName: "checkmark").foregroundStyle(.tint) }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .onDelete { offsets in
+                        mine.remove(atOffsets: offsets)
+                        core.myFrequencies = mine
+                    }
+                    HStack {
+                        TextField("Name (optional)", text: $name)
+                        Button("Add \(mhz(current))") {
+                            mine = (mine + [SavedFrequency(hz: current, name: name.trimmingCharacters(in: .whitespaces))]).sorted { $0.hz < $1.hz }
+                            core.myFrequencies = mine
+                            name = ""
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(mine.contains { $0.hz == current })
+                    }
+                }
+            }
+            .navigationTitle("Frequency")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+            }
+            .onAppear { mine = core.myFrequencies }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func choice(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.callout.monospaced())
+                .fontWeight(selected ? .bold : .regular)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6).padding(.horizontal, 4)
+                .background(selected ? Color.accentColor.opacity(0.18) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.primary)
+    }
+}
+
 // MARK: chat
 
 struct ChatView: View {
@@ -213,6 +373,7 @@ struct ChatView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 StatusBar()
+                FrequencyBar()
                 if let p = core.partner {
                     HStack {
                         VStack(alignment: .leading) {
@@ -692,7 +853,7 @@ struct SettingsView: View {
                     TextField("Dial frequency (Hz)", value: $frequency, format: .number.grouping(.never)).keyboardType(.numberPad)
                         .onSubmit { core.send(["cmd": "set_frequency", "hz": frequency]) }
                 } header: { Text("Radio") } footer: {
-                    Text("For the QSO log; set your radio to this frequency (USB). The phone doesn't tune the radio. On a calling frequency only 500 Hz is allowed for CQ, connect, ping and beacon.")
+                    Text("For the QSO log (also on the Chat screen: tap the frequency); set your radio to it (USB). The phone doesn't tune the radio. On a calling frequency only 500 Hz is allowed for CQ, connect, ping and beacon.")
                 }
 
                 Section {

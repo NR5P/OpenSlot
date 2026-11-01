@@ -2,7 +2,10 @@
 
 A SwiftUI app around the Rust core (`../mobile-core`), with the **XARA modem built in**:
 
-- **Chat**: call a station (or ping it), chat, disconnect; CQ and beacons; accept file
+- **Chat**: the dial frequency (tap it to type one, pick a VarAC calling frequency or one
+  of your own saved frequencies) and the 500/2300/2750 Hz bandwidth buttons, as on the
+  desktop's main screen; a link refused at 2300 Hz on a calling frequency offers the
+  switch to 500 Hz. Call a station (or ping it), chat, disconnect; CQ and beacons; accept file
   offers and QSY requests; verbose SNR (an SNR report each minute) and SNR requests;
   VarAC's INQUIRE (info, last heard, parked VMail, locator, GPS, version, schedule) and
   QSY requests. Calling a station, you pick the slot to QSY to (VarAC's invitation); VMail
@@ -38,6 +41,4 @@ Received files are in the Files app under *Openslot › Received*.
 
 ## Not done yet
 
-- The frequency picker, the bandwidth buttons and the "Bandwidth not allowed!" switch from the desktop app: see [Pending in the phone apps](../PLATFORMS.md#pending-in-the-phone-apps-android-ios).
-- no app icon
 - tested in the simulator against a XARA modem on the Mac; not yet on a phone with a radio

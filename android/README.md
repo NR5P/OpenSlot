@@ -2,6 +2,8 @@
 
 A Jetpack Compose app around the Rust core (`../mobile-core`), with the **XARA modem
 built in**. Same screens and features as the iOS app: Chat, Stations, VMail, Settings.
+The Chat screen has the desktop's dial frequency picker (type one, pick a VarAC calling
+frequency or one of your own) and the 500/2300/2750 Hz bandwidth buttons.
 
 Plug the radio's USB audio interface (a Digirig or similar) into the phone and pick it
 as *Audio in* and *Audio out* in Settings (a USB device is chosen by default). PTT is VOX
@@ -24,7 +26,6 @@ Received files are in `Android/data/io.github.nr5p.openslot/files/Received`.
 
 ## Not done yet
 
-- The frequency picker, the bandwidth buttons and the "Bandwidth not allowed!" switch from the desktop app: see [Pending in the phone apps](../PLATFORMS.md#pending-in-the-phone-apps-android-ios).
-- no app icon
 - (tr)uSDX audio-over-CAT (XARA's Android app has it; needs the USB serial bridge here)
-- tested in the emulator against a XARA modem on the Mac; not yet on a phone with a radio
+- tested on a phone against XARA on a Mac over the air, speaker to mic (chat both ways,
+  either station calling); not yet with a radio
