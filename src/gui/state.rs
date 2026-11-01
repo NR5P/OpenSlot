@@ -949,7 +949,11 @@ pub struct GuiState {
     pub rig_reconnect_requested: bool,
     pub rig_ptt: bool,
     pub rig_error: Option<String>,
-    pub rig_ports: Vec<String>,
+    pub rig_ports: Vec<crate::rig::PortInfo>,
+    /// Settings → RIG "Detect radio": asked for, then running (the result comes back here)
+    pub rig_detect_requested: bool,
+    pub rig_detect_rx: Option<std::sync::mpsc::Receiver<Result<crate::rig::DetectedRig, String>>>,
+    pub rig_detect_status: Option<String>,
 
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<GuiCommand>,
 }
@@ -1394,6 +1398,9 @@ impl GuiState {
             rig_ptt: false,
             rig_error: None,
             rig_ports: Vec::new(),
+            rig_detect_requested: false,
+            rig_detect_rx: None,
+            rig_detect_status: None,
             cmd_tx,
         }
     }

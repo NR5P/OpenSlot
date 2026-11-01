@@ -183,11 +183,193 @@ pub fn create_rig(backend: &RigBackend) -> Option<Box<dyn RigControl>> {
     }
 }
 
-/// Serial ports present on this machine, for the settings dropdown.
-pub fn list_serial_ports() -> Vec<String> {
+/// A serial port for the settings dropdowns: its name and, where the system says, what it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortInfo {
+    pub name: String,
+    /// What the system calls the device ("Silicon Labs Dual CP2105 USB to UART Bridge:
+    /// Enhanced COM Port"); empty when it doesn't say.
+    pub description: String,
+    /// On a dual-port radio interface: Some(true) for the CAT port, Some(false) for the
+    /// keying (PTT/CW) port. None when the port isn't known to be either.
+    pub cat_port: Option<bool>,
+}
+
+impl PortInfo {
+    /// For the dropdowns: "COM4 — Silicon Labs … Enhanced COM Port (CAT)".
+    pub fn label(&self) -> String {
+        let role = match self.cat_port {
+            Some(true) => " (CAT)",
+            Some(false) => " (PTT/keying)",
+            None => "",
+        };
+        if self.description.is_empty() {
+            format!("{}{role}", self.name)
+        } else {
+            format!("{} — {}{role}", self.name, self.description)
+        }
+    }
+}
+
+/// Silicon Labs CP2105, the dual USB-serial bridge in Yaesu radios (FTDX3000, FT-991, FT-891,
+/// FT-710, FTDX10/101): interface 0 is the Enhanced (CAT) port, 1 the Standard (keying) port.
+const CP2105: (u16, u16) = (0x10c4, 0xea70);
+
+/// Serial ports present on this machine, for the settings dropdowns.
+pub fn list_serial_ports() -> Vec<PortInfo> {
     serialport::available_ports()
-        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .map(|ports| ports.into_iter().map(port_info).collect())
         .unwrap_or_default()
+}
+
+fn port_info(p: serialport::SerialPortInfo) -> PortInfo {
+    let serialport::SerialPortType::UsbPort(usb) = p.port_type else {
+        return PortInfo { name: p.port_name, description: String::new(), cat_port: None };
+    };
+    // Windows gives the device's friendly name, which ends in "(COM4)": the name is shown already.
+    let product = usb.product.unwrap_or_default();
+    let product = product.trim_end_matches(&format!("({})", p.port_name)).trim().to_string();
+    let description = match usb.manufacturer {
+        Some(m) if !m.is_empty() && !product.contains(&m) => format!("{m} {product}").trim().to_string(),
+        _ => product,
+    };
+    let cat_port = if (usb.vid, usb.pid) == CP2105 {
+        usb.interface.map(|i| i == 0)
+    } else {
+        None
+    }
+    .or_else(|| {
+        let d = description.to_ascii_lowercase();
+        if d.contains("enhanced com port") {
+            Some(true)
+        } else if d.contains("standard com port") {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    PortInfo { name: p.port_name, description, cat_port }
+}
+
+/// What "Detect radio" found: the settings to use and the radio's name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectedRig {
+    pub port: String,
+    pub baud: u32,
+    /// As in the settings: "ftdx3000", "yaesu" or "kenwood"
+    pub model: &'static str,
+    pub radio: String,
+}
+
+/// The CAT RATE settings radios offer, most common first.
+const DETECT_BAUDS: [u32; 6] = [38400, 4800, 9600, 19200, 57600, 115200];
+
+/// Looks for a radio on the serial ports by asking each one "ID;" at each baud rate (a read-only
+/// query in both the Yaesu and Kenwood CAT sets). DTR is held low throughout. RTS is raised only on
+/// ports known to be a radio's CAT port, where Yaesu's "CAT RTS" needs it; a port that may key the
+/// transmitter on RTS (a CP2105 Standard port, a Digirig) is never touched with it, and a
+/// CP2105 Standard port is skipped altogether. Takes a few seconds per port; run it off the UI thread.
+pub fn detect_cat(ports: &[PortInfo]) -> Result<DetectedRig, String> {
+    let candidates: Vec<&PortInfo> = ports.iter().filter(|p| p.cat_port != Some(false)).collect();
+    if candidates.is_empty() {
+        return Err("no serial ports found — is the radio's USB cable plugged in and the radio on?".into());
+    }
+    let mut busy = Vec::new();
+    for p in &candidates {
+        for baud in DETECT_BAUDS {
+            match probe_id(&p.name, baud, p.cat_port == Some(true)) {
+                Ok(Some(id)) => {
+                    let (model, radio) = model_for_id(&id);
+                    return Ok(DetectedRig { port: p.name.clone(), baud, model, radio });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    busy.push(format!("{} ({e})", p.name));
+                    break;
+                }
+            }
+        }
+    }
+    let mut msg = "no radio answered on ".to_string() + &candidates.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+    if !busy.is_empty() {
+        msg += &format!("; couldn't open {} — close other programs using it", busy.join(", "));
+    }
+    msg += ". Check the radio is on and its CAT RATE, or set the port and baud by hand and press TEST.";
+    Err(msg)
+}
+
+/// One "ID;" at one baud rate: Ok(Some(id digits)) on a reply, Ok(None) on silence or noise.
+fn probe_id(port: &str, baud: u32, raise_rts: bool) -> Result<Option<String>, String> {
+    use std::io::{Read, Write};
+    let mut sp = serialport::new(port, baud)
+        .timeout(Duration::from_millis(50))
+        .stop_bits(serialport::StopBits::Two)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .flow_control(serialport::FlowControl::None)
+        .open()
+        .map_err(|e| e.to_string())?;
+    let _ = sp.write_data_terminal_ready(false);
+    let _ = sp.write_request_to_send(raise_rts);
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = sp.clear(serialport::ClearBuffer::Input);
+    // A "?;" means the baud rate is right but the radio got junk with it (left from probing at
+    // another rate): ask once more. (A leading ';' to clear it won't do: the FTDX3000 answers
+    // "?;" to the empty command and drops the rest.)
+    let mut found = None;
+    for _ in 0..2 {
+        sp.write_all(b"ID;").map_err(|e| e.to_string())?;
+        let _ = sp.flush();
+        let mut reply = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(350);
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline && found.is_none() {
+            match sp.read(&mut buf) {
+                Ok(n) => reply.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            found = find_id(&reply);
+        }
+        if found.is_some() || !String::from_utf8_lossy(&reply).contains("?;") {
+            break;
+        }
+    }
+    let _ = sp.write_request_to_send(false);
+    Ok(found)
+}
+
+/// The digits of an "ID0462;" (Yaesu) or "ID020;" (Kenwood) reply anywhere in what came back;
+/// radios with auto information on send other replies around it.
+fn find_id(reply: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(reply);
+    s.match_indices("ID").find_map(|(i, _)| {
+        let rest = &s[i + 2..];
+        let end = rest.find(';')?;
+        let digits = &rest[..end];
+        ((digits.len() == 3 || digits.len() == 4) && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.to_string())
+    })
+}
+
+/// The settings model and a name for a radio's ID reply (Yaesu IDs as in Hamlib's newcat).
+fn model_for_id(id: &str) -> (&'static str, String) {
+    let yaesu = match id {
+        "0462" => Some(("ftdx3000", "Yaesu FTDX3000")),
+        "0310" => Some(("ftdx3000", "Yaesu FT-950")),
+        "0583" => Some(("ftdx3000", "Yaesu FTDX1200")),
+        "0570" => Some(("yaesu", "Yaesu FT-991/991A")),
+        "0650" => Some(("yaesu", "Yaesu FT-891")),
+        "0800" => Some(("yaesu", "Yaesu FT-710")),
+        "0761" => Some(("yaesu", "Yaesu FTDX10")),
+        "0681" => Some(("yaesu", "Yaesu FTDX101D")),
+        "0682" => Some(("yaesu", "Yaesu FTDX101MP")),
+        _ => None,
+    };
+    match yaesu {
+        Some((model, name)) => (model, name.to_string()),
+        None if id.len() == 4 => ("yaesu", format!("Yaesu radio (ID {id})")),
+        None => ("kenwood", format!("Kenwood-compatible radio (ID {id})")),
+    }
 }
 
 #[allow(dead_code)]
@@ -645,6 +827,35 @@ mod tests {
             RigBackend::CatSerial { port: "/dev/ttyUSB0".into(), baud: 38400, model: CatModel::KenwoodGeneric }
         );
         assert_eq!(RigBackend::from_settings("none", "", "", "", "", ""), RigBackend::None);
+    }
+
+    /// The ID reply is found among auto-information output, and noise isn't taken for one.
+    #[test]
+    fn detect_reads_id_replies() {
+        assert_eq!(find_id(b"RM0000;RM0000;ID0462;?;RM0000;"), Some("0462".into()));
+        assert_eq!(find_id(b"ID020;"), Some("020".into()));
+        assert_eq!(find_id(b"\x7b\xff\xff"), None);
+        assert_eq!(find_id(b"ID04"), None);
+        assert_eq!(find_id(b"IDX12;"), None);
+        assert_eq!(model_for_id("0462"), ("ftdx3000", "Yaesu FTDX3000".into()));
+        assert_eq!(model_for_id("0570").0, "yaesu");
+        assert_eq!(model_for_id("9999").0, "yaesu");
+        assert_eq!(model_for_id("020").0, "kenwood");
+    }
+
+    #[test]
+    fn port_labels() {
+        let p = PortInfo { name: "COM4".into(), description: "Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port".into(), cat_port: Some(true) };
+        assert_eq!(p.label(), "COM4 — Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port (CAT)");
+        let p = PortInfo { name: "/dev/ttyS0".into(), description: String::new(), cat_port: None };
+        assert_eq!(p.label(), "/dev/ttyS0");
+    }
+
+    /// A port that may key on RTS is never probed (detect_cat filters it before opening).
+    #[test]
+    fn detect_skips_keying_ports() {
+        let keying = PortInfo { name: "COM3".into(), description: String::new(), cat_port: Some(false) };
+        assert!(detect_cat(&[keying]).unwrap_err().starts_with("no serial ports found"));
     }
 
     /// A QSY agreed on the air moves the VFO relative to where it is (rig worker,

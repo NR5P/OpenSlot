@@ -70,7 +70,7 @@ VARA HF always starts at 500 Hz bandwidth, like VarAC. Change it during a sessio
 
 Choose how Openslot reaches the radio:
 
-- **COM Port (CAT)** talks to the radio directly. Pick the radio family, the serial port and the baud rate. On a radio with a dual USB-serial chip (for example the FTDX3000), pick the "Enhanced" port.
+- **COM Port (CAT)** talks to the radio directly. Pick the radio family, the serial port and the baud rate (the radio's CAT RATE menu setting), or press **Detect radio** to have Openslot find them: it asks each port for the radio's ID, which never keys the transmitter. The port list says what each port is; on a radio with a dual USB-serial chip (Yaesu FTDX3000, FT-991, FT-891, FT-710, FTDX10/101) CAT is on the port marked **(CAT)**, the "Enhanced" one, and the one marked **(PTT/keying)**, the "Standard" one, is for PTT.
 - **TCP (rigctld)** uses Hamlib's rigctld (default port 4532). Programs like RigHelm can share one radio between Openslot and WSJT-X this way.
 - **FLRig** uses FLRig's XML-RPC server (default port 12345).
 - **None**: no rig control.

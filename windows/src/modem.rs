@@ -185,7 +185,7 @@ pub struct BuiltInModem {
     show_log: bool,
     inputs: Vec<(String, String)>,
     outputs: Vec<(String, String)>,
-    serial_ports: Vec<String>,
+    serial_ports: Vec<crate::rig::PortInfo>,
     refresh_devices_later: bool,
     /// Start again once the current stop finishes (settings changed while running).
     restart_after_stop: bool,
@@ -328,9 +328,7 @@ impl BuiltInModem {
             }
             Err(e) => self.status = format!("Can't list audio devices: {e}"),
         }
-        self.serial_ports = xara::audio::list(xara::audio::Backend::Trusdx)
-            .map(|(p, _)| p.into_iter().map(|(n, _)| n).filter(|n| n != "app").collect())
-            .unwrap_or_default();
+        self.serial_ports = crate::rig::list_serial_ports();
     }
 
     /// The modem bar (above the GUI's own menu bar) and the modem's windows.
@@ -446,14 +444,27 @@ impl BuiltInModem {
                     match d.ptt.as_str() {
                         "rts" | "dtr" => {
                             ui.label("Serial port");
-                            egui::ComboBox::from_id_salt("xara_serial")
-                                .width(320.0)
-                                .selected_text(if d.ptt_serial.is_empty() { "Choose…" } else { &d.ptt_serial })
-                                .show_ui(ui, |ui| {
-                                    for p in &self.serial_ports {
-                                        ui.selectable_value(&mut d.ptt_serial, p.clone(), p);
-                                    }
-                                });
+                            let shown = match self.serial_ports.iter().find(|p| p.name == d.ptt_serial) {
+                                Some(p) => p.label(),
+                                None if d.ptt_serial.is_empty() => "Choose…".to_string(),
+                                None => d.ptt_serial.clone(),
+                            };
+                            egui::ComboBox::from_id_salt("xara_serial").width(320.0).selected_text(shown).show_ui(ui, |ui| {
+                                for p in &self.serial_ports {
+                                    ui.selectable_value(&mut d.ptt_serial, p.name.clone(), p.label());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            ui.label(
+                                RichText::new(
+                                    "On a radio with two serial ports (Yaesu FTDX3000, FT-991…) key on the one marked \
+                                     (PTT/keying), the Standard port, and set the radio's PC keying menu to RTS or DTR \
+                                     to match. Or leave PTT on VOX here and use CAT PTT in Settings › RIG.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                             ui.end_row();
                         }
                         "cm108" => {

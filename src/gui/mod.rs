@@ -2568,6 +2568,42 @@ impl VaracApp {
             }
         }
 
+        // "Detect radio" in Settings → RIG: close our own CAT port so it can be probed, then
+        // look for the radio off the UI thread
+        if self.state.rig_detect_requested {
+            self.state.rig_detect_requested = false;
+            self.ptt_router.set_target(None);
+            self.rig = None;
+            self.state.rig_connected = false;
+            self.state.rig_ptt = false;
+            self.state.rig_ports = crate::rig::list_serial_ports();
+            let ports = self.state.rig_ports.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // (the port the old manager held is released once its worker stops)
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = tx.send(crate::rig::detect_cat(&ports));
+            });
+            self.state.rig_detect_rx = Some(rx);
+            self.state.rig_detect_status = Some("Looking for the radio…".into());
+        }
+        if let Some(r) = self.state.rig_detect_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.state.rig_detect_rx = None;
+            match r {
+                Ok(d) => {
+                    self.state.rig_detect_status =
+                        Some(format!("Found {} on {} at {} baud. Press Save to keep it.", d.radio, d.port, d.baud));
+                    self.state.rig_settings_backend = "cat".into();
+                    self.state.rig_settings_serial = d.port;
+                    self.state.rig_settings_baud = d.baud.to_string();
+                    self.state.rig_settings_model = d.model.into();
+                }
+                Err(e) => self.state.rig_detect_status = Some(format!("Not found: {e}")),
+            }
+            // Connect with what was found, or back to the settings as they were
+            self.state.rig_reconnect_requested = true;
+        }
+
         // Rig (re)connect on settings save or the Reconnect button
         if self.state.rig_reconnect_requested {
             self.state.rig_reconnect_requested = false;
@@ -5899,15 +5935,20 @@ fn draw_settings_window(
                                     ui.end_row();
                                     ui.label("Port");
                                     ui.horizontal(|ui| {
+                                        let shown = state
+                                            .rig_ports
+                                            .iter()
+                                            .find(|p| p.name == state.rig_settings_serial)
+                                            .map_or_else(|| state.rig_settings_serial.clone(), |p| p.label());
                                         egui::ComboBox::from_id_salt("rig_serial_pick")
-                                            .selected_text(&state.rig_settings_serial)
-                                            .width(190.0)
+                                            .selected_text(shown)
+                                            .width(320.0)
                                             .show_ui(ui, |ui| {
                                                 if state.rig_ports.is_empty() {
                                                     ui.label("No serial ports found");
                                                 }
                                                 for p in state.rig_ports.clone() {
-                                                    ui.selectable_value(&mut state.rig_settings_serial, p.clone(), p);
+                                                    ui.selectable_value(&mut state.rig_settings_serial, p.name.clone(), p.label());
                                                 }
                                             });
                                         if ui.small_button("Rescan").clicked() {
@@ -5929,8 +5970,26 @@ fn draw_settings_window(
                                         });
                                     ui.end_row();
                                 });
+                                ui.horizontal(|ui| {
+                                    let detecting = state.rig_detect_rx.is_some();
+                                    if ui
+                                        .add_enabled(!detecting, egui::Button::new("Detect radio"))
+                                        .on_hover_text("Asks each serial port for the radio's ID (read-only, never keys the radio) and fills in radio, port and baud")
+                                        .clicked()
+                                    {
+                                        state.rig_detect_requested = true;
+                                    }
+                                    if detecting {
+                                        ui.spinner();
+                                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                                    }
+                                    if let Some(s) = &state.rig_detect_status {
+                                        let color = if s.starts_with("Found") { theme::GREEN } else if detecting { GRAY } else { RED };
+                                        ui.colored_label(color, RichText::new(s).small());
+                                    }
+                                });
                                 ui.label(RichText::new("8 data bits, no parity; 2 stop bits for Yaesu, 1 for Kenwood. DTR held low, RTS high for Yaesu (CAT RTS).").small().color(GRAY));
-                                ui.label(RichText::new("On a CP2105 radio (FTDX3000) pick the Enhanced port (…-if00).").small().color(GRAY));
+                                ui.label(RichText::new("Radios with two serial ports (Yaesu FTDX3000, FT-991, FT-891, FT-710, FTDX10/101) take CAT on the one marked (CAT), the Enhanced port; the other is for PTT/keying. The baud rate is the radio's CAT RATE menu setting.").small().color(GRAY));
                             } else if state.rig_settings_backend == "rigctld" {
                                 ui.label(RichText::new("Host and port are set under Hamlib (Rigctld) on the right").small().color(GRAY));
                             } else if state.rig_settings_backend == "flrig" {

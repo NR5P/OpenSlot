@@ -31,7 +31,7 @@ ab_glyph = "0.2"
 notify-rust = "4"
 open = "5"
 rfd = "0.15"
-serialport = "4"
+serialport = { version = "4", features = ["usbportinfo-interface"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
