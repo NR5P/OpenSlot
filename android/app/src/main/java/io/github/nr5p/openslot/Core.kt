@@ -281,6 +281,9 @@ object Core {
     val qsyInviteFrom = MutableStateFlow<Long?>(null)
     var qsyInviteOnCf = true
         private set
+    /** When the picker stays by itself (epoch ms; 0 = not open), as the desktop's does after 80 s. */
+    var qsyInviteUntil = 0L
+        private set
     /** "Your QSO is over. Back to the calling frequency?" (its frequency in Hz). */
     val qsyBack = MutableStateFlow<Long?>(null)
     /** VarAC's "QSY NOW" countdown: answer with answerQsy (rejected by itself when it runs out). */
@@ -500,6 +503,7 @@ object Core {
     /** Our QSY invitation in the opening handshake (0 = stay on the calling frequency). */
     fun qsyInvite(slot: Int) {
         qsyInviteFrom.value = null
+        qsyInviteUntil = 0
         send("qsy_invite", "slot" to slot)
     }
 
@@ -600,6 +604,11 @@ object Core {
             ModemService.instance?.stopSelf()
         }
         if (typing.value && System.currentTimeMillis() > typingUntil) typing.value = false
+        // Nobody picked a slot: stay, before the engine gives up on the invitation (90 s) and the link goes silent
+        if (qsyInviteFrom.value != null && qsyInviteUntil != 0L && System.currentTimeMillis() > qsyInviteUntil) {
+            addSystem("No slot chosen: staying on this frequency")
+            qsyInvite(0)
+        }
     }
 
     private fun handle(e: JSONObject) {
@@ -689,6 +698,7 @@ object Core {
             "slot_wait_end" -> slotWait.value = null
             "qsy_invite_request" -> {
                 qsyInviteOnCf = e.optBoolean("on_cf", true)
+                qsyInviteUntil = System.currentTimeMillis() + 80_000
                 qsyInviteFrom.value = e.optLong("cf_hz", prefs.frequency)
             }
             "qsy_back" -> qsyBack.value = e.optLong("cf_hz")

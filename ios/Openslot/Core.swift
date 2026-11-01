@@ -226,6 +226,8 @@ final class Core: ObservableObject {
     /// We called and the partner allows auto-QSY: pick the slot (the calling frequency in Hz)
     @Published var qsyInviteFrom: Int?
     private(set) var qsyInviteOnCf = true
+    /// When the picker stays by itself, as the desktop's does after 80 s
+    private(set) var qsyInviteUntil: Date?
     /// "Your QSO is over. Back to the calling frequency?" (its frequency in Hz)
     @Published var qsyBack: Int?
     /// VarAC's "QSY NOW" countdown: answer with answerQsy (rejected by itself when it runs out)
@@ -386,6 +388,7 @@ final class Core: ObservableObject {
     /// Our QSY invitation in the opening handshake (0 = stay on the calling frequency).
     func qsyInvite(slot: Int) {
         qsyInviteFrom = nil
+        qsyInviteUntil = nil
         send(["cmd": "qsy_invite", "slot": slot])
     }
 
@@ -539,6 +542,11 @@ final class Core: ObservableObject {
             status = "XARA stopped: \(log.last { $0.hasPrefix("xara: ") }.map { String($0.dropFirst(6)) } ?? "see Log")"
         }
         if partnerTyping && Date() > typingUntil { partnerTyping = false }
+        // Nobody picked a slot: stay, before the engine gives up on the invitation (90 s) and the link goes silent
+        if qsyInviteFrom != nil, let until = qsyInviteUntil, Date() > until {
+            addSystem("No slot chosen: staying on this frequency")
+            qsyInvite(slot: 0)
+        }
         // The modem may still be opening its ports: try again until the deadline.
         if let d = connectDeadline, !modemConnected, Date() > d {
             connectDeadline = nil
@@ -635,6 +643,7 @@ final class Core: ObservableObject {
             slotWait = nil
         case "qsy_invite_request":
             qsyInviteOnCf = e["on_cf"] as? Bool ?? true
+            qsyInviteUntil = Date().addingTimeInterval(80)
             qsyInviteFrom = e["cf_hz"] as? Int ?? Settings().frequency
         case "qsy_back":
             qsyBack = e["cf_hz"] as? Int

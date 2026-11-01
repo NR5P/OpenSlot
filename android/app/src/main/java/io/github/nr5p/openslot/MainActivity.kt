@@ -321,11 +321,20 @@ fun SlotList(slot: Int, cf: Long, pick: (Int) -> Unit) {
 fun QsyInvitePicker(cf: Long) {
     val context = LocalContext.current
     var slot by remember { mutableIntStateOf(Prefs(context).cqSlot) }
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(cf) {
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
     AlertDialog(
         onDismissRequest = {},
         title = { Text("QSY invitation") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("Staying automatically in ${maxOf(0L, (Core.qsyInviteUntil - now) / 1000)} s",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 SlotList(slot, cf) { slot = it }
                 Spacer(Modifier.size(8.dp))
                 Text(

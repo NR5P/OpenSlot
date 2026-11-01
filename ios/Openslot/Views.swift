@@ -139,7 +139,11 @@ struct QsyInvitePicker: View {
             List {
                 Section {
                     SlotRows(slot: $slot, cf: cf)
-                } header: { Text("QSY to") } footer: {
+                } header: {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text("QSY to · staying automatically in \(max(0, Int(core.qsyInviteUntil?.timeIntervalSince(ctx.date) ?? 0))) s")
+                    }
+                } footer: {
                     Text(slot == 0
                          ? (onCf ? "Slot 0 stays on the calling frequency; links left there are closed after 4 minutes." : "Slot 0 stays where you are.")
                          : "Both stations move to \(mhz(cf + Slots.offset(slot))) MHz. Retune your radio when the QSY is agreed.")
