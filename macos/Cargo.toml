@@ -48,6 +48,8 @@ serialport = { version = "4", features = ["usbportinfo-interface"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Optional encryption and signing (src/varac/secure.rs); already here through rustls
+ring = "0.17"
 webpki-roots = "1"
 mail-parser = "1.0.0"
 sha1 = "0.10"

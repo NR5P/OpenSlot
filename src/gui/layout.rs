@@ -2215,6 +2215,11 @@ pub(super) fn send_typed(state: &mut GuiState, db: &Storage, qso_guid: &Option<S
                 reply_to: reply_id.map(|i| i.to_string()),
                 reply_quote: quote,
                 tx: Some(crate::gui::state::TxStage::Queued),
+                secure: if state.link_encrypted {
+                    Some(crate::gui::state::LineSecurity::Encrypted)
+                } else {
+                    state.settings_form.sign_messages.then_some(crate::gui::state::LineSecurity::Signed)
+                },
                 ..Default::default()
             });
             if let Some(guid) = qso_guid {

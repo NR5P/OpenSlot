@@ -634,7 +634,7 @@ impl Bridge {
             }
             Command::Chat { text } => {
                 let wire = text.replace('\n', "//n");
-                let r = sess.send_chat(&wire).await;
+                let r = sess.send_typed(&wire).await;
                 if r.is_ok() {
                     emit(json!({"type": "chat", "from": call, "text": text, "outgoing": true, "time": now_hm()}));
                     self.store_chat(2, &call, &text);
@@ -1284,6 +1284,9 @@ impl Bridge {
             }
             SessionEvent::Handshake(step) => log(format!("Handshake: {step}")),
             SessionEvent::Notice(m) => system(m),
+            // (no Security settings on the phones yet: they show what the partner's keys and
+            // signatures say)
+            SessionEvent::Secure(n) => system(n.text()),
             SessionEvent::FrameId { .. } => {}
             SessionEvent::TxStarted { .. } => {}
             SessionEvent::RxProgress { .. } => {}

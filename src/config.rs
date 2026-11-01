@@ -306,6 +306,11 @@ pub struct ConfigFile {
     /// VarAC [VMAIL] SendRelayNotifications / AllowParking (both ON by default)
     pub send_relay_notifications: Option<bool>,
     pub allow_parking: Option<bool>,
+    /// Openslot: encrypt links with Openslot stations that have it on too (off by default;
+    /// not allowed on amateur frequencies)
+    pub encryption: Option<bool>,
+    /// Openslot: sign what we type and our VMail (off by default)
+    pub signing: Option<bool>,
     /// VarAC [APPEARANCE] UITheme: DEFAULT or SCIFI
     pub ui_theme: Option<String>,
     /// VarAC MuteAllSounds and the Play…Sound switches (keys of the sounds switched off)
@@ -847,6 +852,16 @@ pub fn rotator() -> Option<(String, u16)> {
             f.rotator_port.unwrap_or(12000),
         )
     })
+}
+
+/// Openslot's encryption and signing as the config file sets them, with the station keys
+/// kept next to it (`keys.json`).
+pub fn apply_secure(p: &crate::varac::secure::SecurePolicy) {
+    if let Some(dir) = config_dir() {
+        p.open_keyring(dir.join("keys.json"));
+    }
+    let f = read_config_file().unwrap_or_default();
+    p.set(f.encryption.unwrap_or(false), f.signing.unwrap_or(false));
 }
 
 pub fn path_finder_enabled() -> bool {

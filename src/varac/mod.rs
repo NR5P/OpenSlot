@@ -18,3 +18,4 @@ pub mod images;
 pub mod logbook;
 pub mod scheduler;
 pub mod pskreporter;
+pub mod secure;

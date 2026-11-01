@@ -851,6 +851,7 @@ dependencies = [
  "mail-parser",
  "md-5",
  "openslot-eframe-fonts",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

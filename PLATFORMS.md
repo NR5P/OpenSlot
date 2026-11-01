@@ -66,6 +66,14 @@ they have their own versions of the desktop's main-screen controls, on the Chat 
 3. **"Bandwidth not allowed!"**: a beacon, CQ, connect or ping refused at 2300 Hz on a
    calling frequency brings up VarAC's text with **Switch to 500 Hz** (desktop:
    `draw_bw_refused` in `src/gui/mod.rs`; mobile-core sends a `bw_refused` event).
+4. **Security settings** (desktop: `draw_security_settings` in `src/gui/mod.rs`): the
+   two switches *Encrypt links with other Openslot stations* and *Sign my messages and
+   VMail* (both off by default), applied with `policy.secure.set(encrypt, sign)` after
+   `policy.secure.open_keyring(<app data>/keys.json)`; your key's fingerprint and the
+   saved stations' keys (`stations()`, `accept_new_key`, `forget`). The phones already
+   send typed chat through `send_typed` and show the partner's key and signature notes as
+   system lines, so with this they work like the desktop. Desktop chat lines also get a
+   🔒 / ✔ / ⚠ mark.
 
 VARA HF starts at 500 Hz when the modem connects on every platform (as VarAC does).
 

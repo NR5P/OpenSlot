@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.file_size_limit.store(f.incoming_files_size_limit.unwrap_or(5000), std::sync::atomic::Ordering::Relaxed);
             p.auto_file.store(em.auto_file, std::sync::atomic::Ordering::Relaxed);
             p.allow_parking.store(f.allow_parking.unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+            config::apply_secure(&p.secure);
             let ai = config::ai_settings();
             p.ai_gateway.store(ai.enabled && ai.announce, std::sync::atomic::Ordering::Relaxed);
             p

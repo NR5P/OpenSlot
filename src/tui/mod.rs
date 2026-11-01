@@ -591,7 +591,7 @@ async fn handle_action(
             // Convert newlines to VarAC line separator for outgoing
             // (VarAC sends line breaks as they are, CRLF)
             let wire_text = text.replace("\r\n", "\n").replace('\n', "\r\n");
-            match sess.send_chat(&wire_text).await {
+            match sess.send_typed(&wire_text).await {
                 Ok(()) => {
                     let ts = Utc::now().format("%H:%M:%S").to_string();
                     app.add_chat(ChatLine {
@@ -952,6 +952,7 @@ async fn handle_session_event(
         }
         SessionEvent::Handshake(step) => app.add_log(format!("Handshake: {step}")),
         SessionEvent::Notice(m) => app.add_log(m),
+        SessionEvent::Secure(n) => app.add_log(n.text().to_string()),
         // No countdown window here: accept straight away (a frequency we can't place, no)
         SessionEvent::QsyInvitation { target, .. } => {
             use crate::varac::session::QsyTarget;
