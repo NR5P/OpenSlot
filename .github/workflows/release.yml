@@ -1,8 +1,10 @@
-# Builds the Linux download and attaches it to a GitHub release. Push a tag to run it:
+# Builds the Linux and Windows downloads and attaches them to a GitHub release. Push a tag
+# to run it:
 #
 #   git tag v0.1.0 && git push openslot v0.1.0
 #
-# The Mac app needs the XARA checkout next to this repository, so it's built with
+# The Windows app has the XARA modem built in from a checkout next to this repository, so
+# its job checks out NR5P/xara beside it. The Mac app needs the same, so it's built with
 # macos/bundle.sh and added to the same release by hand. Releases are marked as
 # pre-releases while Openslot is still in testing.
 name: Release
@@ -44,6 +46,49 @@ jobs:
 
       - name: Release
         run: |
+          # (the Windows job may have made it first)
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --title "Openslot $TAG" \
-            --notes "Test build for Linux (x86_64) and Mac (Apple silicon and Intel). Windows, iPhone/iPad and Android builds come later."
+            --notes "$NOTES" || gh release view "$TAG" >/dev/null
           gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+        env:
+          NOTES: Test build for Linux (x86_64), Windows (x86_64) and Mac (Apple silicon and Intel). iPhone/iPad and Android builds come later.
+
+  windows:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # windows/Cargo.toml takes XARA from ../../xara: check both out side by side
+      - uses: actions/checkout@v4
+        with:
+          path: OpenSlot
+      - uses: actions/checkout@v4
+        with:
+          repository: NR5P/xara
+          path: xara
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path OpenSlot/windows/Cargo.toml
+
+      - name: Package
+        run: |
+          dir="openslot-$TAG-windows-x86_64"
+          mkdir -p "$dir"
+          cp OpenSlot/windows/target/release/openslot.exe OpenSlot/README.md "$dir/"
+          cp OpenSlot/windows/README.md "$dir/README-Windows.md"
+          7z a "$dir.zip" "$dir" >/dev/null
+          sha256sum "$dir.zip" > "$dir.zip.sha256"
+          echo "ASSET=$dir.zip" >> "$GITHUB_ENV"
+
+      - name: Release
+        run: |
+          # (the Linux job may have made it first)
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --prerelease --title "Openslot $TAG" --notes "$NOTES" || gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$ASSET" "$ASSET.sha256" --clobber
+        env:
+          NOTES: Test build for Linux (x86_64), Windows (x86_64) and Mac (Apple silicon and Intel). iPhone/iPad and Android builds come later.
