@@ -3,9 +3,9 @@
 #
 #   git tag v0.1.0 && git push openslot v0.1.0
 #
-# The Windows app has the XARA modem built in from a checkout next to this repository, so
-# its job checks out NR5P/xara beside it. The Mac app needs the same, so it's built with
-# macos/bundle.sh and added to the same release by hand. Releases are marked as
+# The Linux and Windows apps have the XARA modem built in from a checkout next to this
+# repository, so their jobs check out NR5P/xara beside it. The Mac app needs the same, so it's
+# built with macos/bundle.sh and added to the same release by hand. Releases are marked as
 # pre-releases while Openslot is still in testing.
 name: Release
 
@@ -23,23 +23,32 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
     steps:
+      # linux/Cargo.toml takes XARA from ../../xara: check both out side by side
       - uses: actions/checkout@v4
+        with:
+          path: OpenSlot
+      - uses: actions/checkout@v4
+        with:
+          repository: NR5P/xara
+          path: xara
 
       - name: Build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libudev-dev libxkbcommon-dev \
-            libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+            libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libpulse-dev libasound2-dev
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --manifest-path OpenSlot/linux/Cargo.toml
 
       - name: Package
         run: |
           dir="openslot-$TAG-linux-x86_64"
           mkdir -p "$dir"
-          cp target/release/openslot README.md assets/linux/openslot.desktop "$dir/"
-          cp assets/icon/openslot-256.png "$dir/openslot.png"
+          cp OpenSlot/linux/target/release/openslot OpenSlot/README.md OpenSlot/assets/linux/openslot.desktop "$dir/"
+          cp OpenSlot/linux/README.md "$dir/README-Linux.md"
+          cp OpenSlot/assets/icon/openslot-256.png "$dir/openslot.png"
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
@@ -47,9 +56,9 @@ jobs:
       - name: Release
         run: |
           # (the Windows job may have made it first)
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --title "Openslot $TAG" \
-            --notes "$NOTES" || gh release view "$TAG" >/dev/null
-          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --prerelease --title "Openslot $TAG" --notes "$NOTES" || gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$ASSET" "$ASSET.sha256" --clobber
         env:
           NOTES: Test build for Linux (x86_64), Windows (x86_64) and Mac (Apple silicon and Intel). iPhone/iPad and Android builds come later.
 
