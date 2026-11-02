@@ -114,8 +114,9 @@ impl RigControl for RigctldClient {
     }
 
     fn set_mode(&mut self, mode: RadioMode) -> RigResult<()> {
-        // Passband 0 = radio's default for the mode.
-        let reply = self.send_cmd(&format!("M {} 0", rigctld_mode_str(mode)))?;
+        // Passband -1 = leave the radio's filter alone. 0 would mean "the mode's default",
+        // and Hamlib then narrows the receive filter (2400 → 2000 Hz on an FTDX3000).
+        let reply = self.send_cmd(&format!("M {} -1", rigctld_mode_str(mode)))?;
         Self::check_rprt(&reply)
     }
 
@@ -198,7 +199,10 @@ mod tests {
                         "RPRT 0\n".into()
                     } else if line == "m" {
                         "PKTUSB\n3000\n".into()
-                    } else if line.starts_with('M') || line.starts_with('T') {
+                    } else if let Some(m) = line.strip_prefix("M ") {
+                        // Only "keep the passband" (-1) is accepted: any width changes the filter
+                        if m.ends_with(" -1") { "RPRT 0\n".into() } else { "RPRT -1\n".into() }
+                    } else if line.starts_with('T') {
                         "RPRT 0\n".into()
                     } else {
                         "RPRT -11\n".into()
@@ -222,5 +226,15 @@ mod tests {
         assert_eq!(c.get_freq().unwrap(), 7_105_000);
         c.set_ptt(true).unwrap();
         c.set_ptt(false).unwrap();
+    }
+
+    /// Setting the mode never touches the radio's receive filter width.
+    #[test]
+    fn set_mode_keeps_the_passband() {
+        let port = fake_server();
+        let mut c = RigctldClient::new("localhost", port);
+        c.connect().unwrap();
+        c.set_mode(RadioMode::UsbData).unwrap();
+        c.set_mode(RadioMode::Usb).unwrap();
     }
 }
