@@ -209,6 +209,8 @@ pub struct BuiltInModem {
     refresh_devices_later: bool,
     /// Start again once the current stop finishes (settings changed while running).
     restart_after_stop: bool,
+    /// Started, its port not open yet: when, the status to show once it is, the last check
+    starting: Option<(Instant, String, Instant)>,
 }
 
 impl BuiltInModem {
@@ -230,6 +232,7 @@ impl BuiltInModem {
             serial_ports: Vec::new(),
             refresh_devices_later: false,
             restart_after_stop: false,
+            starting: None,
         }
     }
 
@@ -262,7 +265,9 @@ impl BuiltInModem {
             Some(m) => {
                 *handle() = Some(m);
                 RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.status = format!("Running {} as {}", s.mode_label(), self.call.to_uppercase());
+                let running = format!("Running {} as {}", s.mode_label(), self.call.to_uppercase());
+                self.status = "Starting…".into();
+                self.starting = Some((Instant::now(), running, Instant::now()));
                 Ok(())
             }
             None => Err("a XARA modem is already running in this app".into()),
@@ -326,6 +331,21 @@ impl BuiltInModem {
         // The GUI shows received traffic itself; drop xara's copy so it doesn't pile up.
         while xara_ffi::next_received().is_some() {}
 
+        // Until its port opens. A long wait is usually macOS asking for the microphone (the
+        // audio can't start before that's answered), with its dialog behind this window.
+        if let Some((since, running, checked)) = &mut self.starting {
+            if handle().is_none() {
+                self.starting = None;
+            } else if checked.elapsed() >= Duration::from_millis(500) {
+                *checked = Instant::now();
+                if port_open(self.cmd_port) {
+                    self.status = std::mem::take(running);
+                    self.starting = None;
+                } else if since.elapsed() >= Duration::from_secs(4) {
+                    self.status = "Waiting for the audio to start — if macOS asks to use the microphone, click Allow".into();
+                }
+            }
+        }
         let ended = handle().as_ref().is_some_and(|m| !m.running());
         if ended {
             let m = handle().take();

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the Mac app: macos/build/Openslot.app (release, signed ad hoc for this Mac).
+# Builds the Mac app: macos/build/Openslot.app (release, signed with Developer ID if available).
 #   macos/bundle.sh            build for this Mac's architecture
 #   macos/bundle.sh universal  build for Apple silicon and Intel
 # Needs the XARA checkout next to this one (../xara relative to the repository).
@@ -28,6 +28,10 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$here/Info.plist" "$app/Contents/"
 cp "$here/../assets/icon/openslot.icns" "$app/Contents/Resources/"
 cp "$bin" "$app/Contents/MacOS/openslot"
-# Ad hoc signature: enough to run on this Mac and to ask for microphone access.
-codesign --force --sign - "$app"
+# Signed with this Mac's Developer ID certificate if it has one (OPENSLOT_SIGN_IDENTITY picks
+# another, "-" for ad hoc). A stable identity lets macOS keep the microphone permission across
+# updates: an ad hoc signature changes with every build, macOS asks again, and the modem's
+# audio waits on that question.
+identity=${OPENSLOT_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Developer ID Application:/ { print $2; exit }')}
+codesign --force --sign "${identity:--}" "$app"
 echo "built $app"
