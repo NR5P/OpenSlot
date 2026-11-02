@@ -682,6 +682,14 @@ pub const CALLING_FREQUENCIES_HZ: &[(u64, &str)] = &[
     (439_600_000, "70cm FM"),
 ];
 
+/// The calling frequency of the band `hz` is in (6m, 2m, 70cm: the SSB one), if it has one.
+pub fn band_calling_frequency(hz: u64) -> Option<u64> {
+    let band = band_name(hz)?;
+    CALLING_FREQUENCIES_HZ.iter()
+        .find(|(_, b)| *b == band || b.strip_prefix(band).is_some_and(|r| r.starts_with(' ')))
+        .map(|(f, _)| *f)
+}
+
 /// Validate a ham radio callsign (basic format check).
 /// Accepts 1-2 letter/digit prefix, 1+ digits, 1-3 letters suffix, optional -N SSID.
 pub fn is_valid_callsign(call: &str) -> bool {
@@ -1124,4 +1132,15 @@ mod profile_tests {
         assert!(expand_tags("<UTCT>", &c).ends_with(" UTC"));
         assert_eq!(expand_tags("<LOC>", &c), "<LOC:EM10>");
     }
+
+    #[test]
+    fn band_calling_frequency_follows_the_dial() {
+        assert_eq!(band_calling_frequency(7_107_250), Some(7_105_000));
+        assert_eq!(band_calling_frequency(7_074_000), Some(7_105_000));
+        assert_eq!(band_calling_frequency(14_105_000), Some(14_105_000));
+        assert_eq!(band_calling_frequency(3_573_000), Some(3_595_000));
+        assert_eq!(band_calling_frequency(50_313_000), Some(50_330_000));
+        assert_eq!(band_calling_frequency(9_000_000), None);
+    }
+
 }

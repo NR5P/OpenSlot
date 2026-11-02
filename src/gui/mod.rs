@@ -24,6 +24,15 @@ use crate::varac::session::{SessionState, StationConfig, VaracSession};
 use state::*;
 
 fn send_notification(title: &str, body: &str) {
+    // macOS: name the app the notifications come from. Left unset, notify-rust looks for an
+    // app called "use_default" and macOS asks "Where is use_default?" with an app picker.
+    #[cfg(target_os = "macos")]
+    {
+        static APP: std::sync::Once = std::sync::Once::new();
+        APP.call_once(|| {
+            let _ = notify_rust::set_application("io.github.nr5p.openslot");
+        });
+    }
     let _ = notify_rust::Notification::new()
         .summary(title)
         .body(body)
@@ -115,8 +124,10 @@ pub struct VaracApp {
     dial_pushed: u64,
     /// Checked whether the default window fits the screen
     fitted_to_screen: bool,
-    /// "Load last frequency": retune the radio to the saved frequency when it connects
+    /// The frequency scheduler's pick: tune the radio to it when it connects
     restore_freq_pending: bool,
+    /// Otherwise, at start: the calling frequency of the band the radio is on (first reading)
+    start_on_radio_band: bool,
     /// PSKReporter (stations heard), and the dial it last heard about
     psk: std::sync::mpsc::Sender<crate::varac::pskreporter::Command>,
     psk_freq: u64,
@@ -411,7 +422,8 @@ impl VaracApp {
             freq_check: None,
             dial_pushed: 0,
             fitted_to_screen: false,
-            restore_freq_pending: sched_tuned || load_config_file().and_then(|c| c.frequency).is_some(),
+            restore_freq_pending: sched_tuned,
+            start_on_radio_band: !sched_tuned,
             psk: crate::varac::pskreporter::spawn(|m| tracing::info!(target: "gui", "{m}")),
             psk_freq: 0,
         };
@@ -2507,7 +2519,7 @@ impl VaracApp {
                             rig.set_freq(self.state.current_frequency);
                             self.rig_freq_set_at = Some(Utc::now());
                             self.freq_check = Some(((self.state.current_frequency) as u64, 0));
-                            self.state.add_log(format!("Radio tuned to the last frequency {:.3} MHz", self.state.current_frequency as f64 / 1e6));
+                            self.state.add_log(format!("Radio tuned to the scheduled frequency {:.3} MHz", self.state.current_frequency as f64 / 1e6));
                         }
                     }
                     crate::rig::RigEvent::Disconnected => {
@@ -2517,6 +2529,25 @@ impl VaracApp {
                         self.state.add_log("Rig disconnected".into());
                     }
                     crate::rig::RigEvent::FreqUpdate(f) => {
+                        // At start: the calling frequency of whichever band the radio is on
+                        // (off the ham bands, or scanning: leave the radio where it is)
+                        if std::mem::take(&mut self.start_on_radio_band) && !self.state.freq_mode.scanning() {
+                            if let Some(cf) = messages::band_calling_frequency(f) {
+                                self.state.current_frequency = cf;
+                                self.state.current_band = freq_to_band(cf).unwrap_or("").to_string();
+                                self.state.rig_freq = Some(f);
+                                if cf != f {
+                                    rig.set_mode(self.state.rig_usb_mode());
+                                    rig.set_freq(cf);
+                                    self.rig_freq_set_at = Some(Utc::now());
+                                    self.freq_check = Some((cf, 0));
+                                    self.rig_poll_at = Some(Utc::now() + chrono::Duration::seconds(3));
+                                }
+                                self.state.add_log(format!("Radio is on {}: calling frequency {:.3} MHz",
+                                    self.state.current_band, cf as f64 / 1e6));
+                                continue;
+                            }
+                        }
                         self.state.rig_freq = Some(f);
                         // VarAC (CAT): still not there 3 s after the change → ask again, up to
                         // 10 times ("Trying to change frequency again to …")
