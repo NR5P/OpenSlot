@@ -824,6 +824,14 @@ pub struct GuiState {
     pub chat_search: String,
     pub chat_search_active: bool,
 
+    /// The chat and message box are in their own big window (Pop out / Shrink back)
+    pub chat_window_open: bool,
+    /// The broadcasts are in their own window (Pop out / Shrink back)
+    pub broadcasts_window_open: bool,
+    /// The broadcasts' share of the space they split with the chat in the main window
+    /// (the drag bar between them); None = the default height
+    pub broadcasts_share: Option<f32>,
+
     // CQ filter
     pub cq_filter: String,
 
@@ -1337,6 +1345,9 @@ impl GuiState {
             contact_adding: false,
             chat_search: String::new(),
             chat_search_active: false,
+            chat_window_open: false,
+            broadcasts_window_open: false,
+            broadcasts_share: None,
             cq_filter: String::new(),
             connect_started: None,
             connect_timeout_secs: 30,

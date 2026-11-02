@@ -143,6 +143,8 @@ pub struct ConfigFile {
     pub allow_info_request: Option<bool>,
     pub load_history: Option<bool>,
     pub font_size: Option<f32>,
+    /// Main window: the broadcasts' share of the space they split with the chat (drag bar)
+    pub broadcasts_share: Option<f32>,
     pub notifications_enabled: Option<bool>,
     pub sound_alerts: Option<bool>,
     pub use_local_time: Option<bool>,

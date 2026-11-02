@@ -74,28 +74,257 @@ pub(super) fn draw_main_window(
         .show_separator_line(false)
         .show(ctx, |ui| {
             draw_qso_row(ui, state);
-            ui.add_space(2.0);
-            draw_composer(ui, state, db, qso_guid);
+            // (popped out, the message box is in the chat window)
+            if !state.chat_window_open {
+                ui.add_space(2.0);
+                draw_composer(ui, state, db, qso_guid);
+            }
         });
 
-    // Broadcasts strip
-    egui::TopBottomPanel::top("broadcasts")
-        .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 8.0, top: 4.0, bottom: 4.0 }))
-        .resizable(true)
-        // (a laptop screen leaves the chat barely two lines otherwise)
-        .default_height(if screen.height() < 760.0 { 64.0 } else { 96.0 })
-        .min_height(56.0)
-        .show_separator_line(false)
-        .show(ctx, |ui| draw_broadcasts_card(ui, state));
-
-    // Chat
+    // Broadcasts above the chat, split by a bar to drag (with one of them popped out, the
+    // other takes the space, with a note where the popped one was)
+    // (a laptop screen leaves the chat barely two lines otherwise)
+    let default_bc = if screen.height() < 760.0 { 64.0 } else { 96.0 };
     egui::CentralPanel::default()
         .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 8.0, top: 4.0, bottom: 4.0 }))
-        .show(ctx, |ui| draw_chat_area(ui, state));
+        .show(ctx, |ui| {
+            match (state.broadcasts_window_open, state.chat_window_open) {
+                (false, false) => draw_chat_split(ui, state, default_bc),
+                (false, true) => {
+                    let w = ui.available_width();
+                    let bc_h = (ui.available_height() - 48.0).max(56.0);
+                    ui.allocate_ui(Vec2::new(w, bc_h), |ui| draw_broadcasts_card(ui, state));
+                    ui.add_space(4.0);
+                    draw_chat_placeholder(ui, state);
+                }
+                (true, chat_out) => {
+                    draw_broadcasts_placeholder(ui, state);
+                    ui.add_space(4.0);
+                    if chat_out {
+                        draw_chat_placeholder(ui, state);
+                    } else {
+                        draw_chat_area(ui, state);
+                    }
+                }
+            }
+        });
 
     draw_vmail_window(ctx, state, db);
+    draw_chat_window(ctx, state, db, qso_guid);
+    draw_broadcasts_window(ctx, state);
 
     band_changed
+}
+
+// ---------------------------------------------------------------- broadcasts | chat split
+
+const SPLIT_BAR_H: f32 = 10.0;
+/// Below this the broadcasts are hidden and the chat has the whole space.
+const BC_HIDE_H: f32 = 40.0;
+const CHAT_MIN_H: f32 = 120.0;
+
+/// The broadcasts and the chat, one above the other, with a bar between them to drag
+/// (up: a bigger chat, to the top: no broadcasts) or double-click (big chat / back).
+fn draw_chat_split(ui: &mut egui::Ui, state: &mut GuiState, default_bc: f32) {
+    let total = ui.available_height();
+    let w = ui.available_width();
+    let max_bc = (total - SPLIT_BAR_H - CHAT_MIN_H).max(0.0);
+    let mut bc_h = state.broadcasts_share.map_or(default_bc, |s| s * total).clamp(0.0, max_bc);
+    if bc_h < BC_HIDE_H {
+        bc_h = 0.0;
+    } else {
+        ui.allocate_ui(Vec2::new(w, bc_h), |ui| draw_broadcasts_card(ui, state));
+    }
+
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, SPLIT_BAR_H), egui::Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(
+        if bc_h == 0.0 {
+            format!("Drag down to show the broadcasts ({}) · double-click: normal size", state.broadcasts.len())
+        } else {
+            "Drag to resize the chat · double-click: big chat".to_string()
+        },
+    );
+    let active = resp.hovered() || resp.dragged();
+    let grip = egui::Rect::from_center_size(rect.center(), Vec2::new(48.0, 4.0));
+    ui.painter().rect_filled(grip, 2.0, if active { theme::ACCENT } else { theme::tint(theme::MUTED, 120) });
+    if bc_h == 0.0 && !state.broadcasts.is_empty() {
+        ui.painter().text(
+            rect.left_center() + Vec2::new(2.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("BROADCASTS {}", state.broadcasts.len()),
+            egui::FontId::proportional(10.0),
+            theme::YELLOW,
+        );
+    }
+    let mut changed = None;
+    if resp.dragged() {
+        // (from the hidden end, the drag starts at the hiding height)
+        let from = if bc_h == 0.0 { BC_HIDE_H - 1.0 } else { bc_h };
+        changed = Some((from + resp.drag_delta().y).clamp(0.0, max_bc));
+    }
+    if resp.double_clicked() {
+        changed = Some(if bc_h == 0.0 { default_bc } else { 0.0 });
+    }
+    if let Some(h) = changed {
+        if total > 0.0 {
+            state.broadcasts_share = Some(h / total);
+        }
+    }
+    if resp.drag_stopped() || resp.double_clicked() {
+        let share = state.broadcasts_share;
+        crate::config::update_config_file(|c| c.broadcasts_share = share);
+    }
+
+    draw_chat_area(ui, state);
+}
+
+// ---------------------------------------------------------------- chat in its own window
+
+/// Where the chat was while it's in its own window.
+fn draw_chat_placeholder(ui: &mut egui::Ui, state: &mut GuiState) {
+    theme::card().inner_margin(Margin::same(10.0)).show(ui, |ui| {
+        ui.set_min_size(ui.available_size().max(Vec2::ZERO));
+        ui.horizontal(|ui| {
+            theme::caption(ui, "Chat");
+            let note = match &state.connected_to {
+                Some(call) => format!("In its own window · in QSO with {call}"),
+                None => "In its own window".into(),
+            };
+            ui.label(RichText::new(note).small().color(theme::MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(RichText::new("Bring chat back").color(theme::ACCENT))
+                    .on_hover_text("Put the chat back in the main window")
+                    .clicked()
+                {
+                    state.chat_window_open = false;
+                }
+            });
+        });
+    });
+}
+
+/// The chat and message box in a big window of their own, for a QSO: SEND, DISCONNECT and
+/// Shrink back below them. Closing the window puts the chat back too.
+fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso_guid: &Option<String>) {
+    if !state.chat_window_open {
+        return;
+    }
+    let title = match &state.connected_to {
+        Some(call) => format!("Openslot chat — {call}"),
+        None => "Openslot chat".into(),
+    };
+    let builder = egui::ViewportBuilder::default()
+        .with_title(title.clone())
+        .with_inner_size([960.0, 720.0])
+        .with_min_inner_size([520.0, 380.0]);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("openslot_chat_window"), builder, |ctx, class| {
+        let buttons = |ui: &mut egui::Ui, state: &mut GuiState| {
+            ui.horizontal(|ui| {
+                if ui.add_sized([120.0, 30.0], theme::primary_button("SEND", theme::GREEN)).clicked() {
+                    state.send_requested = true;
+                }
+                if matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect)
+                    && ui.add_sized([120.0, 30.0], theme::accent_button("DISCONNECT", theme::RED)).clicked()
+                {
+                    state.send_cmd(GuiCommand::Disconnect);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_sized([120.0, 30.0], egui::Button::new("Shrink back"))
+                        .on_hover_text("Put the chat back in the main window")
+                        .clicked()
+                    {
+                        state.chat_window_open = false;
+                    }
+                });
+            });
+        };
+        if class == egui::ViewportClass::Embedded {
+            // (no separate windows here: a big window inside the main one)
+            let mut open = true;
+            egui::Window::new(title.clone())
+                .id(egui::Id::new("openslot_chat_window"))
+                .open(&mut open)
+                .default_size([900.0, 620.0])
+                .show(ctx, |ui| {
+                    let chat_h = (ui.available_height() - 160.0).max(160.0);
+                    ui.allocate_ui(Vec2::new(ui.available_width(), chat_h), |ui| draw_chat_area(ui, state));
+                    draw_composer(ui, state, db, qso_guid);
+                    buttons(ui, state);
+                });
+            if !open {
+                state.chat_window_open = false;
+            }
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        if ctx.input(|i| i.viewport().close_requested()) {
+            state.chat_window_open = false;
+        }
+        egui::TopBottomPanel::bottom("chat_window_composer")
+            .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 10.0, top: 4.0, bottom: 10.0 }))
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                draw_composer(ui, state, db, qso_guid);
+                ui.add_space(4.0);
+                buttons(ui, state);
+            });
+        egui::CentralPanel::default()
+            .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 10.0, top: 10.0, bottom: 4.0 }))
+            .show(ctx, |ui| draw_chat_area(ui, state));
+    });
+}
+
+// ---------------------------------------------------------------- broadcasts in their own window
+
+/// A one-line note where the broadcasts were while they're in their own window.
+fn draw_broadcasts_placeholder(ui: &mut egui::Ui, state: &mut GuiState) {
+    theme::card().inner_margin(Margin::symmetric(10.0, 4.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            section_header(ui, "BROADCASTS", state.broadcasts.len(), YELLOW);
+            ui.label(RichText::new("In their own window").small().color(theme::MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(RichText::new("Bring back").color(theme::ACCENT))
+                    .on_hover_text("Put the broadcasts back in the main window")
+                    .clicked()
+                {
+                    state.broadcasts_window_open = false;
+                }
+            });
+        });
+    });
+}
+
+/// The broadcasts in a window of their own (Shrink back in the card's header, or close it).
+fn draw_broadcasts_window(ctx: &egui::Context, state: &mut GuiState) {
+    if !state.broadcasts_window_open {
+        return;
+    }
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Openslot broadcasts")
+        .with_inner_size([900.0, 560.0])
+        .with_min_inner_size([420.0, 240.0]);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("openslot_broadcasts_window"), builder, |ctx, class| {
+        if class == egui::ViewportClass::Embedded {
+            // (no separate windows here: a big window inside the main one)
+            let mut open = true;
+            egui::Window::new("Openslot broadcasts")
+                .id(egui::Id::new("openslot_broadcasts_window"))
+                .open(&mut open)
+                .default_size([820.0, 480.0])
+                .show(ctx, |ui| draw_broadcasts_card(ui, state));
+            if !open {
+                state.broadcasts_window_open = false;
+            }
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            state.broadcasts_window_open = false;
+        }
+        egui::CentralPanel::default()
+            .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(10.0)))
+            .show(ctx, |ui| draw_broadcasts_card(ui, state));
+    });
 }
 
 fn full_width(ui: &egui::Ui) -> Vec2 {
@@ -989,9 +1218,19 @@ fn draw_cq_card(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
 fn draw_broadcasts_card(ui: &mut egui::Ui, state: &mut GuiState) {
     theme::card().inner_margin(Margin::symmetric(10.0, 4.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // (fills the height it's given: the split with the chat sets it)
+        ui.set_min_height(ui.available_height());
         ui.horizontal(|ui| {
             section_header(ui, "BROADCASTS", state.broadcasts.len(), YELLOW);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, tip) = if state.broadcasts_window_open {
+                    ("Shrink back", "Put the broadcasts back in the main window")
+                } else {
+                    ("Pop out", "Open the broadcasts in their own window")
+                };
+                if ui.small_button(RichText::new(label).color(theme::ACCENT)).on_hover_text(tip).clicked() {
+                    state.broadcasts_window_open = !state.broadcasts_window_open;
+                }
                 if !state.broadcasts.is_empty() && ui.small_button("Clear").clicked() {
                     state.broadcasts.clear();
                 }

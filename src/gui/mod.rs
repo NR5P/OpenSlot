@@ -192,6 +192,7 @@ impl VaracApp {
             if let Some(v) = cfg.allow_pings { state.settings_form.allow_pings = v; }
             if let Some(v) = cfg.allow_info_request { state.settings_form.allow_info_request = v; }
             if let Some(v) = cfg.load_history { state.settings_form.load_history = v; }
+            state.broadcasts_share = cfg.broadcasts_share.map(|v| v.clamp(0.0, 1.0));
             if let Some(v) = cfg.font_size {
                 state.font_size = v.clamp(10.0, 24.0);
                 state.settings_form.font_size = v.to_string();
@@ -3601,6 +3602,15 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The chat in its own big window for a QSO, and back into the main window after
+                let (label, tip) = if state.chat_window_open {
+                    ("Shrink back", "Put the chat back in the main window")
+                } else {
+                    ("Pop out", "Open the chat in its own big window")
+                };
+                if ui.small_button(RichText::new(label).color(theme::ACCENT)).on_hover_text(tip).clicked() {
+                    state.chat_window_open = !state.chat_window_open;
+                }
                 // Search toggle
                 if ui.small_button(if state.chat_search_active { "X" } else { "Search" }).clicked() {
                     state.chat_search_active = !state.chat_search_active;
@@ -6481,6 +6491,7 @@ fn save_config_file(state: &GuiState) {
         allow_info_request: Some(form.allow_info_request),
         load_history: Some(form.load_history),
         font_size: form.font_size.parse().ok(),
+        broadcasts_share: state.broadcasts_share,
         notifications_enabled: Some(form.notifications_enabled),
         sound_alerts: Some(form.sound_alerts),
         use_local_time: Some(form.use_local_time),
