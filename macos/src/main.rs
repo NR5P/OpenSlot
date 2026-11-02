@@ -119,6 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The built-in modem listens on this Mac, so it only applies when the GUI's modem is local.
     let local_modem = matches!(modem_config.host.as_str(), "127.0.0.1" | "localhost" | "::1");
     let mut xara = modem::BuiltInModem::new(&callsign, modem_config.cmd_port, modem_config.kiss_port);
+    // Quit from the menu or the Dock (⌘Q too) ends the process from inside AppKit: run_gui
+    // never returns, so the stop below is skipped. exit() still runs this: unkey the radio,
+    // then stop the modem so its audio closes cleanly.
+    extern "C" fn on_exit() {
+        rig::shutdown_all(Duration::from_secs(2));
+        modem::stop_at_exit(Duration::from_secs(3));
+    }
+    unsafe extern "C" {
+        fn atexit(f: extern "C" fn()) -> std::ffi::c_int;
+    }
+    // SAFETY: registers a plain function to run at exit.
+    unsafe { atexit(on_exit) };
     if local_modem && xara.settings.enabled {
         match xara.start() {
             Ok(()) => {

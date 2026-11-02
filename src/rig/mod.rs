@@ -460,6 +460,23 @@ impl PttRouter {
     }
 }
 
+/// Every rig worker (its commands, and whether it has finished), so an exit that skips the
+/// GUI's own shutdown (macOS: Quit from the menu or the Dock) can still unkey the radio.
+static WORKERS: Mutex<Vec<(mpsc::Sender<RigCommand>, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// Unkeys every radio and stops its worker, waiting up to `limit` for them.
+#[allow(dead_code)] // the Mac app's exit hook
+pub fn shutdown_all(limit: Duration) {
+    let workers = WORKERS.lock().map(|mut w| std::mem::take(&mut *w)).unwrap_or_default();
+    for (tx, _) in &workers {
+        let _ = tx.send(RigCommand::Shutdown);
+    }
+    let start = Instant::now();
+    while start.elapsed() < limit && workers.iter().any(|(_, done)| !done.load(Ordering::SeqCst)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[allow(dead_code)]
 pub struct RigManager {
     cmd_tx: mpsc::Sender<RigCommand>,
@@ -477,10 +494,19 @@ impl RigManager {
         let (event_tx, event_rx) = mpsc::channel();
 
         let be = backend.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
         std::thread::Builder::new()
             .name("rig-worker".into())
-            .spawn(move || rig_worker(be, cmd_rx, event_tx))
+            .spawn(move || {
+                rig_worker(be, cmd_rx, event_tx);
+                finished.store(true, Ordering::SeqCst);
+            })
             .expect("spawn rig worker");
+        if let Ok(mut w) = WORKERS.lock() {
+            w.retain(|(_, d)| !d.load(Ordering::SeqCst));
+            w.push((cmd_tx.clone(), done));
+        }
 
         Self {
             cmd_tx,

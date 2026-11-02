@@ -167,6 +167,27 @@ pub fn wait_for_port(port: u16, limit: Duration) -> bool {
 
 static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The running modem. Global so the exit hook can stop it: Quit from the menu or the Dock
+/// ends the process from inside AppKit, and the GUI never returns to stop it itself.
+static HANDLE: std::sync::Mutex<Option<xara_ffi::XaraModem>> = std::sync::Mutex::new(None);
+
+fn handle() -> std::sync::MutexGuard<'static, Option<xara_ffi::XaraModem>> {
+    HANDLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For the exit hook: stops a running modem, so it releases PTT and closes the audio
+/// cleanly (cut off, macOS's audio server can stall the next start). At most `limit`, so a
+/// stuck audio system can't hold up quitting.
+pub fn stop_at_exit(limit: Duration) {
+    let Some(m) = handle().take() else { return };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(m.stop());
+    });
+    let _ = rx.recv_timeout(limit);
+    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn xara_running() -> bool {
     RUNNING.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -177,7 +198,6 @@ pub struct BuiltInModem {
     call: String,
     cmd_port: u16,
     kiss_port: u16,
-    handle: Option<xara_ffi::XaraModem>,
     stopping: Option<JoinHandle<u8>>,
     status: String,
     log: VecDeque<String>,
@@ -200,7 +220,6 @@ impl BuiltInModem {
             call: call.to_string(),
             cmd_port,
             kiss_port,
-            handle: None,
             stopping: None,
             status: "Stopped".into(),
             log: VecDeque::new(),
@@ -215,12 +234,12 @@ impl BuiltInModem {
     }
 
     pub fn running(&self) -> bool {
-        self.handle.is_some()
+        handle().is_some()
     }
 
     /// Starts the modem; Err says why it can't (shown in the bar).
     pub fn start(&mut self) -> Result<(), String> {
-        if self.handle.is_some() {
+        if handle().is_some() {
             return Ok(());
         }
         if self.stopping.is_some() {
@@ -241,7 +260,7 @@ impl BuiltInModem {
         tracing::info!("starting built-in XARA: xara {}", args.join(" "));
         match xara_ffi::start(args) {
             Some(m) => {
-                self.handle = Some(m);
+                *handle() = Some(m);
                 RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
                 self.status = format!("Running {} as {}", s.mode_label(), self.call.to_uppercase());
                 Ok(())
@@ -268,7 +287,8 @@ impl BuiltInModem {
 
     /// Stops the modem in the background (it releases PTT first).
     fn stop(&mut self, cmd_tx: &UnboundedSender<GuiCommand>) {
-        if let Some(m) = self.handle.take() {
+        let m = handle().take();
+        if let Some(m) = m {
             let _ = cmd_tx.send(GuiCommand::DisconnectModem);
             self.status = "Stopping…".into();
             self.stopping = Some(std::thread::spawn(move || m.stop()));
@@ -277,7 +297,8 @@ impl BuiltInModem {
 
     /// Stops the modem and waits for it, for quitting.
     pub fn stop_blocking(&mut self) {
-        if let Some(m) = self.handle.take() {
+        let m = handle().take();
+        if let Some(m) = m {
             m.stop();
         }
         if let Some(t) = self.stopping.take() {
@@ -305,8 +326,10 @@ impl BuiltInModem {
         // The GUI shows received traffic itself; drop xara's copy so it doesn't pile up.
         while xara_ffi::next_received().is_some() {}
 
-        if self.handle.as_ref().is_some_and(|m| !m.running()) {
-            let code = self.handle.take().map_or(0, |m| m.stop());
+        let ended = handle().as_ref().is_some_and(|m| !m.running());
+        if ended {
+            let m = handle().take();
+            let code = m.map_or(0, |m| m.stop());
             RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
             self.status = format!("Stopped (exit {code}): {}", self.last_error());
         }
