@@ -218,9 +218,13 @@ fn run_gui(
     );
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1360.0, 900.0])
-        .with_min_inner_size([1000.0, 770.0])
-        .with_title(format!("Openslot — {callsign}"));
+        .with_inner_size([1360.0, 880.0])
+        // (as gui::run_gui: a 1366×768 laptop leaves ~690 px, and the side column fits that)
+        .with_min_inner_size([1000.0, 600.0])
+        .with_title(format!("Openslot — {callsign}"))
+        // (matches openslot.desktop, where the dock and Alt-Tab find the icon)
+        .with_app_id("openslot");
+    gui::install_desktop_entry();
     if let Some(icon) = gui::app_icon() {
         viewport = viewport.with_icon(icon);
     }

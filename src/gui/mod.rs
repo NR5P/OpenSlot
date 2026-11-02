@@ -10123,7 +10123,7 @@ pub fn app_icon() -> Option<std::sync::Arc<egui::IconData>> {
 /// name matches the app id, not from the window: put ours and the icons in the user's
 /// ~/.local/share once, and again when the program has moved.
 #[cfg(target_os = "linux")]
-fn install_desktop_entry() {
+pub fn install_desktop_entry() {
     let Some(data) = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
     else {
