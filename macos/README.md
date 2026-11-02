@@ -7,12 +7,12 @@ A bar above the GUI controls the built-in modem: **Start/Stop**, **Modem setting
 (mode, audio in/out from your CoreAudio devices, radio mode and PTT: VOX, serial RTS/DTR,
 CM108/AIOC, rigctld; TX drive; registered speeds), **Web UI** (XARA's waterfall and
 levels) and **Modem log**. Once XARA's ports are open the GUI connects to it, exactly as
-it would to VARA on port 8300. With *Start the modem when the app starts* on, it comes up
-at launch.
+it would to VARA on port 8300. It's the default: it comes up at launch (the first time,
+Modem settings opens to pick the radio's audio).
 
-You can still use any other modem: leave the built-in one stopped and set the host/port
-in Settings › VARA Modem as usual. The built-in modem only applies when that host is this
-Mac.
+To use another modem instead (VARA under Wine or on another computer), choose *VARA, or
+another modem I run myself* in Modem settings and set the host/port in Settings › VARA
+Modem as usual. The built-in modem only applies when that host is this Mac.
 
 On first launch from Finder the app asks for your call sign; everything else is in
 Settings. Config, database and `xara.toml` (the built-in modem's settings) live in

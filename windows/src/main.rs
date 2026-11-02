@@ -123,17 +123,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The built-in modem listens on this PC, so it only applies when the GUI's modem is local.
     let local_modem = matches!(modem_config.host.as_str(), "127.0.0.1" | "localhost" | "::1");
     let mut xara = modem::BuiltInModem::new(&callsign, modem_config.cmd_port, modem_config.kiss_port);
+    let mut built_in = false;
     if local_modem && xara.settings.enabled {
         match xara.start() {
-            Ok(()) => {
-                let port = modem_config.cmd_port;
-                tokio::task::spawn_blocking(move || modem::wait_for_port(port, Duration::from_secs(15))).await?;
+            Ok(()) => built_in = true,
+            Err(e) => {
+                eprintln!("Built-in XARA modem not started: {e}");
+                xara.not_started(&e);
             }
-            Err(e) => eprintln!("Built-in XARA modem not started: {e}"),
         }
     }
 
-    let session = match try_connect_modem(&modem_config, &callsign).await {
+    // The built-in modem refuses connections until it listens, and serves one client at a
+    // time: just started, keep trying for a while
+    let deadline = std::time::Instant::now() + Duration::from_secs(if built_in { 15 } else { 0 });
+    let first = loop {
+        match try_connect_modem(&modem_config, &callsign).await {
+            Err(_) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(300)).await,
+            r => break r,
+        }
+    };
+    let session = match first {
         Ok(vara) => {
             // (initialize sent MYCALL with the ping alias as the policy says: VarAC sends one)
             let mut sess = VaracSession::new(vara, station_config.clone());

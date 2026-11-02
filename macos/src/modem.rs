@@ -37,7 +37,7 @@ pub const PTTS: [(&str, &str); 5] = [
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct XaraSettings {
-    /// Start the modem when the app starts.
+    /// Use the built-in modem (started with the app); off = VARA or another modem the user runs.
     pub enabled: bool,
     pub mode: String,
     /// CoreAudio device UIDs.
@@ -58,7 +58,8 @@ pub struct XaraSettings {
 impl Default for XaraSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // XARA works out of the box; VARA is the user's choice in Modem settings
+            enabled: true,
             mode: "hf2300".into(),
             capture: String::new(),
             playback: String::new(),
@@ -150,21 +151,6 @@ fn port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
-/// Waits up to `limit` for the modem's command port to open.
-pub fn wait_for_port(port: u16, limit: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if port_open(port) {
-            return true;
-        }
-        if !xara_running() {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
 static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The running modem. Global so the exit hook can stop it: Quit from the menu or the Dock
@@ -188,9 +174,6 @@ pub fn stop_at_exit(limit: Duration) {
     RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn xara_running() -> bool {
-    RUNNING.load(std::sync::atomic::Ordering::SeqCst)
-}
 
 pub struct BuiltInModem {
     pub settings: XaraSettings,
@@ -274,17 +257,16 @@ impl BuiltInModem {
         }
     }
 
-    /// Starts the modem and has the GUI connect to it once its port is open.
+    /// Shows in the bar why it didn't start at launch.
+    pub fn not_started(&mut self, why: &str) {
+        self.status = format!("Not started: {why}");
+    }
+
+    /// Starts the modem and has the GUI connect to it (retrying until it listens).
     fn start_and_connect(&mut self, cmd_tx: &UnboundedSender<GuiCommand>) {
         match self.start() {
             Ok(()) => {
-                let tx = cmd_tx.clone();
-                let port = self.cmd_port;
-                std::thread::spawn(move || {
-                    if wait_for_port(port, Duration::from_secs(15)) {
-                        let _ = tx.send(GuiCommand::ConnectModem);
-                    }
-                });
+                let _ = cmd_tx.send(GuiCommand::ConnectBuiltInModem);
             }
             Err(e) => self.status = format!("Not started: {e}"),
         }
@@ -458,7 +440,21 @@ impl BuiltInModem {
                 self.call.to_uppercase(),
                 self.cmd_port
             ));
-            ui.checkbox(&mut d.enabled, "Start the modem when the app starts");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Modem").strong());
+            ui.radio_value(&mut d.enabled, true, "Built-in XARA (starts with Openslot)");
+            ui.radio_value(&mut d.enabled, false, "VARA, or another modem I run myself");
+            if !d.enabled {
+                ui.label(
+                    RichText::new(format!(
+                        "Start VARA HF (or VARA FM) yourself: Openslot connects to it on port {} (Settings › Vara). \
+                         The XARA settings below aren't used.",
+                        self.cmd_port
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
             ui.add_space(6.0);
             egui::Grid::new("xara_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Mode");
@@ -578,16 +574,24 @@ impl BuiltInModem {
             self.refresh_devices();
         }
         if save {
-            let restart = self.running() && self.draft != self.settings;
+            let changed = self.draft != self.settings;
             self.settings = self.draft.clone();
             match self.settings.save() {
                 Ok(()) => self.status = "Settings saved".into(),
                 Err(e) => self.status = format!("Couldn't save settings: {e}"),
             }
-            if restart {
+            if !self.settings.enabled {
+                // VARA (or another modem) instead: free its port
+                if self.running() {
+                    self.stop(cmd_tx);
+                    self.status = format!("Stopping XARA: Openslot uses the modem on port {}", self.cmd_port);
+                }
+            } else if self.running() && changed {
                 self.restart_after_stop = true;
                 self.stop(cmd_tx);
                 self.status = "Restarting with the new settings…".into();
+            } else if !self.running() && self.stopping.is_none() {
+                self.start_and_connect(cmd_tx);
             }
             open = false;
         }

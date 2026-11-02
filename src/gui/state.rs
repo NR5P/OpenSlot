@@ -104,6 +104,9 @@ pub enum GuiCommand {
     SetListen(ListenMode),
     SetAway(Option<String>),
     ConnectModem,
+    /// Connect to the built-in modem just started: retried until it takes the connection
+    #[allow(dead_code)] // (sent by the apps with a built-in modem)
+    ConnectBuiltInModem,
     DisconnectModem,
     Ping(String),
     /// A broadcast to ALL or a callsign, through up to two digipeaters (VarAC)

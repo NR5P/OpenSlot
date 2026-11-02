@@ -8204,7 +8204,7 @@ pub fn spawn_session_bridge(
             // A connect / CQ that waited for the channel goes now
             if !chan_busy || guard.ignore_dcd {
                 if let Some(cmd) = guard.waiting.take() {
-                    if matches!(cmd, GuiCommand::ConnectModem | GuiCommand::DisconnectModem) {
+                    if matches!(cmd, GuiCommand::ConnectModem | GuiCommand::ConnectBuiltInModem | GuiCommand::DisconnectModem) {
                     last_alive = None;
                 }
                 process_command(cmd, &mut session, &callsign, &modem_config, &station_config, &session_tx2).await;
@@ -9835,6 +9835,24 @@ async fn process_command(
             if let Some(sess) = session.as_mut() {
                 // (VarAC announces away only when a link starts, never during a QSO)
                 sess.set_away(msg.clone());
+            }
+        }
+        GuiCommand::ConnectBuiltInModem => {
+            // Refused until it listens, and XARA serves one client at a time (on Linux it
+            // stops listening meanwhile), so try again for a while rather than once
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while session.is_none() {
+                match connect_modem(modem_config, callsign, station_config).await {
+                    Ok(sess) => {
+                        *session = Some(sess);
+                        let _ = session_tx.send(SessionMsg::ModemConnected);
+                    }
+                    Err(e) if std::time::Instant::now() >= deadline => {
+                        let _ = session_tx.send(SessionMsg::ModemFailed(e.to_string()));
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                }
             }
         }
         GuiCommand::ConnectModem => {
