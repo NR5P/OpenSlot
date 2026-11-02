@@ -21,8 +21,10 @@ fn cached<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, id: &str, key: 
 
 /// Drop a cached value (after a change), so the next frame reloads it.
 fn uncache(ctx: &egui::Context, id: &str) {
-    ctx.data_mut(|d| d.remove_temp::<()>(egui::Id::new(("feature_cache", id))));
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("feature_cache_gen", id)), ctx.input(|i| i.time)));
+    // (the time first: asking the context for it inside data_mut waits on the lock data_mut
+    // holds, and the app freezes)
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("feature_cache_gen", id)), now));
 }
 
 /// VarAC's game center: pick a game to invite the QSO partner to.
@@ -1604,5 +1606,28 @@ pub fn draw_ale(ctx: &egui::Context, state: &mut GuiState) {
                 state.ale_declined_at = Some(Utc::now());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping a cached value after a settings change must not freeze the app (it once
+    /// deadlocked on egui's context lock).
+    #[test]
+    fn uncache_does_not_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(Default::default(), |ctx| {
+                let a = cached(ctx, "t", "0", 30.0, || 1);
+                uncache(ctx, "t");
+                let generation = ctx.data(|d| d.get_temp::<f64>(egui::Id::new(("feature_cache_gen", "t")))).unwrap_or(-1.0);
+                let b = cached(ctx, "t", &generation.to_string(), 30.0, || 2);
+                let _ = tx.send((a, b));
+            });
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok((1, 2)), "uncache froze or didn't reload");
     }
 }
