@@ -544,24 +544,31 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             let w = ui.available_width() - 44.0;
             // VarAC's beacon button shows the countdown while beaconing
             let label = if state.freq_mode.scanning() {
-                "BEACONS MANAGED BY SCANNER".to_string()
+                "SCANNER BEACONS".to_string()
             } else if state.beacon_auto_enabled {
                 let interval: i64 = state.settings_form.beacon_interval.parse().unwrap_or(15);
                 let left = state.last_beacon_sent.map(|t| interval * 60 - (Utc::now() - t).num_seconds()).unwrap_or(0);
+                // (short enough for a laptop-width column: hours only when there are some)
                 if left <= 0 {
-                    "NEXT BEACON: SOON".to_string()
+                    "BEACON SOON".to_string()
+                } else if left >= 3600 {
+                    format!("BEACON {}:{:02}:{:02}", left / 3600, left / 60 % 60, left % 60)
                 } else {
-                    format!("NEXT BEACON: {:02}:{:02}:{:02}", left / 3600, left / 60 % 60, left % 60)
+                    format!("BEACON {:02}:{:02}", left / 60, left % 60)
                 }
             } else {
                 "SEND BEACONS".to_string()
             };
-            let tip = if state.settings_form.unlimited_beacon_time {
-                "Send a beacon now"
+            let tip = if state.freq_mode.scanning() {
+                "Beacons are managed by the scanner. Click to switch the scanner off."
+            } else if state.settings_form.unlimited_beacon_time {
+                "Send a beacon now (the time is the countdown to the next automatic one)"
             } else {
-                "Send a beacon now. The automatic beacon shuts down within 72 hours; you'll need to re-enable it to continue beaconing."
+                "Send a beacon now (the time is the countdown to the next automatic one). The automatic beacon shuts down within 72 hours; you'll need to re-enable it to continue beaconing."
             };
-            let beacon_click = ui.add_sized([w, 26.0], theme::accent_button(label, theme::PURPLE)).on_hover_text(tip).clicked();
+            // (truncated, never wider than its column: a wider one pushed AUTO under CALL CQ)
+            let beacon = theme::accent_button(RichText::new(label).size(12.5), theme::PURPLE).wrap_mode(egui::TextWrapMode::Truncate);
+            let beacon_click = ui.add_sized([w, 26.0], beacon).on_hover_text(tip).clicked();
             if beacon_click && state.freq_mode.scanning() {
                 // VarAC: pressing BEACON while the scanner runs switches the scanner off
                 state.set_freq_mode(crate::varac::scheduler::Mode::Inactive);
@@ -620,7 +627,7 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             ui.spacing_mut().item_spacing.x = 4.0;
             let w = ui.available_width() - 44.0;
             if state.cq_active || state.slot_wait.is_some() {
-                if ui.add_sized([w, 26.0], theme::accent_button("END CQ", theme::RED)).clicked() {
+                if ui.add_sized([w, 26.0], theme::accent_button("END CQ", theme::RED).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
                     state.cq_active = false;
                     state.send_cmd(GuiCommand::Abort);
                     if state.slot_wait.is_some() || state.pending_slot_qsy.is_some() {
@@ -628,7 +635,9 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
                     }
                     state.status_msg = "CQ stopped".into();
                 }
-            } else if ui.add_sized([w, 26.0], theme::accent_button("CALL CQ", theme::PURPLE)).clicked() && state.modem_connected {
+            } else if ui.add_sized([w, 26.0], theme::accent_button("CALL CQ", theme::PURPLE).wrap_mode(egui::TextWrapMode::Truncate)).clicked()
+                && state.modem_connected
+            {
                 // VarAC: choose the slot to stand by on, unless the slot system is off
                 if state.settings_form.skip_cq_slot_selector {
                     state.call_cq_on_slot(0);
