@@ -228,6 +228,7 @@ fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso
     if !state.chat_window_open {
         // (a new chat window starts with its title from the builder)
         ctx.data_mut(|d| d.remove::<String>(egui::Id::new("openslot_chat_window_title")));
+        forget_popout_size(ctx, "openslot_chat_window");
         return;
     }
     let title = match &state.connected_to {
@@ -236,7 +237,7 @@ fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso
     };
     let builder = egui::ViewportBuilder::default()
         .with_title(title.clone())
-        .with_inner_size([960.0, 720.0])
+        .with_inner_size(popout_size(ctx, "openslot_chat_window", Vec2::new(960.0, 720.0)))
         .with_min_inner_size([520.0, 380.0]);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("openslot_chat_window"), builder, |ctx, class| {
         let buttons = |ui: &mut egui::Ui, state: &mut GuiState| {
@@ -322,11 +323,12 @@ fn draw_broadcasts_placeholder(ui: &mut egui::Ui, state: &mut GuiState) {
 /// The broadcasts in a window of their own (Shrink back in the card's header, or close it).
 fn draw_broadcasts_window(ctx: &egui::Context, state: &mut GuiState) {
     if !state.broadcasts_window_open {
+        forget_popout_size(ctx, "openslot_broadcasts_window");
         return;
     }
     let builder = egui::ViewportBuilder::default()
         .with_title("Openslot broadcasts")
-        .with_inner_size([900.0, 560.0])
+        .with_inner_size(popout_size(ctx, "openslot_broadcasts_window", Vec2::new(900.0, 560.0)))
         .with_min_inner_size([420.0, 240.0]);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("openslot_broadcasts_window"), builder, |ctx, class| {
         if class == egui::ViewportClass::Embedded {
@@ -349,6 +351,30 @@ fn draw_broadcasts_window(ctx: &egui::Context, state: &mut GuiState) {
             .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(10.0)))
             .show(ctx, |ui| draw_broadcasts_card(ui, state));
     });
+}
+
+/// A popped-out window's size: `want`, or less on a screen too small for it. On a 1366×768
+/// laptop 720 px plus the title bar ran past the bottom of the screen (under GNOME's top bar),
+/// hiding SEND, DISCONNECT and Shrink back. Worked out once each time the window opens: a
+/// builder whose size changes resizes the window, undoing the operator's own resizing.
+fn popout_size(ctx: &egui::Context, key: &str, want: Vec2) -> Vec2 {
+    let id = egui::Id::new(key).with("size");
+    if let Some(size) = ctx.data(|d| d.get_temp::<Vec2>(id)) {
+        return size;
+    }
+    // (the main window's size when the system doesn't say the monitor's: it fits the screen)
+    let screen = ctx
+        .input(|i| i.viewport().monitor_size)
+        .filter(|m| m.x > 0.0 && m.y > 0.0)
+        .unwrap_or_else(|| ctx.screen_rect().size() + Vec2::new(0.0, 80.0));
+    // Room for the desktop's bars (GNOME's top bar, a dock or task bar) and the title bar
+    let size = Vec2::new(want.x.min(screen.x - 40.0), want.y.min(screen.y - 120.0)).max(Vec2::new(520.0, 380.0));
+    ctx.data_mut(|d| d.insert_temp(id, size));
+    size
+}
+
+fn forget_popout_size(ctx: &egui::Context, key: &str) {
+    ctx.data_mut(|d| d.remove::<Vec2>(egui::Id::new(key).with("size")));
 }
 
 fn full_width(ui: &egui::Ui) -> Vec2 {
@@ -2416,6 +2442,27 @@ fn end_sniff(state: &mut GuiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chat window opens fitting a 1366×768 laptop's screen, full size on a big one, and
+    /// keeps its size while open.
+    #[test]
+    fn popped_out_windows_fit_the_screen() {
+        let size_on = |w: f32, h: f32| {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let info = egui::ViewportInfo { monitor_size: Some(Vec2::new(w, h)), ..Default::default() };
+            input.viewports.insert(egui::ViewportId::ROOT, info);
+            let mut size = Vec2::ZERO;
+            for _ in 0..2 {
+                let _ = ctx.run(input.clone(), |ctx| size = popout_size(ctx, "chat", Vec2::new(960.0, 720.0)));
+            }
+            size
+        };
+        let laptop = size_on(1366.0, 768.0);
+        // (the title bar is ~37 px and GNOME's top bar 32: it must leave them room)
+        assert!(laptop.y + 37.0 + 32.0 <= 768.0 && laptop.x == 960.0, "{laptop:?}");
+        assert_eq!(size_on(1920.0, 1080.0), Vec2::new(960.0, 720.0));
+    }
 
     /// The main window, drawn for a few frames (the layout settles on what it measured the
     /// frame before) at `w` × `h`, below bars as tall as the Linux app's modem bar and the menu

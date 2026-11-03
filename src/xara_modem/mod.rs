@@ -660,7 +660,7 @@ impl BuiltInModem {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 5.0, color);
                 let status = if self.settings.enabled || running {
-                    format!("XARA: {}", self.status)
+                    format!("XARA: {}", self.shown_status(&feed))
                 } else {
                     format!("XARA off: Openslot uses the modem on port {}", self.cmd_port)
                 };
@@ -691,6 +691,24 @@ impl BuiltInModem {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         !modem_tab
+    }
+
+    /// The status line: once running on VARA HF, with the bandwidth the modem uses now. It
+    /// starts in its Mode's, and Openslot switches it (500 Hz on connecting, as VarAC; the
+    /// 500 / 2300 / 2750 buttons).
+    fn shown_status(&self, feed: &Feed) -> String {
+        let bw = feed
+            .latest()
+            .status
+            .as_ref()
+            .filter(|(t, _)| t.elapsed() < Duration::from_secs(5))
+            .and_then(|(_, st)| st.bw.parse::<u32>().ok());
+        match bw {
+            Some(bw) if self.running() && self.starting.is_none() && self.settings.is_hf() => {
+                format!("Running VARA HF {bw} Hz as {}", self.call.to_uppercase())
+            }
+            _ => self.status.clone(),
+        }
     }
 
     fn tab_ui(&mut self, ui: &mut egui::Ui, feed: &Feed, cmd_tx: &UnboundedSender<GuiCommand>) {
@@ -752,7 +770,7 @@ impl BuiltInModem {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 6.0, color);
                     let status = if self.settings.enabled || running {
-                        self.status.clone()
+                        self.shown_status(feed)
                     } else {
                         "Off: Openslot uses VARA or another modem you run".to_string()
                     };
@@ -1029,7 +1047,8 @@ impl BuiltInModem {
                 badge(ui, "PTT", st.ptt, Color32::from_rgb(220, 50, 50));
             });
         });
-        egui::Grid::new("xara_status").num_columns(4).spacing([24.0, 4.0]).show(ui, |ui| {
+        // (wide enough for each value on one line: "OFDM 49 carriers · QPSK", "1 / 15 retries")
+        egui::Grid::new("xara_status").num_columns(4).spacing([24.0, 4.0]).min_col_width(130.0).show(ui, |ui| {
             let dash = || "–".to_string();
             stat(ui, "Speed level", st.level.map_or_else(dash, |l| l.to_string()));
             stat(
@@ -1330,8 +1349,8 @@ fn badge(ui: &mut egui::Ui, text: &str, on: bool, color: Color32) {
 /// A caption over a value, one cell of the status grid.
 fn stat(ui: &mut egui::Ui, caption: &str, value: String) {
     ui.vertical(|ui| {
-        ui.label(RichText::new(caption).weak().size(11.0));
-        ui.label(RichText::new(value).size(15.0).monospace());
+        ui.add(egui::Label::new(RichText::new(caption).weak().size(11.0)).extend());
+        ui.add(egui::Label::new(RichText::new(value).size(15.0).monospace()).extend());
     });
 }
 
