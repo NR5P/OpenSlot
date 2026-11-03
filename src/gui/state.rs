@@ -1660,7 +1660,16 @@ impl GuiState {
         let cf = self.slot_wait.take().map(|(_, cf, _)| cf).unwrap_or(self.current_frequency);
         self.pending_slot_qsy = None;
         self.tune_to = Some(cf);
+        self.cq_over();
         self.add_log(format!("Back on the calling frequency {:.3} MHz", cf as f64 / 1e6));
+    }
+
+    /// The CQ has run its course (slot wait over, or a CQ without a slot sent twice): it
+    /// stays active only for Auto-CQ, which calls again from here.
+    fn cq_over(&mut self) {
+        if !self.auto_cq_enabled {
+            self.cq_active = false;
+        }
     }
 
     /// Answer a CQ that named a slot: retune there, then connect (as in
@@ -2315,6 +2324,9 @@ impl GuiState {
         } else {
             self.cq_seq = None;
             self.start_slot_wait();
+            if self.slot_wait.is_none() {
+                self.cq_over();
+            }
         }
     }
 }

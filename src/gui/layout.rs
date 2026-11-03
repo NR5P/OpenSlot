@@ -744,6 +744,8 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             if state.cq_active || state.slot_wait.is_some() {
                 if ui.add_sized([w, 26.0], theme::accent_button("END CQ", theme::RED).wrap_mode(egui::TextWrapMode::Truncate)).clicked() {
                     state.cq_active = false;
+                    // (VarAC sends each CQ twice: the second must not follow)
+                    state.cq_seq = None;
                     state.send_cmd(GuiCommand::Abort);
                     if state.slot_wait.is_some() || state.pending_slot_qsy.is_some() {
                         state.return_to_cf();
@@ -1033,7 +1035,8 @@ pub fn draw_cq_slot_selector(ctx: &egui::Context, state: &mut GuiState) {
                 ui.label(RichText::new(format!("{:.3}", cf as f64 / 1e6)).monospace());
                 ui.add_space(12.0);
                 theme::caption(ui, "Selected slot");
-                ui.label(RichText::new(format!("{:.3}", f as f64 / 1e6)).monospace().strong().color(theme::YELLOW));
+                // (to the Hz: slots sit 750 Hz apart, so 14.106 would name the wrong one)
+                ui.label(RichText::new(crate::varac::scheduler::dotted(f)).monospace().strong().color(theme::YELLOW));
             });
             if state.cq_slot == 0 {
                 ui.colored_label(theme::YELLOW, "Slot 0 = the calling frequency itself. QSOs on VarAC calling frequencies are prohibited.");
@@ -2174,6 +2177,7 @@ fn set_ptt_disabled(state: &mut GuiState, on: bool) {
     crate::config::update_config_file(|c| c.ptt_disabled = Some(on));
     if on {
         state.cq_active = false;
+        state.cq_seq = None;
         state.send_cmd(GuiCommand::TuneStop);
     }
     state.status_msg = if on { "PTT disabled: listening only".into() } else { "PTT enabled".into() };
@@ -2519,6 +2523,37 @@ fn end_sniff(state: &mut GuiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CQ ends with its slot wait (END CQ doesn't stay lit), and one without a slot after
+    /// its second transmission; Auto-CQ keeps it active to call again.
+    #[test]
+    fn a_cq_ends_when_its_slot_wait_does() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = GuiState::new("N0CALL".into(), true, tx);
+        s.settings_form.bandwidth = "500".into();
+        s.current_frequency = 14_105_000;
+        let both_cqs_on_air = |s: &mut GuiState| {
+            for _ in 0..2 {
+                s.cq_seq.as_mut().expect("CQ sequence").next_at = Some(Utc::now());
+                s.cq_seq_tick();
+            }
+        };
+        s.call_cq_on_slot(11);
+        both_cqs_on_air(&mut s);
+        assert!(s.slot_wait.is_some() && s.cq_active);
+        s.return_to_cf();
+        assert!(!s.cq_active, "the CQ is over once back on the calling frequency");
+
+        s.call_cq_on_slot(0);
+        both_cqs_on_air(&mut s);
+        assert!(s.cq_seq.is_none() && !s.cq_active, "no slot: over after the second CQ");
+
+        s.auto_cq_enabled = true;
+        s.call_cq_on_slot(11);
+        both_cqs_on_air(&mut s);
+        s.return_to_cf();
+        assert!(s.cq_active, "Auto-CQ calls again from the calling frequency");
+    }
 
     /// The chat window opens fitting a 1366×768 laptop's screen, full size on a big one, and
     /// keeps its size while open.

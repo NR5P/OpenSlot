@@ -4521,7 +4521,9 @@ fn draw_vmail_popups(ctx: &egui::Context, state: &mut GuiState) {
 fn open_reply(state: &mut GuiState, db: &Storage, guid: &str) {
     let Some(vm) = db.vmail_by_guid(guid).ok().flatten() else { return };
     clear_compose(state);
-    state.compose_to = vm.vmail_from.clone();
+    // (a VMail of our own, in Sent or the Outbox: the reply goes to the other station)
+    let ours = base_callsign(&vm.vmail_from) == base_callsign(&state.my_callsign);
+    state.compose_to = if ours { vm.vmail_to.clone() } else { vm.vmail_from.clone() };
     state.compose_subject = if vm.subject.starts_with("RE: ") { vm.subject.clone() } else { format!("RE: {}", vm.subject) };
     truncate_chars(&mut state.compose_subject, 50);
     state.compose_body = reply_quote(&vm.vmail_from, &vm.msg);
@@ -5112,7 +5114,7 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
                 ui.add(
                     TextEdit::singleline(&mut state.file_path_input)
                         .desired_width(300.0)
-                        .hint_text("/path/to/file"),
+                        .hint_text("Full path of the file, or Browse..."),
                 );
                 if ui.button("Browse...").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -5352,7 +5354,8 @@ fn draw_vmail_folders(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
                             state.viewing_vmail = true;
                         }
 
-                        let ctx_from = from.clone();
+                        // (the callsign the row shows: the sender in the Inbox, else the addressee)
+                        let ctx_from = label_call.clone();
                         let ctx_subject = subject.clone();
                         resp.context_menu(|ui| {
                             if ui.button("Open").clicked() {
@@ -8180,16 +8183,16 @@ fn draw_vmail_viewer_window(ctx: &egui::Context, state: &mut GuiState, db: &Stor
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reply").clicked() {
-                    state.compose_open = true;
-                    state.compose_to = from.clone();
-                    state.compose_subject = format!("Re: {subject}");
+                    // (as the list's Reply: VarAC's "RE:" subject and quote)
+                    open_reply(state, db, &guid);
                     state.viewing_vmail = false;
                 }
                 if ui.button("Forward").clicked() {
                     state.compose_open = true;
                     state.compose_to.clear();
                     state.compose_subject = format!("Fwd: {subject}");
-                    state.compose_body = format!("--- Forwarded from {from} ---//n{body}");
+                    // (the compose box holds real line breaks, as the reader shows them)
+                    state.compose_body = format!("--- Forwarded from {from} ---\n{}", body.replace("//n", "\n"));
                     state.viewing_vmail = false;
                 }
                 if state.vmail_folder_tab == 3 {
@@ -8680,13 +8683,17 @@ pub fn spawn_session_bridge(
                         }
                         let on_cf = ptt_router.dial()
                             .is_some_and(|d| crate::varac::messages::is_calling_frequency(d));
-                        if on_cf && !cf_abort_done {
+                        // (away, a call to us has the away limit below instead of the 240 s one,
+                        // which would otherwise always cut it first)
+                        let away_link = s.is_away() && s.is_incoming() && !s.is_ping();
+                        if on_cf && !cf_abort_done && away_link {
                             // Away on a calling frequency: 5 minutes, then <AE> and disconnect
-                            if s.is_away() && s.is_incoming() && !s.is_ping() && !bye_sent && age >= std::time::Duration::from_secs(300) {
+                            if !bye_sent && age >= std::time::Duration::from_secs(300) {
                                 sys("CONNECTION ON CALLING FREQUENCY IN AWAY STATUS TIME LIMIT EXCEEDED. DISCONNECTING...".into());
                                 let _ = s.send_chat("<AE>").await;
                                 (bye_sent, bye_tag_pending) = (true, true);
                             }
+                        } else if on_cf && !cf_abort_done {
                             // VarAC aborts links left on a calling frequency: 240 s, pings 90 s
                             let limit: u64 = if s.is_ping() { 90 } else { 240 };
                             // ...after a reminder (caller at 150 s, called station at 210 s)
