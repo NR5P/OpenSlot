@@ -2,7 +2,7 @@
 # compiled in unchanged), plus the XARA modem built in (PulseAudio / PipeWire, ALSA).
 [package]
 name = "openslot-linux"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 description = "Openslot for Linux, with the XARA modem built in"
 license = "MIT OR Apache-2.0"
