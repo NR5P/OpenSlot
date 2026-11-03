@@ -1957,28 +1957,29 @@ fn draw_qso_row(ui: &mut egui::Ui, state: &mut GuiState) {
     let now = || Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
-        let fixed = 88.0 + 58.0 * 2.0 + 64.0 + 100.0 + 58.0 + 40.0 + 150.0 * 2.0 + 36.0 + 8.0 * 18.0;
+        // (a pick list is as wide as its value at least: sized here for "+25" and "1.2cm")
+        let fixed = 88.0 + 72.0 * 2.0 + 80.0 + 100.0 + 70.0 + 40.0 + 180.0 * 2.0 + 36.0 + 8.0 * 18.0;
         let qth_w = (ui.available_width() - fixed).max(60.0);
         let l = &mut state.qso_log;
         column(ui, "Callsign", &mut |ui| edit(ui, &mut l.call, 80.0));
-        column(ui, "SNR-S", &mut |ui| pick(ui, "qso_snr_s", &mut l.snr_sent, &SNRS, 46.0));
-        column(ui, "SNR-R", &mut |ui| pick(ui, "qso_snr_r", &mut l.snr_rcvd, &SNRS, 46.0));
-        column(ui, "Band", &mut |ui| pick(ui, "qso_band", &mut l.band, &BANDS, 52.0));
+        column(ui, "SNR-S", &mut |ui| pick(ui, "qso_snr_s", &mut l.snr_sent, &SNRS, 60.0));
+        column(ui, "SNR-R", &mut |ui| pick(ui, "qso_snr_r", &mut l.snr_rcvd, &SNRS, 60.0));
+        column(ui, "Band", &mut |ui| pick(ui, "qso_band", &mut l.band, &BANDS, 68.0));
         column(ui, "Name", &mut |ui| edit(ui, &mut l.name, 92.0));
-        column(ui, "Loc", &mut |ui| edit(ui, &mut l.locator, 50.0));
+        column(ui, "Loc", &mut |ui| edit(ui, &mut l.locator, 62.0));
         column(ui, "QTH", &mut |ui| edit(ui, &mut l.qth, qth_w));
         column(ui, "MyPWR", &mut |ui| {
             edit(ui, &mut l.power, 32.0);
             l.power.retain(|c| c.is_ascii_digit() || c == '.');
         });
         column(ui, "Start", &mut |ui| ui.horizontal(|ui| {
-            edit(ui, &mut l.start, 118.0);
+            edit(ui, &mut l.start, 132.0);
             if ui.small_button("now").on_hover_text("Set the QSO start time to now (UTC)").clicked() {
                 l.start = now();
             }
         }).response.mark_changed());
         column(ui, "End", &mut |ui| ui.horizontal(|ui| {
-            edit(ui, &mut l.end, 118.0);
+            edit(ui, &mut l.end, 132.0);
             if ui.small_button("now").on_hover_text("Manually set QSO end time to NOW").clicked() {
                 l.end = now();
             }

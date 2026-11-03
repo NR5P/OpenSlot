@@ -701,10 +701,23 @@ impl VaracApp {
                     self.state.verbose_snr = false;
                     self.state.verbose_snr_invite = false;
                     let prev = self.state.connected_to.take();
-                    let call = prev.as_deref().unwrap_or("?");
-                    self.state.status_msg = format!("Disconnected from {call}");
-                    self.state.add_system_chat(format!("DISCONNECTED FROM {call}"));
-                    sound::narrate(sound::Topic::AlertsAndNotifications, format!("Disconnected from {}.", sound::phonetic(call)));
+                    match (prev.as_deref(), self.state.last_connect_callsign.clone()) {
+                        (Some(call), _) => {
+                            self.state.status_msg = format!("Disconnected from {call}");
+                            self.state.add_system_chat(format!("DISCONNECTED FROM {call}"));
+                            sound::narrate(sound::Topic::AlertsAndNotifications, format!("Disconnected from {}.", sound::phonetic(call)));
+                        }
+                        // (the call we dialled never linked: no answer, or aborted)
+                        (None, Some(call)) => {
+                            self.state.status_msg = format!("No link with {call}");
+                            self.state.add_system_chat(format!("COULD NOT CONNECT TO {call}"));
+                            sound::narrate(sound::Topic::AlertsAndNotifications, format!("Could not connect to {}.", sound::phonetic(&call)));
+                        }
+                        (None, None) => {
+                            self.state.status_msg = "Disconnected".into();
+                            self.state.add_system_chat("DISCONNECTED".into());
+                        }
+                    }
                     if let Some(guid) = self.current_qso_guid.take() {
                         if self.state.unlogged_qso.as_ref().is_some_and(|q| q.guid == guid) {
                             self.state.add_system_chat("QSO not logged yet: click LOG to log it".into());
@@ -947,7 +960,14 @@ impl VaracApp {
                         alert: self.alert_check(crate::varac::alerts::Source::Beacon, &b.callsign, "", &[&b.callsign, &b.locator]),
                     };
                     let dup = self.state.beacon_entries.back().is_some_and(|last| last.callsign == entry.callsign);
-                    if !dup {
+                    if dup {
+                        // (heard again: refresh the row's time, TΔ and SNR)
+                        if let Some(last) = self.state.beacon_entries.back_mut() {
+                            last.time = entry.time;
+                            last.snr = entry.snr;
+                            last.timestamp = entry.timestamp;
+                        }
+                    } else {
                         self.state.beacon_entries.push_back(entry);
                         if self.state.beacon_entries.len() > 200 {
                             self.state.beacon_entries.pop_front();
@@ -1054,10 +1074,17 @@ impl VaracApp {
                     let mut entry = entry;
                     entry.alert = self.alert_check(src, base_call_cq, "", &[&source, &loc]);
                     if is_beacon {
-                        // Suppress duplicate beacons from same callsign within 60s
+                        // The same station again: refresh its row (time, TΔ, SNR) instead of a new one
                         let dominated = self.state.beacon_entries.back()
                             .is_some_and(|last| last.callsign == entry.callsign);
-                        if !dominated {
+                        if dominated {
+                            if let Some(last) = self.state.beacon_entries.back_mut() {
+                                last.time = entry.time;
+                                last.bandwidth = entry.bandwidth;
+                                last.snr = entry.snr;
+                                last.timestamp = entry.timestamp;
+                            }
+                        } else {
                             self.state.beacon_entries.push_back(entry);
                             if self.state.beacon_entries.len() > 200 {
                                 self.state.beacon_entries.pop_front();
@@ -2204,7 +2231,11 @@ impl VaracApp {
                     return;
                 };
                 let entry = BroadcastEntry {
-                    time: bc.timestamp.format("%H:%M").to_string(),
+                    time: if self.state.use_local_time {
+                        bc.timestamp.with_timezone(&Local).format("%H:%M").to_string()
+                    } else {
+                        bc.timestamp.format("%H:%M").to_string()
+                    },
                     from: bc.from.split('-').next().unwrap_or(&bc.from).to_string(),
                     to: bc.to.clone(),
                     via: bc.via.clone(),
@@ -4060,10 +4091,14 @@ fn handle_chat_slash_command(state: &mut GuiState, text: &str) {
             if state.modem_connected {
                 state.send_cmd(GuiCommand::Connect(arg.to_uppercase()));
                 state.connect_started = Some(Utc::now());
+                state.last_connect_callsign = Some(arg.to_uppercase());
                 state.add_log(format!("Connecting to {}", arg.to_uppercase()));
             } else {
                 state.status_msg = "Modem not connected".into();
             }
+        }
+        "/connect" => {
+            state.status_msg = "Usage: /connect CALL".into();
         }
         "/disconnect" | "/disc" => {
             state.send_cmd(GuiCommand::Disconnect);
@@ -6232,12 +6267,22 @@ fn draw_settings_window(
 
                             // ---- CAT Configuration
                             group(&mut cols[0], "CAT Configuration", &mut |ui| {
+                                let was = state.rig_settings_backend.clone();
                                 ui.horizontal(|ui| {
                                     ui.radio_value(&mut state.rig_settings_backend, "cat".into(), "COM Port");
                                     ui.radio_value(&mut state.rig_settings_backend, "rigctld".into(), "TCP (rigctld)");
                                     ui.radio_value(&mut state.rig_settings_backend, "flrig".into(), "FLRig");
                                     ui.radio_value(&mut state.rig_settings_backend, "none".into(), "None");
                                 });
+                                // rigctld and FLRig share the host/port fields: switching between them
+                                // swaps one's default port for the other's (a port the operator typed stays)
+                                if was != state.rig_settings_backend {
+                                    match (state.rig_settings_backend.as_str(), state.rig_settings_port.trim()) {
+                                        ("flrig", "4532" | "") => state.rig_settings_port = "12345".into(),
+                                        ("rigctld", "12345" | "") => state.rig_settings_port = "4532".into(),
+                                        _ => {}
+                                    }
+                                }
                                 if state.rig_settings_backend != "none" {
                                     ui.horizontal(|ui| {
                                         ui.label("Radio mode");
@@ -8078,7 +8123,9 @@ fn draw_vmail_viewer_window(ctx: &egui::Context, state: &mut GuiState, db: &Stor
     };
 
     let mut open = state.viewing_vmail;
+    // (its own id: the folder list is a window titled "VMail" too, and egui keys windows by title)
     egui::Window::new("VMail")
+        .id(egui::Id::new("vmail_viewer"))
         .open(&mut open)
         .default_size([500.0, 350.0])
         .show(ctx, |ui| {
@@ -8121,8 +8168,10 @@ fn draw_vmail_viewer_window(ctx: &egui::Context, state: &mut GuiState, db: &Stor
                 });
                 ui.separator();
             }
+            // (a long VMail scrolls: Reply / Forward / Delete stay on screen)
             ScrollArea::vertical()
-                .auto_shrink([false; 2])
+                .auto_shrink([false, true])
+                .max_height((ctx.screen_rect().height() - 320.0).max(120.0))
                 .show(ui, |ui| {
                     let display = body.replace("//n", "\n");
                     ui.label(&display);

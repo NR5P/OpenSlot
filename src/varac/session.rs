@@ -657,6 +657,8 @@ impl VaracSession {
                         other => self.pending.push_back(other),
                     }
                 }
+                // (with the pause dropped no timer will release what waits: send it now)
+                let _ = self.pump_tx().await;
                 self.pending.pop_front()
             }
             SessionInput::SlotTimeout => {
@@ -3816,6 +3818,43 @@ mod handshake_tests {
         // the stale &IT& is dropped, three go together, then <SR> with the next line (VarAC
         // joins tags too; only files, replies, likes, typing, QSY invitations and AI: not)
         assert_eq!(rest, "16 two\r\nthree\r\nfour10 <SR>\r\nfive6 <C:2>x", "a reply goes alone");
+    }
+
+    /// The partner speaking during VarAC's 1 s pause after our frame ends the pause: what
+    /// waits must go out then, not stay "In queue" until something else happens.
+    #[tokio::test]
+    async fn partner_frame_in_the_pause_releases_the_queue() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap(), data.accept().await.unwrap()) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (_c, (mut modem_data, _)) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: "W5TST".into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(ServiceFlags::VMAIL), bbs_dir: None, email_gate: None, bbs_gate: None,
+            policy: Default::default(),
+        };
+        let mut s = VaracSession::new(vara, cfg);
+        s.state = SessionState::Connected;
+        s.send_framed("<TL>").await.unwrap();
+        s.send_framed("second").await.unwrap();
+        let mut buf = [0u8; 512];
+        let n = modem_data.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"4 <TL>");
+        // BUFFER 0: the pause starts, "second" waits
+        s.tx_done().await;
+        assert!(s.tx_resume_at.is_some());
+        s.pending.clear();
+        // the partner's frame lands inside the pause
+        modem_data.write_all(b"5 hello").await.unwrap();
+        let input = tokio::time::timeout(std::time::Duration::from_millis(500), s.next_input()).await.unwrap().unwrap();
+        assert!(matches!(input, SessionInput::Data(_)));
+        s.handle_input(input).await;
+        let n = tokio::time::timeout(std::time::Duration::from_millis(500), modem_data.read(&mut buf)).await
+            .expect("the queued frame was not sent").unwrap();
+        assert_eq!(&buf[..n], b"6 second");
     }
 
     #[tokio::test]
