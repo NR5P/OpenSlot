@@ -124,6 +124,13 @@ pub struct VaracApp {
     dial_pushed: u64,
     /// Checked whether the default window fits the screen
     fitted_to_screen: bool,
+    /// The window title as last set (a title command asks egui for another frame, so it's
+    /// sent only when it changes, or the app never goes idle)
+    window_title: String,
+    /// When the last frame started (Linux paces frames itself: no vsync there)
+    last_frame: Option<std::time::Instant>,
+    /// OPENSLOT_DEBUG_REPAINT: what asked for each frame, counted and logged every 10 s
+    repaint_debug: Option<(std::time::Instant, u32, std::collections::BTreeMap<String, u32>)>,
     /// The frequency scheduler's pick: tune the radio to it when it connects
     restore_freq_pending: bool,
     /// Otherwise, at start: the calling frequency of the band the radio is on (first reading)
@@ -423,6 +430,9 @@ impl VaracApp {
             freq_check: None,
             dial_pushed: 0,
             fitted_to_screen: false,
+            window_title: String::new(),
+            last_frame: None,
+            repaint_debug: std::env::var_os("OPENSLOT_DEBUG_REPAINT").map(|_| (std::time::Instant::now(), 0, Default::default())),
             restore_freq_pending: sched_tuned,
             start_on_radio_band: !sched_tuned,
             psk: crate::varac::pskreporter::spawn(|m| tracing::info!(target: "gui", "{m}")),
@@ -745,7 +755,13 @@ impl VaracApp {
                 }
                 SessionMsg::TxHeld { cmd, title, text } => {
                     self.state.add_log(format!("{title} {}", text.replace('\n', " ")));
-                    self.state.tx_held = Some((cmd, title, text));
+                    if matches!(cmd, GuiCommand::Tune) {
+                        // (the Tune window asks itself, rather than a popup over it)
+                        self.state.tune_busy = true;
+                        self.state.tune_window = true;
+                    } else {
+                        self.state.tx_held = Some((cmd, title, text));
+                    }
                 }
                 SessionMsg::TxRefused { title, text } => {
                     self.state.add_log(format!("{title} {}", text.replace('\n', " ")));
@@ -2911,6 +2927,11 @@ impl GuiShell {
             .ok();
         Self(app)
     }
+
+    /// The modem's TX drive level (dB) as last read from it or set in the Tune window.
+    pub fn drive_level(&self) -> Option<i32> {
+        self.0.lock().ok().and_then(|app| app.state.drive_level)
+    }
 }
 
 impl eframe::App for GuiShell {
@@ -2927,6 +2948,28 @@ impl eframe::App for GuiShell {
 
 impl eframe::App for VaracApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Without vsync (see run_gui) nothing else caps the frame rate: at most 60 a second, so
+        // a widget asking for repaints every frame can't spin a CPU core.
+        #[cfg(target_os = "linux")]
+        {
+            const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+            if let Some(left) = self.last_frame.and_then(|t| FRAME.checked_sub(t.elapsed())) {
+                std::thread::sleep(left);
+            }
+            self.last_frame = Some(std::time::Instant::now());
+        }
+        if let Some((since, frames, causes)) = self.repaint_debug.as_mut() {
+            *frames += 1;
+            for c in ctx.repaint_causes() {
+                *causes.entry(format!("{}:{} {}", c.file, c.line, c.reason)).or_default() += 1;
+            }
+            if since.elapsed() >= std::time::Duration::from_secs(10) {
+                eprintln!("repaint: {frames} frames in 10 s; causes: {causes:?}");
+                *since = std::time::Instant::now();
+                *frames = 0;
+                causes.clear();
+            }
+        }
         self.tick();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         // VarAC: closing during a QSO, connect, CQ, beacon, broadcast or
@@ -2990,7 +3033,10 @@ impl eframe::App for VaracApp {
         } else {
             format!("Openslot — {}{vmail_badge}", self.state.my_callsign)
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
 
         // Keyboard shortcuts
         ctx.input(|i| {
@@ -3294,6 +3340,7 @@ fn draw_menu_bar(ctx: &egui::Context, state: &mut GuiState) {
                 ui.separator();
                 if ui.button("TUNE").clicked() {
                     state.send_cmd(GuiCommand::Tune);
+                    state.tune_window = true;
                     ui.close_menu();
                 }
                 if ui.button("STOP TUNE").clicked() {
@@ -10102,8 +10149,6 @@ async fn connect_modem(
     // VarAC: VARA HF always starts at 500 Hz
     let pings = station_config.policy.allow_pings.load(std::sync::atomic::Ordering::Relaxed);
     vara.initialize_for(callsign, crate::vara::commands::Bandwidth::Bw500, crate::config::modem_type(), pings).await?;
-    // (VarAC reads the modem's drive level for its tune slider)
-    let _ = vara.send_command(&crate::vara::commands::VaraCommand::TuneQuery).await;
     let mut sess = VaracSession::new(vara, station_config.clone());
     sess.ask_qsy_invite = true;
     // Broadcasts go over the modem's KISS port; carry on without it if it's disabled
@@ -10206,6 +10251,11 @@ pub fn run_gui(
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // Linux (Wayland): a window the compositor has covered gets no frame callbacks, so a
+        // vsync'd buffer swap waits forever. The chat and broadcasts windows are immediate
+        // viewports, drawn inside the main window's update with the app locked: covering one
+        // froze the whole app. Frames are on demand anyway, so not waiting costs nothing.
+        vsync: !cfg!(target_os = "linux"),
         ..Default::default()
     };
 

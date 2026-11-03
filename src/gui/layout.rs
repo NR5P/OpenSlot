@@ -207,6 +207,8 @@ fn draw_chat_placeholder(ui: &mut egui::Ui, state: &mut GuiState) {
 /// Shrink back below them. Closing the window puts the chat back too.
 fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso_guid: &Option<String>) {
     if !state.chat_window_open {
+        // (a new chat window starts with its title from the builder)
+        ctx.data_mut(|d| d.remove::<String>(egui::Id::new("openslot_chat_window_title")));
         return;
     }
     let title = match &state.connected_to {
@@ -256,7 +258,12 @@ fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso
             }
             return;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        // (only when it changes: each title command asks for another frame)
+        let shown_id = egui::Id::new("openslot_chat_window_title");
+        if ctx.data(|d| d.get_temp::<String>(shown_id)).as_ref() != Some(&title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            ctx.data_mut(|d| d.insert_temp(shown_id, title.clone()));
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
             state.chat_window_open = false;
         }
@@ -738,10 +745,22 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
         .default_width(360.0)
         .show(ctx, |ui| {
             let on_air = state.ptt;
+            if on_air {
+                state.tune_busy = false;
+            }
             ui.horizontal(|ui| {
                 let (text, color) = if on_air { ("TRANSMITTING TUNE CARRIER", theme::RED) } else { ("NOT TRANSMITTING", theme::MUTED) };
                 ui.label(RichText::new(text).strong().color(color));
             });
+            if state.tune_busy {
+                theme::card().fill(theme::tint(theme::YELLOW, 30)).inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("The frequency appears to be busy").strong().color(theme::YELLOW));
+                    let now = if state.busy { "Still busy: wait until it clears, or tune anyway." } else { "It's clear now." };
+                    ui.label(RichText::new(now).small());
+                });
+                ui.add_space(4.0);
+            }
             ui.add_space(4.0);
             theme::caption(ui, "Modem drive level");
             let mut db = state.drive_level.unwrap_or(-5);
@@ -770,18 +789,25 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
                     if ui.add(theme::accent_button("STOP", theme::RED)).clicked() {
                         state.send_cmd(GuiCommand::TuneStop);
                     }
+                } else if state.tune_busy {
+                    if ui.add_enabled(state.modem_connected, theme::accent_button("TUNE ANYWAY", theme::RED)).clicked() {
+                        state.tune_busy = false;
+                        state.send_cmd(GuiCommand::Confirmed(Box::new(GuiCommand::Tune)));
+                    }
                 } else if ui.add_enabled(state.modem_connected, theme::accent_button("TUNE AGAIN", theme::PURPLE)).clicked() {
                     state.send_cmd(GuiCommand::Tune);
                 }
                 if ui.button("Close").clicked() {
                     state.send_cmd(GuiCommand::TuneStop);
                     state.tune_window = false;
+                    state.tune_busy = false;
                 }
             });
         });
     if !open {
         state.send_cmd(GuiCommand::TuneStop);
         state.tune_window = false;
+        state.tune_busy = false;
     }
 }
 
@@ -1518,8 +1544,11 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
     // when there's room again)
     let overlap = top_end - bottom.response.rect.top();
     let next = if overlap > 0.5 { shrink + overlap / rows } else { (shrink + (overlap + 2.0) / rows).max(0.0).min(shrink) };
+    // (clamped before comparing: at the smallest buttons a still-too-short window would
+    // otherwise ask for another frame every frame, forever)
+    let next = next.clamp(0.0, base - 18.0);
     if (next - shrink).abs() > 0.1 {
-        ui.ctx().data_mut(|d| d.insert_temp(shrink_id, next.clamp(0.0, base - 18.0)));
+        ui.ctx().data_mut(|d| d.insert_temp(shrink_id, next));
         ui.ctx().request_repaint();
     }
 }
@@ -1924,7 +1953,7 @@ fn draw_status_bar(ctx: &egui::Context, state: &mut GuiState) {
                     crate::config::update_config_file(|c| c.ignore_dcd = Some(on));
                 }
                 if state.ptt {
-                    ui.ctx().request_repaint();
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
                 }
 
                 let (s, c) = match state.session_state {

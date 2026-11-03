@@ -199,6 +199,8 @@ pub struct BuiltInModem {
     refresh_devices_later: bool,
     /// Start again once the current stop finishes (settings changed while running).
     restart_after_stop: bool,
+    /// The GUI's drive level as last seen, to notice the Tune window changing it.
+    gui_drive: Option<i32>,
 }
 
 impl BuiltInModem {
@@ -220,6 +222,25 @@ impl BuiltInModem {
             serial_ports: Vec::new(),
             refresh_devices_later: false,
             restart_after_stop: false,
+            gui_drive: None,
+        }
+    }
+
+    /// Keep a drive level set in the Tune window (DRIVELEVEL, live in the running modem) for
+    /// the next start too, which takes its level from xara.toml. Only a change counts: a level
+    /// left over from before a restart mustn't undo one just saved in Modem settings.
+    pub fn follow_drive_level(&mut self, gui: Option<i32>) {
+        if gui == std::mem::replace(&mut self.gui_drive, gui) {
+            return;
+        }
+        let Some(db) = gui else { return };
+        if !self.settings.enabled || !self.running() || db as f32 == self.settings.drive_db {
+            return;
+        }
+        self.settings.drive_db = db as f32;
+        self.draft.drive_db = db as f32;
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Couldn't save the drive level: {e}");
         }
     }
 

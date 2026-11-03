@@ -128,6 +128,9 @@ impl VaraConnection {
             VaraCommand::Version,
             // (VarAC: one MYCALL, with the -T ping alias only when pings are allowed)
             VaraCommand::MyCall(if ping_alias { vec![callsign.to_string(), format!("{base}-T")] } else { vec![callsign.to_string()] }),
+            // (VarAC reads the modem's drive level for its tune slider; without it the
+            // slider shows a guess and the first TUNE goes out at whatever the modem has)
+            VaraCommand::TuneQuery,
         ] {
             self.send_command(&cmd).await?;
         }

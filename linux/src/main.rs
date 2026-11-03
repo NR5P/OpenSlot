@@ -230,6 +230,8 @@ fn run_gui(
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // (as gui::run_gui: a covered chat window's vsync'd swap would freeze the app on Wayland)
+        vsync: false,
         ..Default::default()
     };
 
@@ -268,6 +270,7 @@ impl eframe::App for LinuxApp<'_> {
         // First, so the modem bar sits above the GUI's menu bar.
         self.xara.ui(ctx, &self.cmd_tx);
         eframe::App::update(&mut self.inner, ctx, frame);
+        self.xara.follow_drive_level(self.inner.drive_level());
     }
 }
 

@@ -712,6 +712,8 @@ pub struct GuiState {
     pub close_confirm: Option<bool>,
     /// The Tune window (opened by TUNE) and the modem's TX drive level in dB, once known
     pub tune_window: bool,
+    /// TUNE was held because the frequency is busy: the Tune window asks, no popup.
+    pub tune_busy: bool,
     pub drive_level: Option<i32>,
     /// VarAC's "Bandwidth not allowed!" box is open
     pub bw_refused: bool,
@@ -1136,6 +1138,7 @@ impl GuiState {
             emcomm_confirm: false,
             close_confirm: None,
             tune_window: false,
+            tune_busy: false,
             drive_level: None,
             bw_refused: false,
             help_open: false,
