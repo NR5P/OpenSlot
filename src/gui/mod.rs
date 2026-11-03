@@ -4037,12 +4037,25 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
     });
 }
 
+/// The message box's own commands (handled here, never sent to the partner).
+const CHAT_COMMANDS: &[&str] = &["/connect", "/disconnect", "/disc", "/cq", "/clear", "/freq", "/away", "/bookmarks", "/bm", "/help"];
+
+/// Is this typed text one of our chat commands (not text for the partner)?
+pub(super) fn is_chat_command(text: &str) -> bool {
+    let first = text.trim().split_whitespace().next().unwrap_or("").to_lowercase();
+    CHAT_COMMANDS.contains(&first.as_str())
+}
+
 fn handle_chat_slash_command(state: &mut GuiState, text: &str) {
     let parts: Vec<&str> = text.splitn(2, ' ').collect();
     let cmd = parts[0].to_lowercase();
     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let idle = state.session_state == SessionState::Idle;
 
     match cmd.as_str() {
+        "/connect" | "/cq" if !idle => {
+            state.status_msg = "In a QSO: disconnect first".into();
+        }
         "/connect" if !arg.is_empty() => {
             if state.modem_connected {
                 state.send_cmd(GuiCommand::Connect(arg.to_uppercase()));
@@ -10680,6 +10693,16 @@ mod tests {
         assert_eq!(spark.chars().count(), 5);
         assert!(spark.starts_with('\u{2581}'));
         assert!(spark.ends_with('\u{2588}'));
+    }
+
+    #[test]
+    fn chat_commands_are_ours_other_slashes_are_text() {
+        assert!(is_chat_command("/disconnect"));
+        assert!(is_chat_command("  /DISC "));
+        assert!(is_chat_command("/away back in 5"));
+        assert!(!is_chat_command("/ok, see you on 40m"));
+        assert!(!is_chat_command("50/50 copy"));
+        assert!(!is_chat_command("/helpful"));
     }
 
     #[test]

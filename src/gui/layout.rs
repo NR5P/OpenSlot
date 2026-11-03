@@ -2091,6 +2091,12 @@ fn draw_composer(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage, qso_guid
     }
     if do_send && !state.input_text.trim().is_empty() {
         let typed = std::mem::take(&mut state.input_text);
+        // Our chat commands work in a QSO too (/disconnect, /away…): they went out to the
+        // partner as text. Any other "/…" is still just text.
+        if connected && crate::gui::is_chat_command(&typed) {
+            handle_chat_slash_command(state, typed.trim());
+            return;
+        }
         // VarAC expands its tags in everything it sends (<NAME>, <RIG>, <HCALL>, <UTCDT> …)
         let mut text = if connected { state.expand_tags(&typed) } else { typed };
         // AI MODE (VarAC): everything we type goes to the partner's AI gateway
