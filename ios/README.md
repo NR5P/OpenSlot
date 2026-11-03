@@ -17,8 +17,12 @@ A SwiftUI app around the Rust core (`../mobile-core`), with the **XARA modem bui
   shows it, and answering asks you to tune the radio to that slot first
 - **VMail**: Inbox, Outbox, Sent, Parked; read, reply, compose. VMail to a station you're
   not in a QSO with waits in the Outbox and goes out on your next QSO with it
-- **Settings**: station (call, name, QTH, grid), modem (XARA on this phone, or VARA on
-  the network), PTT (VOX or rigctld), TX drive, dial frequency for the log, profile (email,
+- **Modem**: the NR5P XARA app inside Openslot. Start/Stop; the modem (XARA on this
+  phone, or VARA on the network), PTT (VOX or rigctld), TX drive, **Registered (I hold a
+  VARA licence)**, showing other stations' traffic, debug log and recording, clients on
+  the local network and web UI control; and its Web UI (waterfall and status), Received
+  and Log pages
+- **Settings**: station (call, name, QTH, grid), dial frequency for the log, profile (email,
   complex call sign), QSO (answer info requests, pings and last-heard peeks, auto-accept
   verbose SNR, welcome message, Call ID and idle-disconnect minutes), and the log. As in the desktop app, CQ, connect,
   ping and beacon are refused at 2300/2750 Hz on a calling frequency
@@ -26,7 +30,7 @@ A SwiftUI app around the Rust core (`../mobile-core`), with the **XARA modem bui
 Plug the radio's USB audio interface (a Digirig or similar) into the phone. iOS gives
 apps no serial or HID access, so PTT is VOX or hamlib `rigctld` on the network. The app
 keeps running in the background while the modem is on. It won't transmit into the phone's
-own speaker or mic unless you allow that in Settings (for testing only).
+own speaker or mic unless you allow that on the Modem tab (for testing only).
 
 ## Building
 

@@ -48,6 +48,8 @@ object Native {
     external fun modemStop(): Int
     external fun modemRunning(): Boolean
     external fun modemNextLog(): ByteArray?
+    /** What the modem decoded since the last call (the Modem tab's Received page). */
+    external fun modemNextReceived(): ByteArray?
 }
 
 private fun String.utf8() = toByteArray(Charsets.UTF_8)
@@ -58,6 +60,8 @@ class Prefs(context: Context) {
     private val p = context.getSharedPreferences("openslot", Context.MODE_PRIVATE)
     val dataDir: File = context.getExternalFilesDir(null) ?: context.filesDir
     val modemState = File(context.filesDir, "xara")
+    /** The modem's debug log and recordings (read with adb shell run-as io.github.nr5p.openslot). */
+    val modemLogs = File(context.filesDir, "xara-logs")
 
     var call by string("call", "")
     var name by string("name", "")
@@ -76,6 +80,16 @@ class Prefs(context: Context) {
     var playback by int("playback", 0)
     var allowBuiltIn by bool("allowBuiltIn", false)
     var registered by bool("registered", false)
+    /** The Modem tab's other XARA settings, as the NR5P XARA app. */
+    var monitor by bool("monitor", false)
+    var monitorFrames by bool("monitorFrames", false)
+    var monitorCalls by string("monitorCalls", "")
+    var debugLog by bool("debugLog", false)
+    var recordAudio by bool("recordAudio", false)
+    var lan by bool("lan", false)
+    var uiControl by bool("uiControl", false)
+    /** Kept across launches, so a bookmarked controlling web UI keeps working. */
+    var uiToken by string("uiToken", "")
     /** Settings → QSO, as VarAC. */
     var allowInfo by bool("allowInfo", true)
     var allowPings by bool("allowPings", true)
@@ -131,12 +145,32 @@ class Prefs(context: Context) {
         a += listOf("--audio", "aaudio", "--capture", "$capture", "--playback", "$playback", "--radio")
         a += listOf("--ptt", if (ptt == "rigctld") "rigctld:$rigctld" else "vox")
         a += listOf("--drive-db", "$driveDb")
-        a += listOf("--addr", "127.0.0.1", "--port", "8300", "--kiss-port", "8100")
-        a += listOf("--ui-port", "8080", "--ui-addr", "127.0.0.1")
+        // On the local network too when chosen (the engine still connects on 127.0.0.1)
+        val bind = if (lan) "0.0.0.0" else "127.0.0.1"
+        a += listOf("--addr", bind, "--port", "8300", "--kiss-port", "8100")
+        a += listOf("--ui-port", "8080", "--ui-addr", bind)
         if (registered) a += "--registered"
+        if (monitor) {
+            a += "--monitor"
+            if (monitorFrames) a += "--monitor-frames"
+            monitorCalls.uppercase().split(' ', ',').filter { it.isNotBlank() }.forEach { a += listOf("--monitor-call", it) }
+        }
+        if (uiControl) a += listOf("--ui-control", "--ui-token", token())
+        if (debugLog || recordAudio) modemLogs.mkdirs()
+        if (debugLog) a += listOf("--debug-log", File(modemLogs, "debug.log").path)
+        if (recordAudio) a += listOf("--record", File(modemLogs, "xara-${System.currentTimeMillis() / 1000}.flac").path)
         a += listOf("--state-dir", modemState.path)
         return JSONArray(a).toString()
     }
+
+    /** The web UI's token (made the first time it's needed). */
+    fun token(): String {
+        if (!uiToken.matches(Regex("^[A-Za-z0-9_-]{8,128}$"))) uiToken = java.util.UUID.randomUUID().toString().replace("-", "")
+        return uiToken
+    }
+
+    /** The modem's web UI, with the token that lets it control the radio when that's on. */
+    val webUrl get() = "http://127.0.0.1:8080/" + if (uiControl) "?token=${token()}" else ""
 
     private fun string(k: String, d: String) = object : kotlin.properties.ReadWriteProperty<Any?, String> {
         override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>) = p.getString(k, d) ?: d
@@ -266,6 +300,8 @@ object Core {
     val heard = MutableStateFlow<List<Heard>>(emptyList())
     val broadcasts = MutableStateFlow<List<BroadcastLine>>(emptyList())
     val log = MutableStateFlow<List<String>>(emptyList())
+    /** What the modem decoded (the Modem tab's Received page). */
+    val received = MutableStateFlow("")
     val unread = MutableStateFlow(0)
     val vmailRevision = MutableStateFlow(0)
     val fileOffer = MutableStateFlow<String?>(null)
@@ -354,7 +390,7 @@ object Core {
             val cap = inputs.find { it.id == prefs.capture } ?: inputs.firstOrNull { it.usb }
             val play = outputs.find { it.id == prefs.playback } ?: outputs.firstOrNull { it.usb }
             if (cap == null || play == null) {
-                status.value = "Choose the audio in and out in Settings (plug in the radio's USB audio interface)."
+                status.value = "Choose the audio in and out on the Modem tab (plug in the radio's USB audio interface)."
                 return
             }
             if (!prefs.allowBuiltIn && (cap.builtIn || play.builtIn)) {
@@ -410,6 +446,29 @@ object Core {
         val code = withContext(Dispatchers.IO) { Native.modemStop() }
         modemRunning.value = false
         if (code != 0) addLog("XARA stopped with exit $code")
+    }
+
+    fun clearReceived() {
+        received.value = ""
+    }
+
+    fun clearLog() {
+        log.value = emptyList()
+    }
+
+    /** The Modem tab's settings changed: restart the engine and modem with them, and go back on
+     *  the air if it was. */
+    fun restartWithSettings(context: Context) {
+        val wasOnline = modemConnected.value || modemRunning.value
+        applySettings(context)
+        if (!wasOnline) return
+        scope.launch {
+            delay(600)
+            // (until the old modem has stopped and the engine is back)
+            var n = 0
+            while ((modemRunning.value || !engineRunning.value) && n++ < 100) delay(100)
+            goOnline(context)
+        }
     }
 
     fun applySettings(context: Context) {
@@ -597,6 +656,9 @@ object Core {
             val l = Native.modemNextLog() ?: break
             addLog(l.text())
         }
+        var heard = ""
+        while (true) heard += (Native.modemNextReceived() ?: break).text()
+        if (heard.isNotEmpty()) received.value = (received.value + heard).takeLast(500_000)
         if (modemRunning.value && !Native.modemRunning()) {
             modemRunning.value = false
             status.value = "XARA stopped: " +

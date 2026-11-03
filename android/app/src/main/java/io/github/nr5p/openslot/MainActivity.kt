@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material3.AlertDialog
@@ -124,7 +125,8 @@ fun App() {
                 NavigationBarItem(tab == 2, { tab = 2 }, {
                     BadgedBox(badge = { if (unread > 0) Badge { Text("$unread") } }) { Icon(Icons.Default.Email, null) }
                 }, label = { Text("VMail") })
-                NavigationBarItem(tab == 3, { tab = 3 }, { Icon(Icons.Default.Settings, null) }, label = { Text("Settings") })
+                NavigationBarItem(tab == 3, { tab = 3 }, { Icon(Icons.Default.Router, null) }, label = { Text("Modem") })
+                NavigationBarItem(tab == 4, { tab = 4 }, { Icon(Icons.Default.Settings, null) }, label = { Text("Settings") })
             }
         },
     ) { pad ->
@@ -135,6 +137,7 @@ fun App() {
                 0 -> ChatScreen()
                 1 -> StationsScreen()
                 2 -> VMailScreen()
+                3 -> ModemScreen()
                 else -> SettingsScreen()
             }
         }
@@ -828,18 +831,7 @@ fun SettingsScreen() {
     var name by remember { mutableStateOf(prefs.name) }
     var qth by remember { mutableStateOf(prefs.qth) }
     var locator by remember { mutableStateOf(prefs.locator) }
-    var source by remember { mutableStateOf(prefs.source) }
-    var host by remember { mutableStateOf(prefs.host) }
-    var port by remember { mutableStateOf(prefs.port.toString()) }
-    var bandwidth by remember { mutableStateOf(prefs.bandwidth) }
     var frequency by remember { mutableStateOf(prefs.frequency.toString()) }
-    var ptt by remember { mutableStateOf(prefs.ptt) }
-    var rigctld by remember { mutableStateOf(prefs.rigctld) }
-    var drive by remember { mutableStateOf(prefs.driveDb.toFloat()) }
-    var capture by remember { mutableIntStateOf(prefs.capture) }
-    var playback by remember { mutableIntStateOf(prefs.playback) }
-    var allowBuiltIn by remember { mutableStateOf(prefs.allowBuiltIn) }
-    var registered by remember { mutableStateOf(prefs.registered) }
     var allowInfo by remember { mutableStateOf(prefs.allowInfo) }
     var allowPings by remember { mutableStateOf(prefs.allowPings) }
     var verboseSnrAuto by remember { mutableStateOf(prefs.verboseSnrAuto) }
@@ -854,15 +846,9 @@ fun SettingsScreen() {
     var multiBandLastHeard by remember { mutableStateOf(prefs.multiBandLastHeard) }
     var cqSlotWait by remember { mutableStateOf(prefs.cqSlotWait.toString()) }
     var showLog by remember { mutableStateOf(false) }
-    val inputs = remember { AudioDevices.list(context, true) }
-    val outputs = remember { AudioDevices.list(context, false) }
-
     fun save() {
         prefs.call = call.trim().uppercase(); prefs.name = name; prefs.qth = qth; prefs.locator = locator.uppercase()
-        prefs.source = source; prefs.host = host.trim(); prefs.port = port.toIntOrNull() ?: 8300
-        prefs.bandwidth = bandwidth; prefs.frequency = frequency.toLongOrNull() ?: 14_105_000
-        prefs.ptt = ptt; prefs.rigctld = rigctld.trim(); prefs.driveDb = drive.toInt()
-        prefs.capture = capture; prefs.playback = playback; prefs.allowBuiltIn = allowBuiltIn; prefs.registered = registered
+        prefs.frequency = frequency.toLongOrNull() ?: 14_105_000
         Core.send("set_frequency", "hz" to prefs.frequency)
         Core.settingsSaved()
     }
@@ -894,33 +880,8 @@ fun SettingsScreen() {
             style = MaterialTheme.typography.bodySmall)
 
         Header("Modem")
-        Choice("XARA on this phone", source == "builtin") { source = "builtin" }
-        Choice("VARA on the network", source == "network") { source = "network" }
-        Text("Bandwidth", style = MaterialTheme.typography.labelLarge)
-        Row { listOf("500", "2300", "2750").forEach { bw -> Choice("$bw Hz", bandwidth == bw) { bandwidth = bw } } }
-        if (source == "builtin") {
-            DevicePicker("Audio in", inputs, capture) { capture = it }
-            DevicePicker("Audio out", outputs, playback) { playback = it }
-            Text("PTT", style = MaterialTheme.typography.labelLarge)
-            Row {
-                Choice("VOX", ptt == "vox") { ptt = "vox" }
-                Choice("rigctld", ptt == "rigctld") { ptt = "rigctld" }
-            }
-            if (ptt == "rigctld") OutlinedTextField(rigctld, { rigctld = it }, Modifier.fillMaxWidth(), label = { Text("rigctld host:port") }, singleLine = true)
-            Text("TX drive ${drive.toInt()} dB", style = MaterialTheme.typography.labelLarge)
-            Slider(drive, { drive = it }, valueRange = -30f..0f, steps = 29)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(allowBuiltIn, { allowBuiltIn = it }); Text("  Allow the phone's speaker and mic (testing only)")
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(registered, { registered = it }); Text("  Registered (I hold a VARA licence)")
-            }
-        } else {
-            OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth(), label = { Text("Host") }, singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
-            OutlinedTextField(port, { port = it }, Modifier.fillMaxWidth(), label = { Text("Command port") }, singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-        }
+        Text("The modem (XARA on this phone or VARA on the network), its audio, PTT and drive, and the " +
+            "Registered (VARA licence) switch are on the Modem tab.", style = MaterialTheme.typography.bodySmall)
 
         Header("QSO")
         Row(verticalAlignment = Alignment.CenterVertically) {

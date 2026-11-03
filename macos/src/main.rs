@@ -18,6 +18,8 @@ mod vara;
 #[path = "../../src/varac/mod.rs"]
 mod varac;
 
+// The built-in XARA modem and its tab, shared with the other desktop apps
+#[path = "../../src/xara_modem/mod.rs"]
 mod modem;
 
 use std::sync::mpsc;
@@ -261,9 +263,12 @@ struct MacApp<'a> {
 
 impl eframe::App for MacApp<'_> {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // First, so the modem bar sits above the GUI's menu bar.
-        self.xara.ui(ctx, &self.cmd_tx);
-        eframe::App::update(&mut self.inner, ctx, frame);
+        // First, so the tab bar sits above the GUI's menu bar. On the Modem tab the GUI isn't
+        // drawn; GuiShell's tick keeps the station working meanwhile.
+        if self.xara.ui(ctx, &self.cmd_tx) {
+            eframe::App::update(&mut self.inner, ctx, frame);
+        }
+        self.xara.follow_drive_level(self.inner.drive_level());
     }
 }
 

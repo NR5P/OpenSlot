@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 @main
 struct OpenslotApp: App {
@@ -12,6 +13,7 @@ struct OpenslotApp: App {
                 VMailView()
                     .tabItem { Label("VMail", systemImage: "envelope") }
                     .badge(core.unread)
+                ModemTabView().tabItem { Label("Modem", systemImage: "dot.radiowaves.left.and.right") }
                 SettingsView().tabItem { Label("Settings", systemImage: "gearshape") }
             }
             .sheet(isPresented: $core.showCqSelector) { CqSlotSelector().environmentObject(core) }
@@ -744,16 +746,7 @@ struct SettingsView: View {
     @AppStorage(Keys.name) private var name = ""
     @AppStorage(Keys.qth) private var qth = ""
     @AppStorage(Keys.locator) private var locator = ""
-    @AppStorage(Keys.modemSource) private var source = "builtin"
-    @AppStorage(Keys.host) private var host = "192.168.1.10"
-    @AppStorage(Keys.port) private var port = 8300
-    @AppStorage(Keys.bandwidth) private var bandwidth = "500"
     @AppStorage(Keys.frequency) private var frequency = 14_105_000
-    @AppStorage(Keys.ptt) private var ptt = "vox"
-    @AppStorage(Keys.rigctld) private var rigctld = "192.168.1.10:4532"
-    @AppStorage(Keys.driveDb) private var driveDb = -5.0
-    @AppStorage(Keys.allowBuiltIn) private var allowBuiltIn = false
-    @AppStorage(Keys.registered) private var registered = false
     @AppStorage(Keys.allowInfo) private var allowInfo = true
     @AppStorage(Keys.allowPings) private var allowPings = true
     @AppStorage(Keys.verboseSnrAuto) private var verboseSnrAuto = false
@@ -792,34 +785,8 @@ struct SettingsView: View {
                 .onChange(of: fullCall) { core.applyPolicy() }
 
                 Section("Modem") {
-                    Picker("Modem", selection: $source) {
-                        Text("XARA on this phone").tag("builtin")
-                        Text("VARA on the network").tag("network")
-                    }
-                    Picker("Bandwidth", selection: $bandwidth) {
-                        Text("500 Hz").tag("500")
-                        Text("2300 Hz").tag("2300")
-                        Text("2750 Hz").tag("2750")
-                    }
-                    if source == "builtin" {
-                        Picker("PTT", selection: $ptt) {
-                            Text("VOX").tag("vox")
-                            Text("rigctld (network)").tag("rigctld")
-                        }
-                        if ptt == "rigctld" {
-                            TextField("rigctld host:port", text: $rigctld).autocorrectionDisabled().textInputAutocapitalization(.never)
-                        }
-                        VStack(alignment: .leading) {
-                            Text("TX drive \(driveDb, specifier: "%.1f") dB")
-                            Slider(value: $driveDb, in: -30...0, step: 0.5)
-                        }
-                        Toggle("Allow the iPhone speaker and mic (testing only)", isOn: $allowBuiltIn)
-                        Toggle("Registered (I hold a VARA licence)", isOn: $registered)
-                        Text("Audio: \(core.route)").font(.footnote).foregroundStyle(.secondary)
-                    } else {
-                        TextField("Host", text: $host).autocorrectionDisabled().textInputAutocapitalization(.never).keyboardType(.URL)
-                        TextField("Command port", value: $port, format: .number.grouping(.never)).keyboardType(.numberPad)
-                    }
+                    Text("The modem (XARA on this phone or VARA on the network), its PTT and drive, and the Registered (VARA licence) switch are on the Modem tab.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -891,5 +858,259 @@ struct LogView: View {
             .onAppear { proxy.scrollTo(core.log.count - 1, anchor: .bottom) }
         }
         .navigationTitle("Log")
+    }
+}
+
+// MARK: the Modem tab: the NR5P XARA app's screens inside Openslot
+
+struct ModemTabView: View {
+    @State private var page = 0
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("Page", selection: $page) {
+                    Text("Modem").tag(0)
+                    Text("Web UI").tag(1)
+                    Text("Received").tag(2)
+                    Text("Log").tag(3)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                switch page {
+                case 0: ModemSettingsPage()
+                case 1: ModemWebPage()
+                case 2: ModemReceivedPage()
+                default: ModemLogPage()
+                }
+            }
+            .navigationTitle("Modem")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+/// Start/Stop, then every modem setting (saved as it changes; a running modem restarts to use them).
+struct ModemSettingsPage: View {
+    @EnvironmentObject var core: Core
+    @AppStorage(Keys.call) private var call = ""
+    @AppStorage(Keys.modemSource) private var source = "builtin"
+    @AppStorage(Keys.host) private var host = "192.168.1.10"
+    @AppStorage(Keys.port) private var port = 8300
+    @AppStorage(Keys.bandwidth) private var bandwidth = "500"
+    @AppStorage(Keys.ptt) private var ptt = "vox"
+    @AppStorage(Keys.rigctld) private var rigctld = "192.168.1.10:4532"
+    @AppStorage(Keys.driveDb) private var driveDb = -5.0
+    @AppStorage(Keys.allowBuiltIn) private var allowBuiltIn = false
+    @AppStorage(Keys.registered) private var registered = false
+    @AppStorage(Keys.monitor) private var monitor = false
+    @AppStorage(Keys.monitorFrames) private var monitorFrames = false
+    @AppStorage(Keys.monitorCalls) private var monitorCalls = ""
+    @AppStorage(Keys.debugLog) private var debugLog = false
+    @AppStorage(Keys.recordAudio) private var recordAudio = false
+    @AppStorage(Keys.lan) private var lan = false
+    @AppStorage(Keys.uiControl) private var uiControl = false
+    @State private var changed = false
+    @State private var addresses: [String] = []
+
+    private var online: Bool { core.modemConnected || core.modemRunning }
+    /// Everything that takes a restart, to notice a change.
+    private var restartKey: String {
+        "\(source) \(host) \(port) \(ptt) \(rigctld) \(driveDb) \(allowBuiltIn) \(registered) \(monitor) " +
+            "\(monitorFrames) \(monitorCalls) \(debugLog) \(recordAudio) \(lan) \(uiControl)"
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    Circle().fill(online ? .green : .secondary).frame(width: 10, height: 10)
+                    Text(core.status).font(.callout)
+                }
+                if source == "builtin" { Text("Audio: \(core.route)").font(.caption).foregroundStyle(.secondary) }
+                Button(online ? "Stop" : "Start", role: online ? .destructive : nil) {
+                    changed = false
+                    Task { if online { await core.goOffline() } else { await core.goOnline() } }
+                }
+                if online && changed {
+                    Button("Restart with the new settings") {
+                        changed = false
+                        Task { await core.restartWithSettings() }
+                    }
+                }
+            } footer: {
+                if online && changed { Text("The modem uses the new settings once it restarts.") }
+            }
+
+            Section("Modem") {
+                Picker("Modem", selection: $source) {
+                    Text("XARA on this phone").tag("builtin")
+                    Text("VARA on the network").tag("network")
+                }
+                Picker("Bandwidth", selection: $bandwidth) {
+                    Text("500 Hz").tag("500")
+                    Text("2300 Hz").tag("2300")
+                    Text("2750 Hz").tag("2750")
+                }
+                .onChange(of: bandwidth) { core.setBandwidth(bandwidth) }
+                if source != "builtin" {
+                    TextField("Host", text: $host).autocorrectionDisabled().textInputAutocapitalization(.never).keyboardType(.URL)
+                    TextField("Command port", value: $port, format: .number.grouping(.never)).keyboardType(.numberPad)
+                }
+            }
+
+            if source == "builtin" {
+                Section {
+                    LabeledContent("Call sign", value: call.uppercased().ifEmpty("set it in Settings"))
+                    VStack(alignment: .leading) {
+                        Text("TX drive \(driveDb, specifier: "%.1f") dB")
+                        Slider(value: $driveDb, in: -30...0, step: 0.5)
+                    }
+                    Toggle("Registered (I hold a VARA licence)", isOn: $registered)
+                } header: { Text("Station") } footer: {
+                    Text("Registered: only with a registered copy of VARA. Higher speeds, and links at full speed with other registered stations.")
+                }
+
+                Section {
+                    Picker("PTT", selection: $ptt) {
+                        Text("VOX").tag("vox")
+                        Text("rigctld (network CAT)").tag("rigctld")
+                    }
+                    if ptt == "rigctld" {
+                        TextField("rigctld host:port", text: $rigctld).autocorrectionDisabled().textInputAutocapitalization(.never)
+                    }
+                    Toggle("Allow the iPhone speaker and mic (testing only)", isOn: $allowBuiltIn)
+                } header: { Text("Radio") } footer: {
+                    Text("XARA transmits into the current audio route. Connect a USB audio interface such as a Digirig; with the toggle off, XARA won't start on the iPhone's own speaker or mic.")
+                }
+
+                Section {
+                    Toggle("Show other stations' traffic", isOn: $monitor)
+                    if monitor {
+                        Picker("Show", selection: $monitorFrames) {
+                            Text("Text only").tag(false)
+                            Text("Every packet").tag(true)
+                        }
+                        TextField("Calls to name (optional)", text: $monitorCalls)
+                            .textInputAutocapitalization(.characters).autocorrectionDisabled()
+                    }
+                } header: { Text("Receive") } footer: {
+                    Text("The Received page shows what the modem decodes on your own links. With this on it also decodes VARA HF traffic between other stations, like VARA's monitor. Answering stations show as #hash unless their call is listed.")
+                }
+
+                Section {
+                    Toggle("Keep a debug log", isOn: $debugLog)
+                    Toggle("Record received audio", isOn: $recordAudio)
+                } header: { Text("Troubleshooting") } footer: {
+                    Text("The debug log adds a line for every frame, host command and, once a second, the audio levels; recording saves what the modem hears and sends (about 3 MB a minute). Both are in the Files app under Openslot › xara-logs.")
+                }
+
+                Section {
+                    Toggle("Accept clients on the local network", isOn: $lan)
+                    Toggle("Web UI can control the radio", isOn: $uiControl)
+                } header: { Text("Clients") } footer: {
+                    if lan {
+                        Text("Clients elsewhere connect to \((addresses.isEmpty ? ["(no network address)"] : addresses).map { "\($0):8300" }.joined(separator: ", ")) (data 8301, KISS 8100, web UI 8080). The modem takes one client at a time, and Openslot is one. Anyone on this network can use it.")
+                    } else {
+                        Text("VARA command port 8300, data 8301, KISS 8100, web UI 8080, on this iPhone only.")
+                    }
+                }
+            }
+        }
+        .onChange(of: restartKey) { changed = true }
+        .onAppear { addresses = LocalNetwork.addresses() }
+    }
+}
+
+struct ModemWebPage: View {
+    @EnvironmentObject var core: Core
+    @State private var reload = 0
+
+    var body: some View {
+        Group {
+            if core.modemRunning {
+                ModemWebView(url: Settings().webURL, reload: reload)
+            } else {
+                ContentUnavailableView("Modem stopped", systemImage: "waveform.slash",
+                                       description: Text("Start the built-in modem to see its waterfall and status."))
+            }
+        }
+        .toolbar {
+            Button { reload += 1 } label: { Image(systemName: "arrow.clockwise") }.disabled(!core.modemRunning)
+        }
+    }
+}
+
+/// XARA's web UI (from XARA's iOS app).
+struct ModemWebView: UIViewRepresentable {
+    let url: URL
+    let reload: Int
+
+    /// Retries until the UI server answers; it comes up a moment after Start.
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var loaded: (URL, Int)?
+
+        func webView(_ w: WKWebView, didFailProvisionalNavigation _: WKNavigation!, withError _: Error) {
+            guard let url = loaded?.0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak w] in w?.load(URLRequest(url: url)) }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let w = WKWebView()
+        w.isOpaque = false
+        w.navigationDelegate = context.coordinator
+        return w
+    }
+
+    func updateUIView(_ w: WKWebView, context: Context) {
+        if context.coordinator.loaded.map({ $0 != url || $1 != reload }) ?? true {
+            context.coordinator.loaded = (url, reload)
+            w.load(URLRequest(url: url))
+        }
+    }
+}
+
+struct ModemReceivedPage: View {
+    @EnvironmentObject var core: Core
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(core.received.isEmpty ? "Nothing received yet. Your QSOs also show on the Chat screen." : core.received)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(core.received.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                Color.clear.frame(height: 1).id("end")
+            }
+            .onChange(of: core.received) { proxy.scrollTo("end", anchor: .bottom) }
+        }
+        .toolbar {
+            ShareLink(item: core.received)
+            Button("Clear") { core.clearReceived() }
+        }
+    }
+}
+
+struct ModemLogPage: View {
+    @EnvironmentObject var core: Core
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            List(core.log.indices, id: \.self) { i in
+                Text(core.log[i]).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
+            .listStyle(.plain)
+            .onChange(of: core.log.count) { if core.log.count > 0 { proxy.scrollTo(core.log.count - 1, anchor: .bottom) } }
+        }
+        .toolbar {
+            ShareLink(item: core.log.joined(separator: "\n"))
+            Button("Clear") { core.clearLog() }
+        }
     }
 }

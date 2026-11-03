@@ -126,3 +126,9 @@ pub extern "C" fn Java_io_github_nr5p_openslot_Native_modemNextLog(env: Env, _: 
     // SAFETY: the JVM passes a live env.
     unsafe { bytes(env, crate::modem_next_log()) }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_io_github_nr5p_openslot_Native_modemNextReceived(env: Env, _: JObject) -> JObject {
+    // SAFETY: the JVM passes a live env.
+    unsafe { bytes(env, crate::modem_next_received()) }
+}

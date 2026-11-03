@@ -7,16 +7,18 @@ code in `src/`, so a fix made there reaches every platform on its next build.
 | Folder | What it is | UI | Modem |
 |---|---|---|---|
 | `/` (root) | Linux desktop app + TUI | egui (Rust) | any VARA/XARA modem over TCP |
-| [`macos/`](macos/README.md) | Mac app (`.app`) | the same egui GUI, plus a XARA bar | XARA built in, or any modem over TCP |
+| [`macos/`](macos/README.md) | Mac app (`.app`) | the same egui GUI, plus a Modem tab | XARA built in, or any modem over TCP |
 | [`ios/`](ios/README.md) | iPhone/iPad app | SwiftUI | XARA built in, or VARA on the network |
 | [`android/`](android/README.md) | Android app | Jetpack Compose | XARA built in, or VARA on the network |
 | [`mobile-core/`](mobile-core/README.md) | Rust library the phone apps link | — | — |
-| [`windows/`](windows/README.md) | Windows program (`openslot.exe`) | the same egui GUI, plus a XARA bar | XARA built in, or VARA (native) over TCP |
+| [`windows/`](windows/README.md) | Windows program (`openslot.exe`) | the same egui GUI, plus a Modem tab | XARA built in, or VARA (native) over TCP |
 
 How the sharing works:
 
 - `macos/` is a Cargo crate that includes `src/` with `#[path = "../../src/..."]` modules,
-  and wraps the GUI's `VaracApp` to add the built-in modem bar.
+  and wraps the GUI's `VaracApp` to add the built-in modem and its Modem tab.
+- The built-in modem and its tab are one module, `src/xara_modem/`, which the Linux, macOS
+  and Windows apps include (`#[path]`) and the plain root build doesn't (it has no XARA).
 - `windows/` is the same as `macos/`, with WASAPI audio and COM ports for the built-in
   modem, no console window, and the exe icon and version embedded by `build.rs`.
 - `mobile-core/` includes `src/vara`, `src/varac` and `src/storage` the same way and puts

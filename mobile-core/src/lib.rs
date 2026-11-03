@@ -103,9 +103,14 @@ pub fn modem_running() -> bool {
 }
 
 pub fn modem_next_log() -> Option<String> {
-    // The app shows chat itself; drop xara's own copy of received text so it doesn't pile up.
-    while xara_ffi::next_received().is_some() {}
     xara_ffi::next_log()
+}
+
+/// What the modem decoded since the last call (the Modem tab's Received page): the links'
+/// text, and with the monitor on, other stations' traffic. The app takes it each tick, so it
+/// doesn't pile up in xara.
+pub fn modem_next_received() -> Option<String> {
+    xara_ffi::next_received()
 }
 
 // ---- C interface ----
@@ -208,4 +213,9 @@ pub extern "C" fn openslot_modem_running() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn openslot_modem_next_log() -> *mut c_char {
     modem_next_log().map_or(std::ptr::null_mut(), out)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn openslot_modem_next_received() -> *mut c_char {
+    modem_next_received().map_or(std::ptr::null_mut(), out)
 }

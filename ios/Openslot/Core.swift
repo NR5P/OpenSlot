@@ -15,6 +15,10 @@ enum Keys {
     static let callIdMinutes = "callIdMinutes", idleMinutes = "idleMinutes"
     static let allowLastHeard = "allowLastHeard", multiBandLastHeard = "multiBandLastHeard"
     static let myFrequencies = "myFrequencies"  // the picker's "My frequencies" (JSON)
+    // The Modem tab's other XARA settings, as the NR5P XARA app
+    static let monitor = "monitor", monitorFrames = "monitorFrames", monitorCalls = "monitorCalls"
+    static let debugLog = "debugLog", recordAudio = "recordAudio", lan = "lan", uiControl = "uiControl"
+    static let uiToken = "uiToken"  // kept, so a bookmarked controlling web UI keeps working
 }
 
 /// VarAC's slot system: QSOs move to slots around the calling frequency, 750 Hz apart for
@@ -76,6 +80,26 @@ struct Settings {
     var driveDb: Double { Self.d.object(forKey: Keys.driveDb) as? Double ?? -5 }
     var allowBuiltIn: Bool { Self.d.bool(forKey: Keys.allowBuiltIn) }
     var registered: Bool { Self.d.bool(forKey: Keys.registered) }
+    var monitor: Bool { Self.d.bool(forKey: Keys.monitor) }
+    var monitorFrames: Bool { Self.d.bool(forKey: Keys.monitorFrames) }
+    var monitorCalls: [String] {
+        (Self.d.string(forKey: Keys.monitorCalls) ?? "").uppercased().split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
+    }
+    var debugLog: Bool { Self.d.bool(forKey: Keys.debugLog) }
+    var recordAudio: Bool { Self.d.bool(forKey: Keys.recordAudio) }
+    var lan: Bool { Self.d.bool(forKey: Keys.lan) }
+    var uiControl: Bool { Self.d.bool(forKey: Keys.uiControl) }
+    /// The web UI's token (made the first time it's needed).
+    var uiToken: String {
+        if let t = Self.d.string(forKey: Keys.uiToken), t.range(of: #"^[A-Za-z0-9_-]{8,128}$"#, options: .regularExpression) != nil {
+            return t
+        }
+        let t = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        Self.d.set(t, forKey: Keys.uiToken)
+        return t
+    }
+    /// The modem's web UI, with the token that lets it control the radio when that's on.
+    var webURL: URL { URL(string: "http://127.0.0.1:8080/" + (uiControl ? "?token=\(uiToken)" : ""))! }
     var allowInfo: Bool { Self.d.object(forKey: Keys.allowInfo) as? Bool ?? true }
     var allowPings: Bool { Self.d.object(forKey: Keys.allowPings) as? Bool ?? true }
     var verboseSnrAuto: Bool { Self.d.bool(forKey: Keys.verboseSnrAuto) }
@@ -110,6 +134,8 @@ struct Settings {
     static var modemState: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("xara")
     }
+    /// The modem's debug log and recordings (the Files app shows them under Openslot › xara-logs).
+    static var modemLogs: URL { documents.appendingPathComponent("xara-logs") }
 
     var engineConfig: [String: Any] {
         ["data_dir": Self.documents.path, "callsign": call, "name": name, "qth": qth, "locator": locator,
@@ -123,9 +149,25 @@ struct Settings {
         a += ["--capture", "route", "--playback", "route", "--radio"]
         a += ["--ptt", ptt == "rigctld" ? "rigctld:\(rigctld)" : "vox"]
         a += ["--drive-db", String(format: "%.1f", driveDb)]
-        a += ["--addr", "127.0.0.1", "--port", "8300", "--kiss-port", "8100"]
-        a += ["--ui-port", "8080", "--ui-addr", "127.0.0.1"]
+        // On the local network too when chosen (the engine still connects on 127.0.0.1)
+        let bind = lan ? "0.0.0.0" : "127.0.0.1"
+        a += ["--addr", bind, "--port", "8300", "--kiss-port", "8100"]
+        a += ["--ui-port", "8080", "--ui-addr", bind]
         if registered { a += ["--registered"] }
+        if monitor {
+            a += ["--monitor"]
+            if monitorFrames { a += ["--monitor-frames"] }
+            for c in monitorCalls { a += ["--monitor-call", c] }
+        }
+        if uiControl { a += ["--ui-control", "--ui-token", uiToken] }
+        if debugLog || recordAudio {
+            try? FileManager.default.createDirectory(at: Self.modemLogs, withIntermediateDirectories: true)
+        }
+        if debugLog { a += ["--debug-log", Self.modemLogs.appendingPathComponent("debug.log").path] }
+        if recordAudio {
+            let stamp = Int(Date().timeIntervalSince1970)
+            a += ["--record", Self.modemLogs.appendingPathComponent("xara-\(stamp).flac").path]
+        }
         a += ["--state-dir", Self.modemState.path]
         return a
     }
@@ -212,6 +254,8 @@ final class Core: ObservableObject {
     @Published private(set) var heard: [Heard] = []
     @Published private(set) var broadcasts: [BroadcastLine] = []
     @Published private(set) var log: [String] = []
+    /// What the modem decoded (the Modem tab's Received page).
+    @Published private(set) var received = ""
     @Published private(set) var unread = 0
     @Published private(set) var vmailRevision = 0
     @Published var fileOffer: String?
@@ -319,6 +363,18 @@ final class Core: ObservableObject {
         connectDeadline = Date().addingTimeInterval(15)
         send(["cmd": "connect_modem"])
     }
+
+    /// The Modem tab's settings changed: restart the engine and modem with them, and go back on
+    /// the air if it was.
+    func restartWithSettings() async {
+        let wasOnline = modemConnected || modemRunning
+        await goOffline()
+        startEngine()
+        if wasOnline { await goOnline() }
+    }
+
+    func clearReceived() { received = "" }
+    func clearLog() { log = [] }
 
     func goOffline() async {
         connectDeadline = nil
@@ -536,6 +592,15 @@ final class Core: ObservableObject {
         while let p = openslot_modem_next_log() {
             addLog(String(cString: p))
             openslot_free(p)
+        }
+        var heard = ""
+        while let p = openslot_modem_next_received() {
+            heard += String(cString: p)
+            openslot_free(p)
+        }
+        if !heard.isEmpty {
+            received += heard
+            if received.count > 500_000 { received.removeFirst(received.count - 500_000) }
         }
         if modemRunning && !openslot_modem_running() {
             modemRunning = false

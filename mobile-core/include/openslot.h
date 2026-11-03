@@ -67,6 +67,9 @@ uint8_t openslot_modem_stop(void);
 bool openslot_modem_running(void);
 // The next line the modem logged, or NULL.
 char *openslot_modem_next_log(void);
+// What the modem decoded since the last call (the links' text, and other stations' with the
+// monitor on), or NULL.
+char *openslot_modem_next_received(void);
 
 #ifdef __cplusplus
 }
