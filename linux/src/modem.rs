@@ -85,10 +85,13 @@ impl XaraSettings {
     }
 
     pub fn load() -> Self {
-        Self::path()
+        let mut s: Self = Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // An older /dev/ttyUSBn becomes its /dev/serial/by-id name (kept on the next Save)
+        s.ptt_serial = crate::rig::stable_port_name(&s.ptt_serial);
+        s
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -337,29 +340,10 @@ impl BuiltInModem {
             }
             Err(e) => self.status = format!("Can't list audio devices: {e}"),
         }
-        // The call-out devices in /dev (no Bluetooth), described as the system says
-        let known = crate::rig::list_serial_ports();
-        self.serial_ports = std::fs::read_dir("/dev")
-            .map(|d| {
-                let mut v: Vec<String> = d
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("cu.") && !n.contains("Bluetooth"))
-                    .map(|n| format!("/dev/{n}"))
-                    .collect();
-                v.sort();
-                v
-            })
-            .unwrap_or_default()
-            .into_iter()
-            .map(|name| {
-                known.iter().find(|p| p.name == name).cloned().unwrap_or(crate::rig::PortInfo {
-                    name,
-                    description: String::new(),
-                    cat_port: None,
-                })
-            })
-            .collect();
+        // Serial ports by their /dev/serial/by-id names where they have one, so the PTT port
+        // survives the radio being power cycled
+        self.serial_ports = crate::rig::list_serial_ports();
+        self.serial_ports.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     /// The modem bar (above the GUI's own menu bar) and the modem's windows.

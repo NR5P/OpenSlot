@@ -6,7 +6,10 @@ use serialport::SerialPort;
 use super::{CatModel, RadioMode, RigControl, RigError, RigResult};
 
 pub struct CatSerial {
+    /// The port from the settings
     port_name: String,
+    /// What the connect log shows: the radio, and the port when it isn't the saved one
+    name: String,
     baud: u32,
     model: CatModel,
     port: Option<Box<dyn SerialPort>>,
@@ -19,6 +22,7 @@ impl CatSerial {
     pub fn new(port_name: &str, baud: u32, model: CatModel) -> Self {
         Self {
             port_name: port_name.to_string(),
+            name: model_name(model).to_string(),
             baud,
             model,
             port: None,
@@ -92,14 +96,27 @@ impl RigControl for CatSerial {
             CatModel::KenwoodGeneric => serialport::StopBits::One,
             _ => serialport::StopBits::Two,
         };
-        let mut port = serialport::new(&self.port_name, self.baud)
+        // A saved Linux /dev/ttyUSBn that is gone (the radio came back under another number): use
+        // the radio's CAT port where it is now, if that's unambiguous.
+        let port_name = match super::replacement_cat_port(&self.port_name) {
+            Some(found) => {
+                let now = std::fs::canonicalize(&found).map_or_else(|_| found.clone(), |p| p.to_string_lossy().into_owned());
+                self.name = format!("{} on {now} ({} is gone)", model_name(self.model), self.port_name);
+                found
+            }
+            None => {
+                self.name = model_name(self.model).to_string();
+                self.port_name.clone()
+            }
+        };
+        let mut port = serialport::new(&port_name, self.baud)
             .timeout(Duration::from_millis(300))
             .stop_bits(stop_bits)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .flow_control(serialport::FlowControl::None)
             .open()
-            .map_err(|e| RigError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{}: {e}", self.port_name))))?;
+            .map_err(|e| RigError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{port_name}: {e}"))))?;
 
         // Yaesu radios with "CAT RTS" enabled (the default) ignore commands unless RTS is
         // asserted. On the Enhanced (CAT) port RTS is not a keying line, so this is safe.
@@ -115,7 +132,7 @@ impl RigControl for CatSerial {
             return Err(match e {
                 RigError::Timeout => RigError::Protocol(format!(
                     "no CAT reply on {} at {} baud — check port, baud rate and the radio's CAT RATE menu",
-                    self.port_name, self.baud
+                    port_name, self.baud
                 )),
                 e => e,
             });
@@ -204,11 +221,15 @@ impl RigControl for CatSerial {
     }
 
     fn name(&self) -> &str {
-        match self.model {
-            CatModel::Ftdx3000 => "FTDX3000 CAT",
-            CatModel::YaesuGeneric => "Yaesu CAT",
-            CatModel::KenwoodGeneric => "Kenwood/QMX CAT",
-        }
+        &self.name
+    }
+}
+
+fn model_name(model: CatModel) -> &'static str {
+    match model {
+        CatModel::Ftdx3000 => "FTDX3000 CAT",
+        CatModel::YaesuGeneric => "Yaesu CAT",
+        CatModel::KenwoodGeneric => "Kenwood/QMX CAT",
     }
 }
 

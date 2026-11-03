@@ -353,7 +353,8 @@ impl VaracApp {
                 state.rig_settings_port = p.to_string();
             }
             if let Some(ref sp) = cfg.rig_serial_port {
-                state.rig_settings_serial = sp.clone();
+                // An older Linux /dev/ttyUSBn becomes its /dev/serial/by-id name (kept on the next Save)
+                state.rig_settings_serial = crate::rig::stable_port_name(sp);
             }
             if let Some(b) = cfg.rig_baud {
                 state.rig_settings_baud = b.to_string();

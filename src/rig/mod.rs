@@ -204,10 +204,17 @@ impl PortInfo {
             Some(false) => " (PTT/keying)",
             None => "",
         };
+        // A /dev/serial/by-id name is long and says what the description says: show the device it
+        // points at now instead (only Linux has these).
+        let shown = match self.name.strip_prefix("/dev/serial/by-id/") {
+            Some(_) => std::fs::canonicalize(&self.name)
+                .map_or_else(|_| self.name.clone(), |p| p.to_string_lossy().into_owned()),
+            None => self.name.clone(),
+        };
         if self.description.is_empty() {
-            format!("{}{role}", self.name)
+            format!("{shown}{role}")
         } else {
-            format!("{} — {}{role}", self.name, self.description)
+            format!("{shown} — {}{role}", self.description)
         }
     }
 }
@@ -216,11 +223,62 @@ impl PortInfo {
 /// FT-710, FTDX10/101): interface 0 is the Enhanced (CAT) port, 1 the Standard (keying) port.
 const CP2105: (u16, u16) = (0x10c4, 0xea70);
 
-/// Serial ports present on this machine, for the settings dropdowns.
+/// Serial ports present on this machine, for the settings dropdowns. On Linux USB ports are
+/// named by their /dev/serial/by-id link, which survives the radio being unplugged or power cycled.
 pub fn list_serial_ports() -> Vec<PortInfo> {
     serialport::available_ports()
-        .map(|ports| ports.into_iter().map(port_info).collect())
+        .map(|ports| {
+            ports
+                .into_iter()
+                .map(port_info)
+                .map(|p| PortInfo { name: stable_port_name(&p.name), ..p })
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Linux numbers USB serial devices in the order they appear, so a radio that drops off the bus
+/// can come back as /dev/ttyUSB2 instead of /dev/ttyUSB0. The /dev/serial/by-id link (USB serial
+/// number + interface) stays the same: return it for a port that has one, else the name as given.
+#[cfg(target_os = "linux")]
+pub fn stable_port_name(name: &str) -> String {
+    const BY_ID: &str = "/dev/serial/by-id";
+    if name.starts_with(BY_ID) {
+        return name.to_string();
+    }
+    let Ok(target) = std::fs::canonicalize(name) else { return name.to_string() };
+    std::fs::read_dir(BY_ID)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|link| std::fs::canonicalize(link).is_ok_and(|t| t == target))
+        .map_or_else(|| name.to_string(), |link| link.to_string_lossy().into_owned())
+}
+
+/// COM ports (Windows) and /dev/cu.* names (macOS) don't get renumbered this way.
+#[cfg(not(target_os = "linux"))]
+pub fn stable_port_name(name: &str) -> String {
+    name.to_string()
+}
+
+/// The saved CAT port is gone (Linux, a bare /dev/ttyUSBn the radio no longer has): the one radio
+/// CAT port that is plugged in, if there is exactly one. Only ports known to be a radio's CAT port
+/// (a CP2105 interface 0, an "Enhanced COM Port") qualify, never a keying port or an unknown one,
+/// since connecting raises RTS.
+#[cfg(target_os = "linux")]
+pub fn replacement_cat_port(saved: &str) -> Option<String> {
+    if saved.is_empty() || std::path::Path::new(saved).exists() {
+        return None;
+    }
+    let mut cat: Vec<String> =
+        list_serial_ports().into_iter().filter(|p| p.cat_port == Some(true)).map(|p| p.name).collect();
+    (cat.len() == 1).then(|| cat.remove(0))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn replacement_cat_port(_saved: &str) -> Option<String> {
+    None
 }
 
 fn port_info(p: serialport::SerialPortInfo) -> PortInfo {
@@ -876,6 +934,19 @@ mod tests {
         assert_eq!(p.label(), "COM4 — Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port (CAT)");
         let p = PortInfo { name: "/dev/ttyS0".into(), description: String::new(), cat_port: None };
         assert_eq!(p.label(), "/dev/ttyS0");
+    }
+
+    /// Names without a by-id link come back as given; a by-id name is already stable; a port
+    /// that exists (or no port at all) is never swapped for another.
+    #[test]
+    fn stable_port_names() {
+        assert_eq!(stable_port_name("/dev/ttyUSB99"), "/dev/ttyUSB99");
+        assert_eq!(stable_port_name("COM4"), "COM4");
+        assert_eq!(stable_port_name(""), "");
+        let by_id = "/dev/serial/by-id/usb-Silicon_Labs_CP2105-if00-port0";
+        assert_eq!(stable_port_name(by_id), by_id);
+        assert_eq!(replacement_cat_port(""), None);
+        assert_eq!(replacement_cat_port("/dev/null"), None);
     }
 
     /// A port that may key on RTS is never probed (detect_cat filters it before opening).
