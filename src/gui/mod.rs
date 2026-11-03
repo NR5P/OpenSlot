@@ -740,6 +740,19 @@ impl VaracApp {
                     for i in our_lines_in_frame(&self.state.chat_lines, &text, |l| l.tx == Some(state::TxStage::Queued)) {
                         self.state.chat_lines[i].tx = Some(state::TxStage::OnAir { total: bytes as u32, since: now });
                     }
+                    // Our VMail going out: a line of its own, on its way like a typed message
+                    if let Some(line) = vmail_chat_text(&text) {
+                        let time = self.state.format_time();
+                        let callsign = self.state.my_callsign.clone();
+                        self.state.add_chat(ChatLine {
+                            time,
+                            callsign,
+                            text: line,
+                            is_outgoing: true,
+                            tx: Some(state::TxStage::OnAir { total: bytes as u32, since: now }),
+                            ..Default::default()
+                        });
+                    }
                 }
                 SessionMsg::Busy(on) => {
                     if self.state.busy && !on {
@@ -769,6 +782,15 @@ impl VaracApp {
                 }
                 SessionMsg::FrameId { outgoing: false, id, .. } => self.state.rx_chat_id = Some(id),
                 SessionMsg::FrameId { outgoing: true, id, text } => {
+                    // (our VMail's line: sent)
+                    if let Some(vmail) = vmail_chat_text(&text) {
+                        if let Some(line) = self.state.chat_lines.iter_mut().rev()
+                            .find(|l| l.is_outgoing && l.chat_id.is_none() && l.text == vmail)
+                        {
+                            line.chat_id = Some(id);
+                            line.tx = Some(state::TxStage::Sent { at: std::time::Instant::now() });
+                        }
+                    }
                     // Our line that this frame carried (newest first; a reply has its <C:n> prefix)
                     let body = text.split_once('>').filter(|_| text.starts_with("<C:")).map_or(text.as_str(), |(_, b)| b);
                     let body = body.replace("//n", "\n");
@@ -2929,6 +2951,7 @@ impl GuiShell {
     }
 
     /// The modem's TX drive level (dB) as last read from it or set in the Tune window.
+    #[allow(dead_code)] // the Linux app's built-in modem keeps it in xara.toml
     pub fn drive_level(&self) -> Option<i32> {
         self.0.lock().ok().and_then(|app| app.state.drive_level)
     }
@@ -3053,6 +3076,8 @@ impl eframe::App for VaracApp {
                 self.state.heard_stations_open = false;
                 self.state.contacts_open = false;
                 self.state.chat_search_active = false;
+                self.state.broadcast_search_active = false;
+                self.state.broadcast_search.clear();
                 self.state.freq_ref_open = false;
                 self.state.about_open = false;
                 self.state.bbs_listing_open = false;
@@ -3140,6 +3165,7 @@ impl eframe::App for VaracApp {
         draw_qso_log_window(ctx, &mut self.state, &self.db);
         draw_qso_stats_window(ctx, &mut self.state, &self.db);
         draw_vmail_viewer_window(ctx, &mut self.state, &self.db);
+        draw_compose_vmail_window(ctx, &mut self.state, &self.db);
         draw_broadcast_window(ctx, &mut self.state);
         draw_relay_offer(ctx, &mut self.state);
         draw_verbose_snr_invite(ctx, &mut self.state);
@@ -3551,6 +3577,29 @@ fn parse_bitrate(s: &str) -> Option<(u8, u32, bool)> {
 
 /// Our lines a frame carries (one message, or up to three joined by CRLF; a reply has its
 /// <C:n> prefix), newest matching line for each part.
+/// Our VMail frame (VarAC's `<SM>…<TO:…><SBJ:…><MSG:…>`) as the chat shows it while it goes
+/// out: what it is and to whom when it's relayed, and the start of its text.
+fn vmail_chat_text(frame: &str) -> Option<String> {
+    let rest = frame.strip_prefix("<SM>")?;
+    let tag = |name: &str| {
+        rest.split_once(&format!("<{name}:")).and_then(|(_, r)| r.split_once('>')).map(|(v, _)| messages::desanitize(v))
+    };
+    let subject = tag("SBJ").unwrap_or_default();
+    let mut line = match tag("TO") {
+        Some(to) => format!("VMail to {to}: {subject}"),
+        None => format!("VMail: {subject}"),
+    };
+    let body = tag("MSG").unwrap_or_default().replace("//n", "\n").replace("\r\n", "\n");
+    if !body.trim().is_empty() {
+        line.push('\n');
+        line.extend(body.chars().take(300));
+        if body.chars().count() > 300 {
+            line.push('…');
+        }
+    }
+    Some(line)
+}
+
 fn our_lines_in_frame(lines: &std::collections::VecDeque<ChatLine>, text: &str, want: impl Fn(&ChatLine) -> bool) -> Vec<usize> {
     let body = text.split_once('>').filter(|_| text.starts_with("<C:")).map_or(text, |(_, b)| b).replace("//n", "\n");
     let whole = body.replace("\r\n", "\n");
@@ -3774,14 +3823,22 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
 
         ScrollArea::vertical()
             .auto_shrink([false; 2])
+            // (egui's least, 64 px, is more than a laptop screen leaves the chat: the card ran
+            // under the QSO log row)
+            .min_scrolled_height(0.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if state.chat_lines.is_empty() {
-                    ui.add_space(ui.available_height() * 0.35);
+                    // In the middle of what there is, the second line only if it fits
+                    let h = ui.available_height();
+                    let both = h >= 44.0;
+                    ui.add_space(((h - if both { 40.0 } else { 22.0 }) * 0.45).max(0.0));
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("No messages yet").size(16.0).color(theme::MUTED));
-                        ui.label(RichText::new("Connect to a station or answer a CQ to start chatting · /help for commands")
-                            .small().color(theme::tint(theme::MUTED, 160)));
+                        if both {
+                            ui.label(RichText::new("Connect to a station or answer a CQ to start chatting · /help for commands")
+                                .small().color(theme::tint(theme::MUTED, 160)));
+                        }
                     });
                 }
                 // VarAC's Reply / Reaction cells: (line index, like?) or (chat number, quote)
@@ -4008,6 +4065,33 @@ enum ComposeAction {
 /// (one VMail each), subject up to 50 characters, the body up to 500 (10000 at
 /// 2300/2750 Hz while linked, or in EmComm); SEND, SEND AND DISCONNECT, SAVE TO DRAFTS,
 /// CANCEL ("Are you sure?"). An Outbox VMail being edited keeps its To and says UPDATE.
+/// Compose / edit a VMail in a window of its own (as VarAC), above the main window: drawn in
+/// the message box's place it was taller than a laptop screen leaves there, its SEND and
+/// CANCEL below the window's edge. The ✕ is CANCEL.
+fn draw_compose_vmail_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage) {
+    if !state.compose_open {
+        return;
+    }
+    let title = if state.compose_editing.is_some() { "Edit VMail" } else { "Compose VMail" };
+    let mut open = true;
+    egui::Window::new(title)
+        .id(egui::Id::new("compose_vmail_window"))
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(620.0)
+        .max_height((ctx.screen_rect().height() - 80.0).max(200.0))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| draw_compose_window(ui, state, db));
+        });
+    if !open {
+        if state.compose_subject.is_empty() && state.compose_body.is_empty() {
+            clear_compose(state);
+        } else {
+            state.compose_cancel_confirm = true;
+        }
+    }
+}
+
 fn draw_compose_window(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
     let connected = state.session_state == SessionState::Connected;
     let wide = matches!(state.settings_form.bandwidth.trim(), "2300" | "2750");
@@ -4019,9 +4103,6 @@ fn draw_compose_window(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
         .inner_margin(Margin::same(8.0))
         .stroke(Stroke::new(2.0_f32, YELLOW))
         .show(ui, |ui| {
-            let title = if state.compose_editing.is_some() { "Edit VMail" } else { "Compose VMail" };
-            ui.colored_label(YELLOW, RichText::new(title).strong());
-            ui.separator();
             ui.horizontal(|ui| {
                 ui.label("To:");
                 ui.add_enabled(!editing_outbox, TextEdit::singleline(&mut state.compose_to).desired_width(220.0)
@@ -5654,641 +5735,646 @@ fn draw_settings_window(
             });
             ui.separator();
 
-            match state.settings_form.settings_tab {
-                0 => {
-                    // Station tab
-                    egui::Grid::new("station_grid")
-                        .num_columns(2)
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Callsign:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.callsign).desired_width(150.0));
-                            ui.end_row();
-
-                            ui.label("GPS position (manual):");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.gps_manual).desired_width(200.0).hint_text("e.g. 30.2672,-97.7431"))
-                                .on_hover_text("Answered to a GPS request as <GPS:…> (empty: NO GPS DATA)");
-                            ui.end_row();
-
-                            ui.label("Complex callsign:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.full_callsign).desired_width(150.0).hint_text("e.g. W/4Z1AC/QRP"))
-                                .on_hover_text("Prefix/suffix form sent in your opening as <FC:..> (VARA links with the plain callsign)");
-                            ui.end_row();
-
-                            ui.label("Name:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.name).desired_width(200.0));
-                            ui.end_row();
-
-                            ui.label("QTH:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.qth).desired_width(200.0));
-                            ui.end_row();
-
-                            ui.label("Locator:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.locator).desired_width(100.0).hint_text("e.g. FN42"));
-                            ui.end_row();
-
-                            ui.label("Email:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.email).desired_width(200.0))
-                                .on_hover_text("Shared when a station asks for your INFO (leave empty to keep it private)");
-                            ui.end_row();
-
-                            // VarAC [MY_INFO]: sent in INFO replies, usable as <RIG> <PWR> <ANT> <ICE> tags
-                            for (label, value, hint) in [
-                                ("Rig:", &mut state.settings_form.my_rig, "e.g. FTDX3000"),
-                                ("Power (W):", &mut state.settings_form.my_power, "e.g. 100"),
-                                ("Antenna:", &mut state.settings_form.my_antenna, "e.g. EFHW 40-10m"),
-                                ("Age:", &mut state.settings_form.my_age, ""),
-                                ("Profession:", &mut state.settings_form.my_profession, ""),
-                                ("Hobbies:", &mut state.settings_form.my_hobbies, ""),
-                            ] {
-                                ui.label(label);
-                                ui.add(TextEdit::singleline(value).desired_width(200.0).hint_text(hint));
+            // The longer tabs are taller than a laptop screen leaves: they scroll, and the tab
+            // bar and SAVE AND EXIT stay in view
+            let tab_h = (ctx.screen_rect().height() - 240.0).max(200.0);
+            egui::ScrollArea::vertical().max_height(tab_h).auto_shrink([false, true]).show(ui, |ui| {
+                match state.settings_form.settings_tab {
+                    0 => {
+                        // Station tab
+                        egui::Grid::new("station_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Callsign:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.callsign).desired_width(150.0));
                                 ui.end_row();
-                            }
-                        });
 
-                    ui.add_space(8.0);
-                    ui.heading("Services");
-                    ui.checkbox(&mut state.settings_form.vmail_enabled, "VMail");
-                    ui.checkbox(&mut state.settings_form.bbs_enabled, "BBS File Transfer");
-                    if state.settings_form.bbs_enabled {
-                        ui.horizontal(|ui| {
-                            ui.label("BBS Directory:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.bbs_directory)
-                                .desired_width(200.0)
-                                .hint_text("/path/to/bbs/files"));
-                            if ui.button("Browse...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                    state.settings_form.bbs_directory = path.display().to_string();
-                                }
-                            }
-                        });
-                        let f = &mut state.settings_form;
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut f.bbs_limit, "Limit BBS to these callsigns:");
-                            ui.add_enabled(f.bbs_limit, TextEdit::singleline(&mut f.bbs_allow).desired_width(220.0).hint_text("W5TST,K5XYZ"));
-                        });
-                        ui.add_enabled_ui(!f.bbs_limit, |ui| {
-                            ui.checkbox(&mut f.bbs_announce, "Announce the BBS in my beacons (ADVANCED beacons, open BBS only)");
-                        });
-                    }
-                }
-                1 => {
-                    // VARA Modem tab
-                    egui::Grid::new("modem_grid")
-                        .num_columns(2)
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Host:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.modem_host).desired_width(150.0));
-                            ui.end_row();
+                                ui.label("GPS position (manual):");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.gps_manual).desired_width(200.0).hint_text("e.g. 30.2672,-97.7431"))
+                                    .on_hover_text("Answered to a GPS request as <GPS:…> (empty: NO GPS DATA)");
+                                ui.end_row();
 
-                            ui.label("Command Port:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.cmd_port).desired_width(80.0));
-                            ui.end_row();
+                                ui.label("Complex callsign:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.full_callsign).desired_width(150.0).hint_text("e.g. W/4Z1AC/QRP"))
+                                    .on_hover_text("Prefix/suffix form sent in your opening as <FC:..> (VARA links with the plain callsign)");
+                                ui.end_row();
 
-                            ui.label("Data Port:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.data_port).desired_width(80.0));
-                            ui.end_row();
+                                ui.label("Name:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.name).desired_width(200.0));
+                                ui.end_row();
 
-                            ui.label("VARA modem:");
-                            ui.horizontal(|ui| {
-                                for k in ["VaraHF", "VaraFM", "VaraSAT"] {
-                                    ui.radio_value(&mut state.settings_form.vara_modem_type, k.to_string(), k);
+                                ui.label("QTH:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.qth).desired_width(200.0));
+                                ui.end_row();
+
+                                ui.label("Locator:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.locator).desired_width(100.0).hint_text("e.g. FN42"));
+                                ui.end_row();
+
+                                ui.label("Email:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.email).desired_width(200.0))
+                                    .on_hover_text("Shared when a station asks for your INFO (leave empty to keep it private)");
+                                ui.end_row();
+
+                                // VarAC [MY_INFO]: sent in INFO replies, usable as <RIG> <PWR> <ANT> <ICE> tags
+                                for (label, value, hint) in [
+                                    ("Rig:", &mut state.settings_form.my_rig, "e.g. FTDX3000"),
+                                    ("Power (W):", &mut state.settings_form.my_power, "e.g. 100"),
+                                    ("Antenna:", &mut state.settings_form.my_antenna, "e.g. EFHW 40-10m"),
+                                    ("Age:", &mut state.settings_form.my_age, ""),
+                                    ("Profession:", &mut state.settings_form.my_profession, ""),
+                                    ("Hobbies:", &mut state.settings_form.my_hobbies, ""),
+                                ] {
+                                    ui.label(label);
+                                    ui.add(TextEdit::singleline(value).desired_width(200.0).hint_text(hint));
+                                    ui.end_row();
                                 }
                             });
-                            ui.end_row();
-                            ui.label("Digipeat via:");
-                            ui.add_enabled(state.settings_form.vara_modem_type == "VaraFM",
-                                TextEdit::singleline(&mut state.settings_form.digipeat_via).desired_width(200.0).hint_text("DIGI1 DIGI2"))
-                                .on_hover_text("VARA FM only: CQs, beacons and broadcasts go through these digipeaters (space between them). To connect through one, type CALL VIA DIGI in the callsign box.");
-                            ui.end_row();
 
-                            ui.label("VARA program:");
+                        ui.add_space(8.0);
+                        ui.heading("Services");
+                        ui.checkbox(&mut state.settings_form.vmail_enabled, "VMail");
+                        ui.checkbox(&mut state.settings_form.bbs_enabled, "BBS File Transfer");
+                        if state.settings_form.bbs_enabled {
                             ui.horizontal(|ui| {
-                                ui.add(TextEdit::singleline(&mut state.settings_form.vara_path).desired_width(260.0).hint_text("C:\\VARA\\VARA.exe"));
-                                if ui.small_button("Browse…").clicked() {
-                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                        state.settings_form.vara_path = p.display().to_string();
+                                ui.label("BBS Directory:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.bbs_directory)
+                                    .desired_width(200.0)
+                                    .hint_text("/path/to/bbs/files"));
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        state.settings_form.bbs_directory = path.display().to_string();
                                     }
                                 }
                             });
-                            ui.end_row();
-                            ui.label("");
+                            let f = &mut state.settings_form;
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut state.settings_form.vara_launch, "Start VARA when connecting the modem")
-                                    .on_hover_text("Only when VARA isn't running yet. Sets its command and KISS ports. A .exe runs through Wine on Linux/macOS.");
-                                ui.label("then wait");
-                                ui.add(TextEdit::singleline(&mut state.settings_form.vara_launch_delay_secs).desired_width(30.0));
-                                ui.label("s");
+                                ui.checkbox(&mut f.bbs_limit, "Limit BBS to these callsigns:");
+                                ui.add_enabled(f.bbs_limit, TextEdit::singleline(&mut f.bbs_allow).desired_width(220.0).hint_text("W5TST,K5XYZ"));
                             });
-                            ui.end_row();
+                            ui.add_enabled_ui(!f.bbs_limit, |ui| {
+                                ui.checkbox(&mut f.bbs_announce, "Announce the BBS in my beacons (ADVANCED beacons, open BBS only)");
+                            });
+                        }
+                    }
+                    1 => {
+                        // VARA Modem tab
+                        egui::Grid::new("modem_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Host:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.modem_host).desired_width(150.0));
+                                ui.end_row();
 
-                            ui.label("KISS Port:");
-                            ui.add(TextEdit::singleline(&mut state.settings_form.kiss_port).desired_width(80.0))
-                                .on_hover_text("VARA's KISS interface (CQs, beacons, broadcasts). VARA's default is 8100.");
-                            ui.end_row();
+                                ui.label("Command Port:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.cmd_port).desired_width(80.0));
+                                ui.end_row();
 
-                            ui.label("Bandwidth:");
-                            egui::ComboBox::from_id_salt("bw_combo")
-                                .selected_text(&state.settings_form.bandwidth)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut state.settings_form.bandwidth, "500".into(), "500 Hz");
-                                    ui.selectable_value(&mut state.settings_form.bandwidth, "2300".into(), "2300 Hz");
-                                    ui.selectable_value(&mut state.settings_form.bandwidth, "2750".into(), "2750 Hz");
+                                ui.label("Data Port:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.data_port).desired_width(80.0));
+                                ui.end_row();
+
+                                ui.label("VARA modem:");
+                                ui.horizontal(|ui| {
+                                    for k in ["VaraHF", "VaraFM", "VaraSAT"] {
+                                        ui.radio_value(&mut state.settings_form.vara_modem_type, k.to_string(), k);
+                                    }
                                 });
-                            ui.end_row();
-                        });
-                }
-                2 => {
-                    // QSO tab
-                    ui.checkbox(&mut state.settings_form.auto_log_qso, "Auto log QSO");
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("CQ slot wait time (seconds):");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.cq_slot_wait_secs).desired_width(50.0));
-                        ui.add_space(12.0);
-                        ui.label("Slot size (Hz):");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.slot_step_hz).desired_width(50.0));
-                    });
-                    ui.checkbox(&mut state.settings_form.skip_cq_slot_selector, "Skip slot selector")
-                        .on_hover_text("Call CQ without a slot (VARA FM, or your own net off the VarAC calling frequencies). \
-                            On the official VarAC HF calling frequencies, use slots.");
-                    ui.colored_label(GRAY, RichText::new(
-                        "VarAC slots: your CQ names a slot (750 Hz steps around the calling frequency); you then wait \
-                         there for a reply and return to the calling frequency after the wait time. Stations answering \
-                         your CQ use the same slot size.",
-                    ).small().italics());
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut state.settings_form.load_history, "Load history upon connection");
-                    ui.checkbox(&mut state.settings_form.allow_pings, "Allow incoming pings");
-                    ui.checkbox(&mut state.settings_form.allow_info_request, "Allow info/inquire requests")
-                        .on_hover_text("Off: info and gateway-address requests are refused with <INFOJ>, like VarAC");
-                    ui.horizontal(|ui| {
-                        ui.label("Call ID every (min):");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.call_id_minutes).desired_width(30.0))
-                            .on_hover_text("Sends \"de CALL <R+NN>\" during the QSO (5–30, like VarAC)");
-                        ui.add_space(10.0);
-                        ui.label("Disconnect when idle (min, 0 = never):");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.idle_disconnect_minutes).desired_width(30.0))
-                            .on_hover_text("Tells the partner <IE> and disconnects");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Welcome message:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.welcome_message).desired_width(260.0)
-                            .hint_text("sent to stations that connect; \"de CALL\" is added"));
-                        ui.checkbox(&mut state.settings_form.welcome_always, "Send always (even when away)");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.settings_form.allow_last_heard, "Allow last heard peeking");
-                        ui.checkbox(&mut state.settings_form.multi_band_last_heard, "Multi-band");
-                        ui.checkbox(&mut state.settings_form.allow_path_finder, "Answer path finder requests")
-                            .on_hover_text("Tell stations looking for a path when you heard their target in the last 24 hours");
-                    });
-                    ui.checkbox(&mut state.settings_form.verbose_snr_auto_accept, "Auto accept verbose SNR")
-                        .on_hover_text("Accept a partner's invitation to exchange SNR every minute without asking");
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Logging").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("ADIF log file:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.adif_log_path).desired_width(300.0)
-                            .hint_text(crate::config::default_adif_path().display().to_string()));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("SUBMODE:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.adif_submode).desired_width(80.0).hint_text("as the modem"))
-                            .on_hover_text("VarAC writes MODE DYNAMIC, SUBMODE VARA HF (NONE leaves it out)");
-                        ui.label("Comment:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.default_log_comment).desired_width(180.0));
-                    });
-                    for (label, app, ip, port) in [
-                        ("Logger:", &mut state.settings_form.logger_app, &mut state.settings_form.logger_ip, &mut state.settings_form.logger_port),
-                        ("Second logger:", &mut state.settings_form.logger_app2, &mut state.settings_form.logger_ip2, &mut state.settings_form.logger_port2),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            egui::ComboBox::from_id_salt(label).selected_text(app.clone()).show_ui(ui, |ui| {
-                                for (name, default_port) in crate::varac::logbook::LOGGERS {
-                                    if ui.selectable_label(app == name, *name).clicked() {
-                                        *app = name.to_string();
-                                        *port = if *default_port > 0 { default_port.to_string() } else { String::new() };
+                                ui.end_row();
+                                ui.label("Digipeat via:");
+                                ui.add_enabled(state.settings_form.vara_modem_type == "VaraFM",
+                                    TextEdit::singleline(&mut state.settings_form.digipeat_via).desired_width(200.0).hint_text("DIGI1 DIGI2"))
+                                    .on_hover_text("VARA FM only: CQs, beacons and broadcasts go through these digipeaters (space between them). To connect through one, type CALL VIA DIGI in the callsign box.");
+                                ui.end_row();
+
+                                ui.label("VARA program:");
+                                ui.horizontal(|ui| {
+                                    ui.add(TextEdit::singleline(&mut state.settings_form.vara_path).desired_width(260.0).hint_text("C:\\VARA\\VARA.exe"));
+                                    if ui.small_button("Browse…").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                            state.settings_form.vara_path = p.display().to_string();
+                                        }
                                     }
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut state.settings_form.vara_launch, "Start VARA when connecting the modem")
+                                        .on_hover_text("Only when VARA isn't running yet. Sets its command and KISS ports. A .exe runs through Wine on Linux/macOS.");
+                                    ui.label("then wait");
+                                    ui.add(TextEdit::singleline(&mut state.settings_form.vara_launch_delay_secs).desired_width(30.0));
+                                    ui.label("s");
+                                });
+                                ui.end_row();
+
+                                ui.label("KISS Port:");
+                                ui.add(TextEdit::singleline(&mut state.settings_form.kiss_port).desired_width(80.0))
+                                    .on_hover_text("VARA's KISS interface (CQs, beacons, broadcasts). VARA's default is 8100.");
+                                ui.end_row();
+
+                                ui.label("Bandwidth:");
+                                egui::ComboBox::from_id_salt("bw_combo")
+                                    .selected_text(&state.settings_form.bandwidth)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut state.settings_form.bandwidth, "500".into(), "500 Hz");
+                                        ui.selectable_value(&mut state.settings_form.bandwidth, "2300".into(), "2300 Hz");
+                                        ui.selectable_value(&mut state.settings_form.bandwidth, "2750".into(), "2750 Hz");
+                                    });
+                                ui.end_row();
+                            });
+                    }
+                    2 => {
+                        // QSO tab
+                        ui.checkbox(&mut state.settings_form.auto_log_qso, "Auto log QSO");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("CQ slot wait time (seconds):");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.cq_slot_wait_secs).desired_width(50.0));
+                            ui.add_space(12.0);
+                            ui.label("Slot size (Hz):");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.slot_step_hz).desired_width(50.0));
+                        });
+                        ui.checkbox(&mut state.settings_form.skip_cq_slot_selector, "Skip slot selector")
+                            .on_hover_text("Call CQ without a slot (VARA FM, or your own net off the VarAC calling frequencies). \
+                                On the official VarAC HF calling frequencies, use slots.");
+                        ui.colored_label(GRAY, RichText::new(
+                            "VarAC slots: your CQ names a slot (750 Hz steps around the calling frequency); you then wait \
+                             there for a reply and return to the calling frequency after the wait time. Stations answering \
+                             your CQ use the same slot size.",
+                        ).small().italics());
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut state.settings_form.load_history, "Load history upon connection");
+                        ui.checkbox(&mut state.settings_form.allow_pings, "Allow incoming pings");
+                        ui.checkbox(&mut state.settings_form.allow_info_request, "Allow info/inquire requests")
+                            .on_hover_text("Off: info and gateway-address requests are refused with <INFOJ>, like VarAC");
+                        ui.horizontal(|ui| {
+                            ui.label("Call ID every (min):");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.call_id_minutes).desired_width(30.0))
+                                .on_hover_text("Sends \"de CALL <R+NN>\" during the QSO (5–30, like VarAC)");
+                            ui.add_space(10.0);
+                            ui.label("Disconnect when idle (min, 0 = never):");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.idle_disconnect_minutes).desired_width(30.0))
+                                .on_hover_text("Tells the partner <IE> and disconnects");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Welcome message:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.welcome_message).desired_width(260.0)
+                                .hint_text("sent to stations that connect; \"de CALL\" is added"));
+                            ui.checkbox(&mut state.settings_form.welcome_always, "Send always (even when away)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.settings_form.allow_last_heard, "Allow last heard peeking");
+                            ui.checkbox(&mut state.settings_form.multi_band_last_heard, "Multi-band");
+                            ui.checkbox(&mut state.settings_form.allow_path_finder, "Answer path finder requests")
+                                .on_hover_text("Tell stations looking for a path when you heard their target in the last 24 hours");
+                        });
+                        ui.checkbox(&mut state.settings_form.verbose_snr_auto_accept, "Auto accept verbose SNR")
+                            .on_hover_text("Accept a partner's invitation to exchange SNR every minute without asking");
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Logging").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("ADIF log file:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.adif_log_path).desired_width(300.0)
+                                .hint_text(crate::config::default_adif_path().display().to_string()));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("SUBMODE:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.adif_submode).desired_width(80.0).hint_text("as the modem"))
+                                .on_hover_text("VarAC writes MODE DYNAMIC, SUBMODE VARA HF (NONE leaves it out)");
+                            ui.label("Comment:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.default_log_comment).desired_width(180.0));
+                        });
+                        for (label, app, ip, port) in [
+                            ("Logger:", &mut state.settings_form.logger_app, &mut state.settings_form.logger_ip, &mut state.settings_form.logger_port),
+                            ("Second logger:", &mut state.settings_form.logger_app2, &mut state.settings_form.logger_ip2, &mut state.settings_form.logger_port2),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                egui::ComboBox::from_id_salt(label).selected_text(app.clone()).show_ui(ui, |ui| {
+                                    for (name, default_port) in crate::varac::logbook::LOGGERS {
+                                        if ui.selectable_label(app == name, *name).clicked() {
+                                            *app = name.to_string();
+                                            *port = if *default_port > 0 { default_port.to_string() } else { String::new() };
+                                        }
+                                    }
+                                });
+                                if app != "NONE" {
+                                    ui.add(TextEdit::singleline(ip).desired_width(100.0).hint_text("127.0.0.1"));
+                                    ui.add(TextEdit::singleline(port).desired_width(50.0).hint_text("port"));
                                 }
                             });
-                            if app != "NONE" {
-                                ui.add(TextEdit::singleline(ip).desired_width(100.0).hint_text("127.0.0.1"));
-                                ui.add(TextEdit::singleline(port).desired_width(50.0).hint_text("port"));
+                        }
+                        ui.checkbox(&mut state.settings_form.logger_callsign_lookup, "Log4OM callsign lookup")
+                            .on_hover_text("Show the station you connect to in Log4OM (UDP to its API port 2241)");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.settings_form.pskreporter_upload, "Report stations heard to PSKReporter")
+                                .on_hover_text("CQs, beacons, broadcasts and QSO partners, as VarAC does (mode VARAC)");
+                            ui.add_enabled(state.settings_form.pskreporter_upload,
+                                egui::Checkbox::new(&mut state.settings_form.pskreporter_self_report, "Self report"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.settings_form.dxcluster_enabled, "Spot QSOs to a DX cluster")
+                                .on_hover_text("Right-click a station: \"DX Cluster spot\" (telnet, as VarAC)");
+                            if state.settings_form.dxcluster_enabled {
+                                ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_host).desired_width(110.0).hint_text("k1ttt.net"));
+                                ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_port).desired_width(45.0).hint_text("7373"));
+                                ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_username).desired_width(70.0).hint_text("login"));
+                                ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_password).desired_width(70.0).password(true).hint_text("password"));
                             }
                         });
-                    }
-                    ui.checkbox(&mut state.settings_form.logger_callsign_lookup, "Log4OM callsign lookup")
-                        .on_hover_text("Show the station you connect to in Log4OM (UDP to its API port 2241)");
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.settings_form.pskreporter_upload, "Report stations heard to PSKReporter")
-                            .on_hover_text("CQs, beacons, broadcasts and QSO partners, as VarAC does (mode VARAC)");
-                        ui.add_enabled(state.settings_form.pskreporter_upload,
-                            egui::Checkbox::new(&mut state.settings_form.pskreporter_self_report, "Self report"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.settings_form.dxcluster_enabled, "Spot QSOs to a DX cluster")
-                            .on_hover_text("Right-click a station: \"DX Cluster spot\" (telnet, as VarAC)");
-                        if state.settings_form.dxcluster_enabled {
-                            ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_host).desired_width(110.0).hint_text("k1ttt.net"));
-                            ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_port).desired_width(45.0).hint_text("7373"));
-                            ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_username).desired_width(70.0).hint_text("login"));
-                            ui.add(TextEdit::singleline(&mut state.settings_form.dxcluster_password).desired_width(70.0).password(true).hint_text("password"));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.settings_form.allow_parking, "Allow parking")
-                            .on_hover_text("Hold VMail for other stations until they connect (off: refused with <SMFP>)");
-                        ui.checkbox(&mut state.settings_form.send_relay_notifications, "Send relay notifications")
-                            .on_hover_text("Tell a station whose beacon you hear that VMail waits here for it (again after 20 minutes)");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Incoming files folder:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_dir).desired_width(260.0).hint_text("Downloads"));
-                        if ui.small_button("Browse…").clicked() {
-                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                                state.settings_form.incoming_files_dir = d.display().to_string();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Incoming files size limit (bytes):");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_size_limit).desired_width(70.0))
-                            .on_hover_text("Smaller files and VMail attachments are accepted at once; bigger ones are refused while away, else you're asked (VarAC: 5000)");
-                    });
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Callsigns block list").strong());
-                    ui.add(TextEdit::singleline(&mut state.settings_form.callsigns_block_list).desired_width(420.0).hint_text("CALL1,CALL2"))
-                        .on_hover_text("Comma separated. Their connects are aborted and their beacons, CQs and broadcasts are ignored.");
-                    ui.add_space(6.0);
-                    let mut em = state.settings_form.emcomm_mode;
-                    if ui.checkbox(&mut em, RichText::new("EmComm mode").strong().color(RED))
-                        .on_hover_text("VarAC's emergency communications mode: beacons as CALL-8, check-in requests, \
-                                        and the options below. Avoid it on a calling frequency.").changed()
-                    {
-                        // (VarAC asks first on a calling frequency)
-                        if em && crate::varac::messages::is_calling_frequency(state.dial()) {
-                            state.emcomm_confirm = true;
-                        } else {
-                            state.set_emcomm(em);
-                        }
-                    }
-                    ui.add_enabled_ui(state.settings_form.emcomm_mode, |ui| {
-                        ui.indent("emcomm_opts", |ui| {
-                            ui.checkbox(&mut state.settings_form.emcomm_auto_reply_checkin, "Answer check-in requests with a beacon");
-                            ui.checkbox(&mut state.settings_form.emcomm_allow_last_connections, "Allow last-connections peeking")
-                                .on_hover_text("Stations may ask for your last 5 QSOs (<LCR>)");
-                            ui.checkbox(&mut state.settings_form.emcomm_auto_file_approval, "Accept incoming files automatically");
-                            ui.checkbox(&mut state.settings_form.emcomm_qsy_notify, "Notify a scheduled QSY by broadcast")
-                                .on_hover_text("Before the frequency scheduler retunes, a broadcast to ALL tells where we go (<QF:…>)");
-                            ui.checkbox(&mut state.settings_form.emcomm_disable_snr, "Don't send SNR reports");
-                            ui.checkbox(&mut state.settings_form.emcomm_disable_call_id, "Don't send Call ID");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.settings_form.allow_parking, "Allow parking")
+                                .on_hover_text("Hold VMail for other stations until they connect (off: refused with <SMFP>)");
+                            ui.checkbox(&mut state.settings_form.send_relay_notifications, "Send relay notifications")
+                                .on_hover_text("Tell a station whose beacon you hear that VMail waits here for it (again after 20 minutes)");
                         });
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.settings_form.auto_away_enabled, "Auto away in");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.auto_away_minutes).desired_width(40.0));
-                        ui.label("minutes");
-                    });
-                    ui.checkbox(&mut state.auto_qsy_enabled, "Allow auto-QSY (within allowed frequency ranges)");
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Connection timeout:");
-                        let mut timeout = state.connect_timeout_secs.to_string();
-                        if ui.add(TextEdit::singleline(&mut timeout).desired_width(40.0)).changed() {
-                            if let Ok(v) = timeout.parse::<u32>() {
-                                state.connect_timeout_secs = v.clamp(10, 120);
-                            }
-                        }
-                        ui.label("seconds (10-120)");
-                    });
-                }
-                3 => {
-                    // CQ / Beacon tab
-                    ui.horizontal(|ui| {
-                        ui.label("Beacon interval (minutes):");
-                        // VarAC's choices (at least 15 minutes on VARA HF)
-                        egui::ComboBox::from_id_salt("beacon_interval").selected_text(state.settings_form.beacon_interval.clone()).show_ui(ui, |ui| {
-                            // (VARA FM, and EmComm, may beacon every 5–10 minutes)
-                            let short = state.settings_form.vara_modem_type == "VaraFM" || state.settings_form.emcomm_mode;
-                            let choices: &[&str] = if short { &["5", "6", "7", "8", "9", "10", "15", "20", "30", "45", "60", "90", "120", "180"] } else { &["15", "20", "30", "45", "60", "90", "120", "180"] };
-                            for m in choices.iter().copied() {
-                                ui.selectable_value(&mut state.settings_form.beacon_interval, m.to_string(), m);
+                        ui.horizontal(|ui| {
+                            ui.label("Incoming files folder:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_dir).desired_width(260.0).hint_text("Downloads"));
+                            if ui.small_button("Browse…").clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    state.settings_form.incoming_files_dir = d.display().to_string();
+                                }
                             }
                         });
-                    });
-                    ui.checkbox(&mut state.settings_form.start_beacon_on_startup, "Start beacon on startup");
-                    ui.checkbox(&mut state.settings_form.unlimited_beacon_time, "Unlimited beacon time")
-                        .on_hover_text("Off (VarAC's default): the beacon shuts down within 72 hours and must be re-enabled.");
-                    ui.horizontal(|ui| {
-                        ui.label("Beacon type:");
-                        let f = &mut state.settings_form;
-                        if ui.radio(f.beacon_type != "advanced", "STANDARD").clicked() {
-                            f.beacon_type = "standard".into();
-                        }
-                        if ui.radio(f.beacon_type == "advanced", "ADVANCED").clicked() {
-                            f.beacon_type = "advanced".into();
-                        }
-                    });
-                    ui.colored_label(GRAY, RichText::new(
-                        "Standard: a VARA CQ frame (CALL-9). Advanced: VarAC's KISS beacon with your locator and \
-                         announced services (e.g. your email gateway); needs the modem's KISS port.",
-                    ).small().italics());
-                    ui.horizontal(|ui| {
-                        ui.label("Auto-CQ repeat interval (seconds):");
-                        let mut interval = state.auto_cq_interval_secs.to_string();
-                        if ui.add(TextEdit::singleline(&mut interval).desired_width(40.0)).changed() {
-                            if let Ok(v) = interval.parse::<u32>() {
-                                state.auto_cq_interval_secs = v.clamp(10, 300);
-                            }
-                        }
-                    });
-                }
-                4 => {
-                    // Display tab
-                    ui.horizontal(|ui| {
-                        ui.label("Font size:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.font_size).desired_width(40.0));
-                        ui.label("px (10-24, default 14)");
-                    });
-                    ui.checkbox(&mut state.settings_form.notifications_enabled, "Desktop notifications");
-                    ui.colored_label(GRAY, RichText::new("Notifications for connections, VMail, file offers, and messages while away.").small().italics());
-                    ui.checkbox(&mut state.settings_form.sound_alerts, "Sound alerts");
-                    ui.add_space(6.0);
-                    features::draw_sound_settings(ui);
-                    ui.colored_label(GRAY, RichText::new("Play audio alert on connection, incoming VMail, and file offers.").small().italics());
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut state.settings_form.use_local_time, "Use local time (instead of UTC)");
-                    ui.checkbox(&mut state.settings_form.modem_auto_reconnect, "Auto-reconnect modem on disconnect");
-                    ui.colored_label(GRAY, RichText::new("Automatically retry modem connection every 10 seconds when disconnected.").small().italics());
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Theme:");
-                        if ui.selectable_label(state.dark_mode, "Dark").clicked() {
-                            state.dark_mode = true;
-                        }
-                        if ui.selectable_label(!state.dark_mode && !state.scifi_theme, "Light").clicked() {
-                            state.dark_mode = false;
-                            state.scifi_theme = false;
-                        }
-                        if ui.selectable_label(state.scifi_theme, "Sci-Fi").on_hover_text("VarAC's SCIFI theme (dark)").clicked() {
-                            state.scifi_theme = !state.scifi_theme;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Distances in:");
-                        ui.radio_value(&mut state.settings_form.distance_unit, "MI".to_string(), "miles");
-                        ui.radio_value(&mut state.settings_form.distance_unit, "KM".to_string(), "km");
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("QSO duration alert:");
-                        ui.add(TextEdit::singleline(&mut state.settings_form.qso_alert_minutes).desired_width(40.0));
-                        ui.label("min (0 = off)");
-                    });
-                    ui.colored_label(GRAY, RichText::new("Notification after N minutes in a QSO.").small().italics());
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut state.dx_alert_enabled, "DX alert (notify on foreign CQ stations)");
-                    ui.colored_label(GRAY, RichText::new("Desktop notification when a CQ from another country is heard.").small().italics());
-                }
-                6 => draw_email_settings(ui, &mut state.settings_form, station_config.email_gate.as_ref()),
-                5 => {
-                    // RIG tab — grouped like VarAC's: PTT + CAT on the left, frequency control + Hamlib on the right
-                    let group = |ui: &mut egui::Ui, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
-                        theme::card().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            theme::caption(ui, title);
-                            ui.add_space(2.0);
-                            body(ui);
+                        ui.horizontal(|ui| {
+                            ui.label("Incoming files size limit (bytes):");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_size_limit).desired_width(70.0))
+                                .on_hover_text("Smaller files and VMail attachments are accepted at once; bigger ones are refused while away, else you're asked (VarAC: 5000)");
                         });
                         ui.add_space(6.0);
-                    };
-                    ui.columns(2, |cols| {
-                        // ---- PTT Configuration
-                        group(&mut cols[0], "PTT Configuration", &mut |ui| {
-                            let rig_on = state.rig_settings_backend != "none";
-                            ui.add_enabled_ui(rig_on, |ui| {
-                                ui.radio_value(&mut state.rig_settings_ptt, true, "CAT — key the radio through rig control");
+                        ui.label(RichText::new("Callsigns block list").strong());
+                        ui.add(TextEdit::singleline(&mut state.settings_form.callsigns_block_list).desired_width(420.0).hint_text("CALL1,CALL2"))
+                            .on_hover_text("Comma separated. Their connects are aborted and their beacons, CQs and broadcasts are ignored.");
+                        ui.add_space(6.0);
+                        let mut em = state.settings_form.emcomm_mode;
+                        if ui.checkbox(&mut em, RichText::new("EmComm mode").strong().color(RED))
+                            .on_hover_text("VarAC's emergency communications mode: beacons as CALL-8, check-in requests, \
+                                            and the options below. Avoid it on a calling frequency.").changed()
+                        {
+                            // (VarAC asks first on a calling frequency)
+                            if em && crate::varac::messages::is_calling_frequency(state.dial()) {
+                                state.emcomm_confirm = true;
+                            } else {
+                                state.set_emcomm(em);
+                            }
+                        }
+                        ui.add_enabled_ui(state.settings_form.emcomm_mode, |ui| {
+                            ui.indent("emcomm_opts", |ui| {
+                                ui.checkbox(&mut state.settings_form.emcomm_auto_reply_checkin, "Answer check-in requests with a beacon");
+                                ui.checkbox(&mut state.settings_form.emcomm_allow_last_connections, "Allow last-connections peeking")
+                                    .on_hover_text("Stations may ask for your last 5 QSOs (<LCR>)");
+                                ui.checkbox(&mut state.settings_form.emcomm_auto_file_approval, "Accept incoming files automatically");
+                                ui.checkbox(&mut state.settings_form.emcomm_qsy_notify, "Notify a scheduled QSY by broadcast")
+                                    .on_hover_text("Before the frequency scheduler retunes, a broadcast to ALL tells where we go (<QF:…>)");
+                                ui.checkbox(&mut state.settings_form.emcomm_disable_snr, "Don't send SNR reports");
+                                ui.checkbox(&mut state.settings_form.emcomm_disable_call_id, "Don't send Call ID");
                             });
-                            ui.radio_value(&mut state.rig_settings_ptt, false, "None — VARA keys the radio (VOX / VARA PTT)");
-                            ui.horizontal(|ui| {
-                                ui.label("TEST");
-                                let can = state.rig_connected;
-                                if ui.add_enabled(can, theme::accent_button("PTT ON", theme::RED)).on_hover_text("Key the transmitter (use a dummy load or a clear frequency)").clicked() {
-                                    state.rig_test_ptt = Some(true);
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.settings_form.auto_away_enabled, "Auto away in");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.auto_away_minutes).desired_width(40.0));
+                            ui.label("minutes");
+                        });
+                        ui.checkbox(&mut state.auto_qsy_enabled, "Allow auto-QSY (within allowed frequency ranges)");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Connection timeout:");
+                            let mut timeout = state.connect_timeout_secs.to_string();
+                            if ui.add(TextEdit::singleline(&mut timeout).desired_width(40.0)).changed() {
+                                if let Ok(v) = timeout.parse::<u32>() {
+                                    state.connect_timeout_secs = v.clamp(10, 120);
                                 }
-                                if ui.add_enabled(can, egui::Button::new("PTT OFF")).clicked() {
-                                    state.rig_test_ptt = Some(false);
-                                }
-                                if state.rig_ptt {
-                                    theme::pill(ui, "TX", theme::TX_RED);
+                            }
+                            ui.label("seconds (10-120)");
+                        });
+                    }
+                    3 => {
+                        // CQ / Beacon tab
+                        ui.horizontal(|ui| {
+                            ui.label("Beacon interval (minutes):");
+                            // VarAC's choices (at least 15 minutes on VARA HF)
+                            egui::ComboBox::from_id_salt("beacon_interval").selected_text(state.settings_form.beacon_interval.clone()).show_ui(ui, |ui| {
+                                // (VARA FM, and EmComm, may beacon every 5–10 minutes)
+                                let short = state.settings_form.vara_modem_type == "VaraFM" || state.settings_form.emcomm_mode;
+                                let choices: &[&str] = if short { &["5", "6", "7", "8", "9", "10", "15", "20", "30", "45", "60", "90", "120", "180"] } else { &["15", "20", "30", "45", "60", "90", "120", "180"] };
+                                for m in choices.iter().copied() {
+                                    ui.selectable_value(&mut state.settings_form.beacon_interval, m.to_string(), m);
                                 }
                             });
                         });
-
-                        // ---- CAT Configuration
-                        group(&mut cols[0], "CAT Configuration", &mut |ui| {
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut state.rig_settings_backend, "cat".into(), "COM Port");
-                                ui.radio_value(&mut state.rig_settings_backend, "rigctld".into(), "TCP (rigctld)");
-                                ui.radio_value(&mut state.rig_settings_backend, "flrig".into(), "FLRig");
-                                ui.radio_value(&mut state.rig_settings_backend, "none".into(), "None");
-                            });
-                            if state.rig_settings_backend != "none" {
-                                ui.horizontal(|ui| {
-                                    ui.label("Radio mode");
-                                    egui::ComboBox::from_id_salt("usb_mode")
-                                        .selected_text(state.settings_form.usb_mode.clone())
-                                        .show_ui(ui, |ui| {
-                                            for m in ["USB", "USB-D", "DATA-U", "FM", "FM-D"] {
-                                                ui.selectable_value(&mut state.settings_form.usb_mode, m.to_string(), m);
-                                            }
-                                        });
-                                    ui.colored_label(GRAY, RichText::new("set before every frequency change, as in VarAC").small().italics());
-                                });
+                        ui.checkbox(&mut state.settings_form.start_beacon_on_startup, "Start beacon on startup");
+                        ui.checkbox(&mut state.settings_form.unlimited_beacon_time, "Unlimited beacon time")
+                            .on_hover_text("Off (VarAC's default): the beacon shuts down within 72 hours and must be re-enabled.");
+                        ui.horizontal(|ui| {
+                            ui.label("Beacon type:");
+                            let f = &mut state.settings_form;
+                            if ui.radio(f.beacon_type != "advanced", "STANDARD").clicked() {
+                                f.beacon_type = "standard".into();
                             }
-                            if state.rig_settings_backend == "cat" {
-                                egui::Grid::new("cat_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                                    ui.label("Radio");
-                                    egui::ComboBox::from_id_salt("rig_model")
-                                        .selected_text(match state.rig_settings_model.as_str() {
-                                            "yaesu" => "Yaesu FT-991/891/710, FTDX10/101",
-                                            "kenwood" | "qmx" => "Kenwood / QRP Labs QMX",
-                                            _ => "Yaesu FTDX3000 / FT-950 / FTDX1200",
-                                        })
-                                        .width(230.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut state.rig_settings_model, "ftdx3000".into(), "Yaesu FTDX3000 / FT-950 / FTDX1200");
-                                            ui.selectable_value(&mut state.rig_settings_model, "yaesu".into(), "Yaesu FT-991/891/710, FTDX10/101");
-                                            ui.selectable_value(&mut state.rig_settings_model, "kenwood".into(), "Kenwood / QRP Labs QMX");
-                                        });
-                                    ui.end_row();
-                                    ui.label("Port");
+                            if ui.radio(f.beacon_type == "advanced", "ADVANCED").clicked() {
+                                f.beacon_type = "advanced".into();
+                            }
+                        });
+                        ui.colored_label(GRAY, RichText::new(
+                            "Standard: a VARA CQ frame (CALL-9). Advanced: VarAC's KISS beacon with your locator and \
+                             announced services (e.g. your email gateway); needs the modem's KISS port.",
+                        ).small().italics());
+                        ui.horizontal(|ui| {
+                            ui.label("Auto-CQ repeat interval (seconds):");
+                            let mut interval = state.auto_cq_interval_secs.to_string();
+                            if ui.add(TextEdit::singleline(&mut interval).desired_width(40.0)).changed() {
+                                if let Ok(v) = interval.parse::<u32>() {
+                                    state.auto_cq_interval_secs = v.clamp(10, 300);
+                                }
+                            }
+                        });
+                    }
+                    4 => {
+                        // Display tab
+                        ui.horizontal(|ui| {
+                            ui.label("Font size:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.font_size).desired_width(40.0));
+                            ui.label("px (10-24, default 14)");
+                        });
+                        ui.checkbox(&mut state.settings_form.notifications_enabled, "Desktop notifications");
+                        ui.colored_label(GRAY, RichText::new("Notifications for connections, VMail, file offers, and messages while away.").small().italics());
+                        ui.checkbox(&mut state.settings_form.sound_alerts, "Sound alerts");
+                        ui.add_space(6.0);
+                        features::draw_sound_settings(ui);
+                        ui.colored_label(GRAY, RichText::new("Play audio alert on connection, incoming VMail, and file offers.").small().italics());
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut state.settings_form.use_local_time, "Use local time (instead of UTC)");
+                        ui.checkbox(&mut state.settings_form.modem_auto_reconnect, "Auto-reconnect modem on disconnect");
+                        ui.colored_label(GRAY, RichText::new("Automatically retry modem connection every 10 seconds when disconnected.").small().italics());
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Theme:");
+                            if ui.selectable_label(state.dark_mode, "Dark").clicked() {
+                                state.dark_mode = true;
+                            }
+                            if ui.selectable_label(!state.dark_mode && !state.scifi_theme, "Light").clicked() {
+                                state.dark_mode = false;
+                                state.scifi_theme = false;
+                            }
+                            if ui.selectable_label(state.scifi_theme, "Sci-Fi").on_hover_text("VarAC's SCIFI theme (dark)").clicked() {
+                                state.scifi_theme = !state.scifi_theme;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Distances in:");
+                            ui.radio_value(&mut state.settings_form.distance_unit, "MI".to_string(), "miles");
+                            ui.radio_value(&mut state.settings_form.distance_unit, "KM".to_string(), "km");
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("QSO duration alert:");
+                            ui.add(TextEdit::singleline(&mut state.settings_form.qso_alert_minutes).desired_width(40.0));
+                            ui.label("min (0 = off)");
+                        });
+                        ui.colored_label(GRAY, RichText::new("Notification after N minutes in a QSO.").small().italics());
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut state.dx_alert_enabled, "DX alert (notify on foreign CQ stations)");
+                        ui.colored_label(GRAY, RichText::new("Desktop notification when a CQ from another country is heard.").small().italics());
+                    }
+                    6 => draw_email_settings(ui, &mut state.settings_form, station_config.email_gate.as_ref()),
+                    5 => {
+                        // RIG tab — grouped like VarAC's: PTT + CAT on the left, frequency control + Hamlib on the right
+                        let group = |ui: &mut egui::Ui, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
+                            theme::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                theme::caption(ui, title);
+                                ui.add_space(2.0);
+                                body(ui);
+                            });
+                            ui.add_space(6.0);
+                        };
+                        ui.columns(2, |cols| {
+                            // ---- PTT Configuration
+                            group(&mut cols[0], "PTT Configuration", &mut |ui| {
+                                let rig_on = state.rig_settings_backend != "none";
+                                ui.add_enabled_ui(rig_on, |ui| {
+                                    ui.radio_value(&mut state.rig_settings_ptt, true, "CAT — key the radio through rig control");
+                                });
+                                ui.radio_value(&mut state.rig_settings_ptt, false, "None — VARA keys the radio (VOX / VARA PTT)");
+                                ui.horizontal(|ui| {
+                                    ui.label("TEST");
+                                    let can = state.rig_connected;
+                                    if ui.add_enabled(can, theme::accent_button("PTT ON", theme::RED)).on_hover_text("Key the transmitter (use a dummy load or a clear frequency)").clicked() {
+                                        state.rig_test_ptt = Some(true);
+                                    }
+                                    if ui.add_enabled(can, egui::Button::new("PTT OFF")).clicked() {
+                                        state.rig_test_ptt = Some(false);
+                                    }
+                                    if state.rig_ptt {
+                                        theme::pill(ui, "TX", theme::TX_RED);
+                                    }
+                                });
+                            });
+
+                            // ---- CAT Configuration
+                            group(&mut cols[0], "CAT Configuration", &mut |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut state.rig_settings_backend, "cat".into(), "COM Port");
+                                    ui.radio_value(&mut state.rig_settings_backend, "rigctld".into(), "TCP (rigctld)");
+                                    ui.radio_value(&mut state.rig_settings_backend, "flrig".into(), "FLRig");
+                                    ui.radio_value(&mut state.rig_settings_backend, "none".into(), "None");
+                                });
+                                if state.rig_settings_backend != "none" {
                                     ui.horizontal(|ui| {
-                                        let shown = state
-                                            .rig_ports
-                                            .iter()
-                                            .find(|p| p.name == state.rig_settings_serial)
-                                            .map_or_else(|| state.rig_settings_serial.clone(), |p| p.label());
-                                        egui::ComboBox::from_id_salt("rig_serial_pick")
-                                            .selected_text(shown)
-                                            .width(320.0)
+                                        ui.label("Radio mode");
+                                        egui::ComboBox::from_id_salt("usb_mode")
+                                            .selected_text(state.settings_form.usb_mode.clone())
                                             .show_ui(ui, |ui| {
-                                                if state.rig_ports.is_empty() {
-                                                    ui.label("No serial ports found");
-                                                }
-                                                for p in state.rig_ports.clone() {
-                                                    ui.selectable_value(&mut state.rig_settings_serial, p.name.clone(), p.label());
+                                                for m in ["USB", "USB-D", "DATA-U", "FM", "FM-D"] {
+                                                    ui.selectable_value(&mut state.settings_form.usb_mode, m.to_string(), m);
                                                 }
                                             });
-                                        if ui.small_button("Rescan").clicked() {
-                                            state.rig_ports = crate::rig::list_serial_ports();
-                                        }
+                                        ui.colored_label(GRAY, RichText::new("set before every frequency change, as in VarAC").small().italics());
                                     });
-                                    ui.end_row();
-                                    ui.label("");
-                                    ui.add(TextEdit::singleline(&mut state.rig_settings_serial).desired_width(230.0).hint_text("/dev/ttyUSB0 or COM5"));
-                                    ui.end_row();
-                                    ui.label("Baud");
-                                    egui::ComboBox::from_id_salt("rig_baud")
-                                        .selected_text(&state.rig_settings_baud)
-                                        .width(100.0)
-                                        .show_ui(ui, |ui| {
-                                            for b in ["4800", "9600", "19200", "38400", "57600", "115200"] {
-                                                ui.selectable_value(&mut state.rig_settings_baud, b.to_string(), b);
+                                }
+                                if state.rig_settings_backend == "cat" {
+                                    egui::Grid::new("cat_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Radio");
+                                        egui::ComboBox::from_id_salt("rig_model")
+                                            .selected_text(match state.rig_settings_model.as_str() {
+                                                "yaesu" => "Yaesu FT-991/891/710, FTDX10/101",
+                                                "kenwood" | "qmx" => "Kenwood / QRP Labs QMX",
+                                                _ => "Yaesu FTDX3000 / FT-950 / FTDX1200",
+                                            })
+                                            .width(230.0)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut state.rig_settings_model, "ftdx3000".into(), "Yaesu FTDX3000 / FT-950 / FTDX1200");
+                                                ui.selectable_value(&mut state.rig_settings_model, "yaesu".into(), "Yaesu FT-991/891/710, FTDX10/101");
+                                                ui.selectable_value(&mut state.rig_settings_model, "kenwood".into(), "Kenwood / QRP Labs QMX");
+                                            });
+                                        ui.end_row();
+                                        ui.label("Port");
+                                        ui.horizontal(|ui| {
+                                            let shown = state
+                                                .rig_ports
+                                                .iter()
+                                                .find(|p| p.name == state.rig_settings_serial)
+                                                .map_or_else(|| state.rig_settings_serial.clone(), |p| p.label());
+                                            egui::ComboBox::from_id_salt("rig_serial_pick")
+                                                .selected_text(shown)
+                                                .width(320.0)
+                                                .show_ui(ui, |ui| {
+                                                    if state.rig_ports.is_empty() {
+                                                        ui.label("No serial ports found");
+                                                    }
+                                                    for p in state.rig_ports.clone() {
+                                                        ui.selectable_value(&mut state.rig_settings_serial, p.name.clone(), p.label());
+                                                    }
+                                                });
+                                            if ui.small_button("Rescan").clicked() {
+                                                state.rig_ports = crate::rig::list_serial_ports();
                                             }
                                         });
-                                    ui.end_row();
-                                });
+                                        ui.end_row();
+                                        ui.label("");
+                                        ui.add(TextEdit::singleline(&mut state.rig_settings_serial).desired_width(230.0).hint_text("/dev/ttyUSB0 or COM5"));
+                                        ui.end_row();
+                                        ui.label("Baud");
+                                        egui::ComboBox::from_id_salt("rig_baud")
+                                            .selected_text(&state.rig_settings_baud)
+                                            .width(100.0)
+                                            .show_ui(ui, |ui| {
+                                                for b in ["4800", "9600", "19200", "38400", "57600", "115200"] {
+                                                    ui.selectable_value(&mut state.rig_settings_baud, b.to_string(), b);
+                                                }
+                                            });
+                                        ui.end_row();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let detecting = state.rig_detect_rx.is_some();
+                                        if ui
+                                            .add_enabled(!detecting, egui::Button::new("Detect radio"))
+                                            .on_hover_text("Asks each serial port for the radio's ID (read-only, never keys the radio) and fills in radio, port and baud")
+                                            .clicked()
+                                        {
+                                            state.rig_detect_requested = true;
+                                        }
+                                        if detecting {
+                                            ui.spinner();
+                                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                                        }
+                                        if let Some(s) = &state.rig_detect_status {
+                                            let color = if s.starts_with("Found") { theme::GREEN } else if detecting { GRAY } else { RED };
+                                            ui.colored_label(color, RichText::new(s).small());
+                                        }
+                                    });
+                                    ui.label(RichText::new("8 data bits, no parity; 2 stop bits for Yaesu, 1 for Kenwood. DTR held low, RTS high for Yaesu (CAT RTS).").small().color(GRAY));
+                                    ui.label(RichText::new("Radios with two serial ports (Yaesu FTDX3000, FT-991, FT-891, FT-710, FTDX10/101) take CAT on the one marked (CAT), the Enhanced port; the other is for PTT/keying. The baud rate is the radio's CAT RATE menu setting.").small().color(GRAY));
+                                } else if state.rig_settings_backend == "rigctld" {
+                                    ui.label(RichText::new("Host and port are set under Hamlib (Rigctld) on the right").small().color(GRAY));
+                                } else if state.rig_settings_backend == "flrig" {
+                                    ui.label(RichText::new("Host and port are set under FLRig on the right").small().color(GRAY));
+                                }
+                            });
+
+                            // ---- Frequency Control (status)
+                            group(&mut cols[1], "Frequency Control", &mut |ui| {
                                 ui.horizontal(|ui| {
-                                    let detecting = state.rig_detect_rx.is_some();
-                                    if ui
-                                        .add_enabled(!detecting, egui::Button::new("Detect radio"))
-                                        .on_hover_text("Asks each serial port for the radio's ID (read-only, never keys the radio) and fills in radio, port and baud")
-                                        .clicked()
-                                    {
-                                        state.rig_detect_requested = true;
+                                    if state.rig_connected {
+                                        theme::status_pill(ui, "Connected", theme::GREEN);
+                                    } else if state.rig_backend != crate::rig::RigBackend::None {
+                                        theme::status_pill(ui, "Not connected", theme::YELLOW);
+                                    } else {
+                                        theme::status_pill(ui, "Off", theme::MUTED);
                                     }
-                                    if detecting {
-                                        ui.spinner();
-                                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                                    }
-                                    if let Some(s) = &state.rig_detect_status {
-                                        let color = if s.starts_with("Found") { theme::GREEN } else if detecting { GRAY } else { RED };
-                                        ui.colored_label(color, RichText::new(s).small());
-                                    }
+                                    ui.label(format!("{}", state.rig_backend));
                                 });
-                                ui.label(RichText::new("8 data bits, no parity; 2 stop bits for Yaesu, 1 for Kenwood. DTR held low, RTS high for Yaesu (CAT RTS).").small().color(GRAY));
-                                ui.label(RichText::new("Radios with two serial ports (Yaesu FTDX3000, FT-991, FT-891, FT-710, FTDX10/101) take CAT on the one marked (CAT), the Enhanced port; the other is for PTT/keying. The baud rate is the radio's CAT RATE menu setting.").small().color(GRAY));
-                            } else if state.rig_settings_backend == "rigctld" {
-                                ui.label(RichText::new("Host and port are set under Hamlib (Rigctld) on the right").small().color(GRAY));
-                            } else if state.rig_settings_backend == "flrig" {
-                                ui.label(RichText::new("Host and port are set under FLRig on the right").small().color(GRAY));
-                            }
-                        });
-
-                        // ---- Frequency Control (status)
-                        group(&mut cols[1], "Frequency Control", &mut |ui| {
-                            ui.horizontal(|ui| {
                                 if state.rig_connected {
-                                    theme::status_pill(ui, "Connected", theme::GREEN);
-                                } else if state.rig_backend != crate::rig::RigBackend::None {
-                                    theme::status_pill(ui, "Not connected", theme::YELLOW);
-                                } else {
-                                    theme::status_pill(ui, "Off", theme::MUTED);
+                                    if let Some(f) = state.rig_freq {
+                                        ui.label(RichText::new(format!("{:.3} kHz", f as f64 / 1000.0)).monospace().size(18.0));
+                                    }
+                                    if let Some(m) = state.rig_mode {
+                                        ui.label(format!("Mode: {m}"));
+                                    }
+                                    ui.label(RichText::new("Frequency is read every 1.5 s; band changes and accepted QSYs tune the radio.").small().color(GRAY));
+                                } else if let Some(ref e) = state.rig_error {
+                                    ui.colored_label(RED, RichText::new(e).small());
                                 }
-                                ui.label(format!("{}", state.rig_backend));
-                            });
-                            if state.rig_connected {
-                                if let Some(f) = state.rig_freq {
-                                    ui.label(RichText::new(format!("{:.3} kHz", f as f64 / 1000.0)).monospace().size(18.0));
+                                ui.add_space(4.0);
+                                if ui.add(theme::accent_button("TEST / Apply & reconnect", CYAN)).clicked() {
+                                    state.rig_reconnect_requested = true;
                                 }
-                                if let Some(m) = state.rig_mode {
-                                    ui.label(format!("Mode: {m}"));
-                                }
-                                ui.label(RichText::new("Frequency is read every 1.5 s; band changes and accepted QSYs tune the radio.").small().color(GRAY));
-                            } else if let Some(ref e) = state.rig_error {
-                                ui.colored_label(RED, RichText::new(e).small());
-                            }
-                            ui.add_space(4.0);
-                            if ui.add(theme::accent_button("TEST / Apply & reconnect", CYAN)).clicked() {
-                                state.rig_reconnect_requested = true;
-                            }
-                        });
-
-                        // ---- Hamlib (Rigctld)
-                        group(&mut cols[1], "Hamlib (Rigctld) / RigHelm", &mut |ui| {
-                            ui.add_enabled_ui(state.rig_settings_backend == "rigctld", |ui| {
-                                egui::Grid::new("rigctld_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                                    ui.label("Host");
-                                    ui.add(TextEdit::singleline(&mut state.rig_settings_host).desired_width(160.0));
-                                    ui.end_row();
-                                    ui.label("Port");
-                                    ui.horizontal(|ui| {
-                                        ui.add(TextEdit::singleline(&mut state.rig_settings_port).desired_width(60.0));
-                                        if ui.small_button("Default 4532").clicked() {
-                                            state.rig_settings_host = "127.0.0.1".into();
-                                            state.rig_settings_port = "4532".into();
-                                        }
-                                    });
-                                    ui.end_row();
-                                });
                             });
-                            ui.label(RichText::new("RigHelm: enable its rigctld server (Settings > Ports & sharing). It drives ~30 Yaesu, Icom, Kenwood and Elecraft radios and shares the CAT port with WSJT-X and others.").small().color(GRAY));
-                        });
 
-                        // ---- FLRig (XML-RPC)
-                        group(&mut cols[1], "FLRig", &mut |ui| {
-                            ui.add_enabled_ui(state.rig_settings_backend == "flrig", |ui| {
-                                egui::Grid::new("flrig_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                                    ui.label("Host");
-                                    ui.add(TextEdit::singleline(&mut state.rig_settings_host).desired_width(160.0));
-                                    ui.end_row();
-                                    ui.label("Port");
-                                    ui.horizontal(|ui| {
-                                        ui.add(TextEdit::singleline(&mut state.rig_settings_port).desired_width(60.0));
-                                        if ui.small_button("Default 12345").clicked() {
-                                            state.rig_settings_host = "127.0.0.1".into();
-                                            state.rig_settings_port = "12345".into();
-                                        }
+                            // ---- Hamlib (Rigctld)
+                            group(&mut cols[1], "Hamlib (Rigctld) / RigHelm", &mut |ui| {
+                                ui.add_enabled_ui(state.rig_settings_backend == "rigctld", |ui| {
+                                    egui::Grid::new("rigctld_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Host");
+                                        ui.add(TextEdit::singleline(&mut state.rig_settings_host).desired_width(160.0));
+                                        ui.end_row();
+                                        ui.label("Port");
+                                        ui.horizontal(|ui| {
+                                            ui.add(TextEdit::singleline(&mut state.rig_settings_port).desired_width(60.0));
+                                            if ui.small_button("Default 4532").clicked() {
+                                                state.rig_settings_host = "127.0.0.1".into();
+                                                state.rig_settings_port = "4532".into();
+                                            }
+                                        });
+                                        ui.end_row();
                                     });
-                                    ui.end_row();
                                 });
+                                ui.label(RichText::new("RigHelm: enable its rigctld server (Settings > Ports & sharing). It drives ~30 Yaesu, Icom, Kenwood and Elecraft radios and shares the CAT port with WSJT-X and others.").small().color(GRAY));
                             });
-                            ui.label(RichText::new("FLRig's XML-RPC server: frequency, mode, PTT and the antenna tuner, as VarAC uses it.").small().color(GRAY));
-                        });
 
-                        // ---- Antenna rotator (PstRotator)
-                        group(&mut cols[1], "Antenna rotator (PstRotator)", &mut |ui| {
-                            let f = &mut state.settings_form;
-                            ui.checkbox(&mut f.rotator_enabled, "Turn the antenna with \"Rotate Antenna\" in the beacon and CQ menus");
-                            ui.add_enabled_ui(f.rotator_enabled, |ui| {
-                                egui::Grid::new("rotator_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                                    ui.label("Host");
-                                    ui.add(TextEdit::singleline(&mut f.rotator_host).desired_width(160.0));
-                                    ui.end_row();
-                                    ui.label("UDP port");
-                                    ui.horizontal(|ui| {
-                                        ui.add(TextEdit::singleline(&mut f.rotator_port).desired_width(60.0));
-                                        if ui.small_button("Default 12000").clicked() {
-                                            f.rotator_host = "127.0.0.1".into();
-                                            f.rotator_port = "12000".into();
-                                        }
+                            // ---- FLRig (XML-RPC)
+                            group(&mut cols[1], "FLRig", &mut |ui| {
+                                ui.add_enabled_ui(state.rig_settings_backend == "flrig", |ui| {
+                                    egui::Grid::new("flrig_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Host");
+                                        ui.add(TextEdit::singleline(&mut state.rig_settings_host).desired_width(160.0));
+                                        ui.end_row();
+                                        ui.label("Port");
+                                        ui.horizontal(|ui| {
+                                            ui.add(TextEdit::singleline(&mut state.rig_settings_port).desired_width(60.0));
+                                            if ui.small_button("Default 12345").clicked() {
+                                                state.rig_settings_host = "127.0.0.1".into();
+                                                state.rig_settings_port = "12345".into();
+                                            }
+                                        });
+                                        ui.end_row();
                                     });
-                                    ui.end_row();
                                 });
+                                ui.label(RichText::new("FLRig's XML-RPC server: frequency, mode, PTT and the antenna tuner, as VarAC uses it.").small().color(GRAY));
                             });
-                            ui.label(RichText::new("PstRotator drives the rotator; turn on its UDP control. The bearing is worked out from your locator (Settings › Station) and the station's. Applies after Save.").small().color(GRAY));
+
+                            // ---- Antenna rotator (PstRotator)
+                            group(&mut cols[1], "Antenna rotator (PstRotator)", &mut |ui| {
+                                let f = &mut state.settings_form;
+                                ui.checkbox(&mut f.rotator_enabled, "Turn the antenna with \"Rotate Antenna\" in the beacon and CQ menus");
+                                ui.add_enabled_ui(f.rotator_enabled, |ui| {
+                                    egui::Grid::new("rotator_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Host");
+                                        ui.add(TextEdit::singleline(&mut f.rotator_host).desired_width(160.0));
+                                        ui.end_row();
+                                        ui.label("UDP port");
+                                        ui.horizontal(|ui| {
+                                            ui.add(TextEdit::singleline(&mut f.rotator_port).desired_width(60.0));
+                                            if ui.small_button("Default 12000").clicked() {
+                                                f.rotator_host = "127.0.0.1".into();
+                                                f.rotator_port = "12000".into();
+                                            }
+                                        });
+                                        ui.end_row();
+                                    });
+                                });
+                                ui.label(RichText::new("PstRotator drives the rotator; turn on its UDP control. The bearing is worked out from your locator (Settings › Station) and the station's. Applies after Save.").small().color(GRAY));
+                            });
                         });
-                    });
+                    }
+                    7 => features::draw_ai_settings(ui, &mut state.settings_form),
+                    _ => {}
                 }
-                7 => features::draw_ai_settings(ui, &mut state.settings_form),
-                _ => {}
-            }
+            });
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -10285,6 +10371,20 @@ pub fn run_gui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our VMail frame becomes a chat line (subject, addressee when relayed, start of the
+    /// text); anything else isn't one.
+    #[test]
+    fn vmail_frames_as_chat_lines() {
+        assert_eq!(
+            vmail_chat_text("<SM><SBJ:new client><MSG:hi «there»\r\nline two>").as_deref(),
+            Some("VMail: new client\nhi <there>\nline two")
+        );
+        assert_eq!(vmail_chat_text("<SM><TO:W1AW><SBJ:relay><MSG:>").as_deref(), Some("VMail to W1AW: relay"));
+        let long = format!("<SM><SBJ:s><MSG:{}>", "x".repeat(400));
+        assert!(vmail_chat_text(&long).unwrap().ends_with("x…"));
+        assert_eq!(vmail_chat_text("hello <SM>"), None);
+    }
 
     /// VarAC's compose rules: several callsigns with commas, one email, reply quoting.
     #[test]

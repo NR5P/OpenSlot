@@ -189,18 +189,69 @@ pub fn status_pill(ui: &mut egui::Ui, label: &str, color: Color32) -> egui::Resp
 }
 
 /// Button filled with a translucent accent and colored label.
-pub fn accent_button(text: impl Into<RichText>, color: Color32) -> egui::Button<'static> {
-    egui::Button::new(text.into().color(color).strong())
-        .fill(tint(color, 30))
-        .stroke(Stroke::new(1.0_f32, tint(color, 110)))
-        .rounding(Rounding::same(6.0))
+pub fn accent_button(text: impl Into<RichText>, color: Color32) -> ColorButton {
+    ColorButton::shaded(
+        egui::Button::new(text.into().color(color).strong())
+            .fill(tint(color, 30))
+            .stroke(Stroke::new(1.0_f32, tint(color, 110)))
+            .rounding(Rounding::same(6.0)),
+    )
 }
 
 /// Solid primary button (call to action).
-pub fn primary_button(text: impl Into<RichText>, color: Color32) -> egui::Button<'static> {
-    egui::Button::new(text.into().color(Color32::from_rgb(8, 12, 20)).strong())
-        .fill(color)
-        .rounding(Rounding::same(6.0))
+pub fn primary_button(text: impl Into<RichText>, color: Color32) -> ColorButton {
+    ColorButton::shaded(
+        egui::Button::new(text.into().color(Color32::from_rgb(8, 12, 20)).strong())
+            .fill(color)
+            .rounding(Rounding::same(6.0)),
+    )
+}
+
+/// A button with a fill of its own (accent_button, primary_button). egui paints such a fill
+/// the same idle, hovered and held down, so a click on one looked like nothing happened:
+/// lighter under the pointer, darker while pressed, and the pointing hand.
+/// (A plain egui::Button converts, for an `if` that picks one or the other: it keeps egui's own
+/// hover and press look.)
+pub struct ColorButton(egui::Button<'static>, bool);
+
+impl ColorButton {
+    fn shaded(b: egui::Button<'static>) -> Self {
+        Self(b, true)
+    }
+
+    pub fn wrap_mode(self, mode: egui::TextWrapMode) -> Self {
+        Self(self.0.wrap_mode(mode), self.1)
+    }
+
+    pub fn small(self) -> Self {
+        Self(self.0.small(), self.1)
+    }
+}
+
+impl From<egui::Button<'static>> for ColorButton {
+    fn from(b: egui::Button<'static>) -> Self {
+        Self(b, false)
+    }
+}
+
+impl egui::Widget for ColorButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let r = ui.add(self.0);
+        if !self.1 || !r.enabled() {
+            return r;
+        }
+        let shade = if r.is_pointer_button_down_on() {
+            Some(Color32::from_black_alpha(70))
+        } else if r.hovered() {
+            Some(Color32::from_white_alpha(24))
+        } else {
+            None
+        };
+        if let Some(c) = shade {
+            ui.painter().rect_filled(r.rect, Rounding::same(6.0), c);
+        }
+        r.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
 }
 
 /// Uppercase muted caption used above groups of controls.

@@ -18,6 +18,8 @@
 use super::*;
 
 const SIDE_COL_W: f32 = 176.0;
+/// The right-hand column in a window too short for it (see draw_side_column)
+const SIDE_COL_W_COMPACT: f32 = 280.0;
 const CONTROL_COL_W: f32 = 320.0;
 
 /// Draws everything except the menu bar and modal windows.
@@ -39,18 +41,31 @@ pub(super) fn draw_main_window(
 
     draw_status_bar(ctx, state);
 
-    // Top section: controls | beacons | CQ calls
+    // Top section: controls | beacons | CQ calls. Never lower than its controls need (it cut
+    // them off), and, dragged or remembered taller, never more than leaves the right-hand
+    // column below the room it needs in its compact form (both measured last frame).
+    let data = |id: &str, or: f32| ctx.data(|d| d.get_temp::<f32>(egui::Id::new(id))).unwrap_or(or);
+    // (below it: the column, and beside it the message box with a chat no lower than its least)
+    let top_min = data(TOP_NEED_H, 200.0).max(200.0);
+    let composer_h = egui::containers::panel::PanelState::load(ctx, egui::Id::new("composer")).map_or(0.0, |p| p.rect.height());
+    let below = (data(SIDE_NEED_COMPACT, 0.0) + SIDE_PANEL_MARGIN_Y).max(composer_h + SPLIT_BAR_H + CHAT_MIN_H + 8.0);
+    let top_max = (ctx.available_rect().height() - below).max(top_min);
     egui::TopBottomPanel::top("top_section")
         .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 10.0, top: 8.0, bottom: 4.0 }))
         .resizable(true)
-        .default_height(236.0)
-        .min_height(200.0)
+        .default_height(236.0_f32.clamp(top_min, top_max))
+        .min_height(top_min)
+        .max_height(top_max)
         .show_separator_line(false)
         .show(ctx, |ui| {
             let h = ui.available_height();
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(CONTROL_COL_W, h), Layout::top_down(Align::LEFT), |ui| {
                     band_changed = draw_control_column(ui, state, db);
+                    // (+ the frame's margins, and clear of the resize handle along the
+                    // bottom edge: it took clicks on the last row's buttons)
+                    let need = ui.min_rect().height() + 12.0 + ui.style().interaction.resize_grab_radius_side;
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(TOP_NEED_H), need));
                 });
                 let w = ((ui.available_width() - 8.0) / 2.0).max(100.0);
                 ui.allocate_ui_with_layout(Vec2::new(w, h), Layout::top_down(Align::LEFT), |ui| draw_beacons_card(ui, state, db));
@@ -61,12 +76,15 @@ pub(super) fn draw_main_window(
     // One right-hand column from the broadcasts down to the QSO row, as in VarAC:
     // options, then QSY / VMail / broadcast / file / path finder / in-QSO requests.
     // Everything in it fits without scrolling (the window's minimum height allows for it).
+    // Too short for VarAC's one-per-row column (a 768 px screen, with the Linux app's modem
+    // bar): wider, with its options, buttons and in-QSO requests side by side
+    let compact = ctx.available_rect().height() - SIDE_PANEL_MARGIN_Y < data(SIDE_NEED_FULL, 0.0);
     egui::SidePanel::right("side_column")
-        .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 0.0, right: 10.0, top: 4.0, bottom: 8.0 }))
-        .exact_width(SIDE_COL_W + 10.0)
+        .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 0.0, right: 10.0, top: 4.0, bottom: SIDE_PANEL_MARGIN_Y - 4.0 }))
+        .exact_width(if compact { SIDE_COL_W_COMPACT } else { SIDE_COL_W } + 10.0)
         .resizable(false)
         .show_separator_line(false)
-        .show(ctx, |ui| draw_side_column(ui, state));
+        .show(ctx, |ui| draw_side_column(ui, state, compact));
 
     // QSO log row + message box (bottom, like VarAC), left of the column's LOG / SEND
     egui::TopBottomPanel::bottom("composer")
@@ -86,7 +104,8 @@ pub(super) fn draw_main_window(
     // (a laptop screen leaves the chat barely two lines otherwise)
     let default_bc = if screen.height() < 760.0 { 64.0 } else { 96.0 };
     egui::CentralPanel::default()
-        .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 8.0, top: 4.0, bottom: 4.0 }))
+        // (top: clear of the top section's resize handle, which took clicks on the bar below)
+        .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 8.0, top: 6.0, bottom: 4.0 }))
         .show(ctx, |ui| {
             match (state.broadcasts_window_open, state.chat_window_open) {
                 (false, false) => draw_chat_split(ui, state, default_bc),
@@ -225,10 +244,8 @@ fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso
                 if ui.add_sized([120.0, 30.0], theme::primary_button("SEND", theme::GREEN)).clicked() {
                     state.send_requested = true;
                 }
-                if matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect)
-                    && ui.add_sized([120.0, 30.0], theme::accent_button("DISCONNECT", theme::RED)).clicked()
-                {
-                    state.send_cmd(GuiCommand::Disconnect);
+                if matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect) {
+                    disconnect_button(ui, state, Vec2::new(120.0, 30.0));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add_sized([120.0, 30.0], egui::Button::new("Shrink back"))
@@ -478,7 +495,7 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
                 let rig_ok = state.rig_backend != crate::rig::RigBackend::None;
                 let mode = state.freq_mode;
                 let text = if rig_ok { mode.button() } else { "FREQ SCHEDULE N/A" };
-                let b = if mode == Mode::Inactive { egui::Button::new(text) } else { theme::accent_button(text, theme::YELLOW) };
+                let b = if mode == Mode::Inactive { egui::Button::new(text).into() } else { theme::accent_button(text, theme::YELLOW) };
                 let r = ui.add_enabled(rig_ok, b.small())
                     .on_hover_text("Frequency scheduler / scanner. Right-click to edit the lists.");
                 if r.clicked() {
@@ -601,9 +618,7 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
         draw_callsign_box(ui, state, db);
         let in_qso = matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect);
         if in_qso {
-            if ui.add_sized(full_width(ui), theme::accent_button("DISCONNECT", theme::RED)).clicked() {
-                state.send_cmd(GuiCommand::Disconnect);
-            }
+            disconnect_button(ui, state, full_width(ui));
         } else if ui.add_sized(full_width(ui), theme::primary_button("CONNECT", theme::ACCENT)).clicked() {
             try_connect(state);
         }
@@ -808,6 +823,21 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
         state.send_cmd(GuiCommand::TuneStop);
         state.tune_window = false;
         state.tune_busy = false;
+    }
+}
+
+/// DISCONNECT, then DISCONNECTING… while the link closes (a few seconds: the partner's QRT,
+/// the modem's DISCONNECTED), so the click shows. Pressed again, the link is dropped at once.
+fn disconnect_button(ui: &mut egui::Ui, state: &mut GuiState, size: Vec2) {
+    if state.session_state == SessionState::AwaitingDisconnect {
+        if ui.add_sized(size, theme::accent_button("DISCONNECTING…", theme::YELLOW))
+            .on_hover_text("The link is closing. Click to drop it now (ABORT).")
+            .clicked()
+        {
+            state.send_cmd(GuiCommand::Abort);
+        }
+    } else if ui.add_sized(size, theme::accent_button("DISCONNECT", theme::RED)).clicked() {
+        state.send_cmd(GuiCommand::Disconnect);
     }
 }
 
@@ -1269,16 +1299,37 @@ fn draw_broadcasts_card(ui: &mut egui::Ui, state: &mut GuiState) {
                 if !state.broadcasts.is_empty() && ui.small_button("Clear").clicked() {
                     state.broadcasts.clear();
                 }
+                // Search, as the chat's: a filter on callsign, message, addressee and via
+                if ui.small_button(if state.broadcast_search_active { "X" } else { "Search" }).clicked() {
+                    state.broadcast_search_active = !state.broadcast_search_active;
+                    if !state.broadcast_search_active {
+                        state.broadcast_search.clear();
+                    }
+                }
+                if state.broadcast_search_active {
+                    ui.add(TextEdit::singleline(&mut state.broadcast_search).desired_width(120.0).hint_text("Filter..."));
+                }
             });
         });
+        let filter = state.broadcast_search.trim().to_lowercase();
+        let filter = (state.broadcast_search_active && !filter.is_empty()).then_some(filter);
         ScrollArea::vertical()
             .id_salt("bc_scroll")
             .max_height((ui.available_height() - 4.0).max(20.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                let bc_snapshot: Vec<_> = state.broadcasts.iter().rev().take(50)
+                // (the newest 50 of those that match: a search reaches back past what's shown)
+                let bc_snapshot: Vec<_> = state.broadcasts.iter().rev()
+                    .filter(|bc| filter.as_ref().is_none_or(|f| {
+                        [&bc.from, &bc.message, &bc.to].iter().any(|s| s.to_lowercase().contains(f))
+                            || bc.via.as_ref().is_some_and(|v| v.to_lowercase().contains(f))
+                    }))
+                    .take(50)
                     .map(|bc| (bc.time.clone(), bc.from.clone(), bc.message.clone(), bc.to.clone(), bc.via.clone(), bc.qsy_hz, bc.alert))
                     .collect();
+                if bc_snapshot.is_empty() && filter.is_some() && !state.broadcasts.is_empty() {
+                    ui.label(RichText::new("No broadcasts match").small().italics().color(theme::MUTED));
+                }
                 for (time, from, message, to, via, qsy_hz, alert) in &bc_snapshot {
                     let resp = ui.horizontal(|ui| {
                         ui.label(RichText::new(time).small().monospace().color(theme::MUTED));
@@ -1342,22 +1393,39 @@ fn draw_broadcasts_card(ui: &mut egui::Ui, state: &mut GuiState) {
 // ---------------------------------------------------------------- right-hand column
 
 const BTN_H: f32 = 24.0;
+/// egui temp data, measured last frame: the height the top section's controls need, and the
+/// least height the right-hand column can live with, laid out one per row or compact
+const TOP_NEED_H: &str = "top_section_need_h";
+const SIDE_NEED_FULL: &str = "side_column_need_full";
+const SIDE_NEED_COMPACT: &str = "side_column_need_compact";
+/// The side panel's frame, top and bottom
+const SIDE_PANEL_MARGIN_Y: f32 = 12.0;
 
 /// VarAC's right-hand column, top to bottom: the options ("Send 'is typing'", "I'm away"…),
 /// QSY, SEND VMAIL, BROADCAST, SEND FILE, PATH FINDER, SNR | INFO; and at the bottom,
 /// Auto log QSO, LOG, the canned messages, Enter to send and SEND. Nothing in it scrolls.
-fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
+///
+/// `compact` (a window too short for that, the column wider): the options two by two, the
+/// buttons three to a row, the in-QSO requests on one row and Auto log QSO beside LOG.
+fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState, compact: bool) {
     let connected = state.session_state == SessionState::Connected;
-    // Height of the LOG … SEND group at the bottom, measured last frame
-    let bottom_id = ui.id().with("side_bottom_h");
-    let bottom_h = ui.ctx().data(|d| d.get_temp::<f32>(bottom_id)).unwrap_or(140.0);
+    // Heights measured last frame, for each layout: the options card, and the LOG … SEND
+    // group at the bottom (guesses until each has been drawn once)
+    let measured = |ui: &egui::Ui, what: &str, compact: bool, or: f32| {
+        ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new((what, compact)))).unwrap_or(or)
+    };
+    let bottom_id = egui::Id::new(("side_bottom_h", compact));
+    let bottom_h = measured(ui, "side_bottom_h", compact, if compact { 112.0 } else { 140.0 });
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
     ui.spacing_mut().button_padding.x = 4.0;
     let w = ui.available_width();
     let half = Vec2::new((w - 4.0) / 2.0, BTN_H);
     let label = |text: &str| RichText::new(text).size(12.5);
 
-    draw_options_card(ui, state);
+    let column_top = ui.cursor().top();
+    draw_options_card(ui, state, compact);
+    let options_h = ui.cursor().top() - column_top;
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("side_options_h", compact)), options_h));
     ui.add_space(4.0);
 
     // Offers waiting on an answer go first, where the eye already is
@@ -1398,15 +1466,31 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
     let rows_fit = (spare / row).floor().max(0.0) as usize;
     let pairs = SIDE_BUTTONS.saturating_sub(rows_fit).min(SIDE_BUTTONS / 2);
     let singles = SIDE_BUTTONS - 2 * pairs;
+    // The least each layout can live with (options, offers waiting, its rows at their lowest,
+    // the bottom group): which one to use, and how tall the top section may get
+    let emcomm = if state.settings_form.emcomm_mode { 1.0 } else { 0.0 };
+    let offers_h = ui.cursor().top() - column_top - options_h;
+    let need = |compact: bool, rows: f32| {
+        measured(ui, "side_options_h", compact, if compact { 60.0 } else { 100.0 }) + offers_h
+            + rows * (18.0 + 4.0) + measured(ui, "side_bottom_h", compact, if compact { 112.0 } else { 140.0 }) + 4.0
+    };
+    let (rows_full, rows_compact) = ((SIDE_BUTTONS / 2) as f32 + 2.0 + emcomm, (SIDE_BUTTONS / 3) as f32 + 1.0 + emcomm);
+    let (need_full, need_compact) = (need(false, rows_full), need(true, rows_compact));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(egui::Id::new(SIDE_NEED_FULL), need_full);
+        d.insert_temp(egui::Id::new(SIDE_NEED_COMPACT), need_compact);
+    });
     // Still short with everything paired (a 768 px screen): make these rows lower rather
     // than run into LOG / SEND below, by the overlap measured last frame
-    let rows = (singles + pairs) as f32 + 2.0 + if state.settings_form.emcomm_mode { 1.0 } else { 0.0 };
+    let rows = if compact { rows_compact } else { (singles + pairs) as f32 + 2.0 + emcomm };
     let shrink_id = ui.id().with("side_shrink");
     let shrink = ui.ctx().data(|d| d.get_temp::<f32>(shrink_id)).unwrap_or(0.0);
     let base = ui.spacing().interact_size.y;
     let bh = (base - shrink).clamp(18.0, base);
     let full = Vec2::new(w, bh);
     let half = Vec2::new((w - 4.0) / 2.0, bh);
+    let third = Vec2::new((w - 8.0) / 3.0, bh);
+    let quarter = Vec2::new((w - 12.0) / 4.0, bh);
     // (a horizontal row is at least interact_size high, whatever its buttons ask for)
     let (saved_interact, saved_pad) = (ui.spacing().interact_size.y, ui.spacing().button_padding.y);
     ui.spacing_mut().interact_size.y = bh;
@@ -1428,31 +1512,44 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
             }
         }
     }
-    for i in 0..singles {
-        side_button(ui, state, i, full, connected);
-    }
-    for i in (singles..SIDE_BUTTONS).step_by(2) {
-        ui.horizontal(|ui| {
-            side_button(ui, state, i, half, connected);
-            side_button(ui, state, i + 1, half, connected);
-        });
+    if compact {
+        for i in (0..SIDE_BUTTONS).step_by(3) {
+            ui.horizontal(|ui| {
+                for k in i..(i + 3).min(SIDE_BUTTONS) {
+                    side_button(ui, state, k, third, connected);
+                }
+            });
+        }
+    } else {
+        for i in 0..singles {
+            side_button(ui, state, i, full, connected);
+        }
+        for i in (singles..SIDE_BUTTONS).step_by(2) {
+            ui.horizontal(|ui| {
+                side_button(ui, state, i, half, connected);
+                side_button(ui, state, i + 1, half, connected);
+            });
+        }
     }
 
-    // In-QSO requests, paired as in VarAC (SNR | INFO, LH.P | FS.P)
-    ui.horizontal(|ui| {
-        if centered_button(ui, connected, half, label("SNR"))
+    // In-QSO requests, paired as in VarAC (SNR | INFO, LH.P | FS.P); compact, all four on a row
+    let req = if compact { quarter } else { half };
+    let snr = |ui: &mut egui::Ui, state: &mut GuiState| {
+        if centered_button(ui, connected, req, label("SNR"))
             .on_hover_text("Ask for a signal report").clicked()
         {
             state.send_cmd(GuiCommand::SnrRequest);
         }
-        if centered_button(ui, connected, half, label("INFO"))
+    };
+    let info = |ui: &mut egui::Ui, state: &mut GuiState| {
+        if centered_button(ui, connected, req, label("INFO"))
             .on_hover_text("Ask for their station info").clicked()
         {
             state.send_cmd(GuiCommand::InfoRequest);
         }
-    });
-    ui.horizontal(|ui| {
-        if centered_button(ui, connected, half, label("BBS LIST"))
+    };
+    let bbs = |ui: &mut egui::Ui, state: &mut GuiState| {
+        if centered_button(ui, connected, req, label("BBS LIST"))
             .on_hover_text("List the messages on their BBS").clicked()
         {
             match state.bbs_refusal(false) {
@@ -1460,9 +1557,11 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
                 None => state.send_cmd(GuiCommand::RequestBbsList),
             }
         }
+    };
+    let inquire = |ui: &mut egui::Ui, state: &mut GuiState| {
         // VarAC's INQUIRE window, as a menu: questions the partner's VarAC answers itself
         ui.add_enabled_ui(connected, |ui| {
-            egui::menu::menu_custom_button(ui, egui::Button::new(label("INQUIRE…")).min_size(half), |ui| {
+            egui::menu::menu_custom_button(ui, egui::Button::new(label("INQUIRE…")).min_size(req), |ui| {
                 let ask = |ui: &mut egui::Ui, label: &str, tip: &str, tag: String| {
                     if ui.button(label).on_hover_text(tip).clicked() {
                         state.send_cmd(GuiCommand::SendInquiry(tag));
@@ -1486,7 +1585,24 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
                 }
             });
         });
-    });
+    };
+    if compact {
+        ui.horizontal(|ui| {
+            snr(ui, state);
+            info(ui, state);
+            bbs(ui, state);
+            inquire(ui, state);
+        });
+    } else {
+        ui.horizontal(|ui| {
+            snr(ui, state);
+            info(ui, state);
+        });
+        ui.horizontal(|ui| {
+            bbs(ui, state);
+            inquire(ui, state);
+        });
+    }
 
     ui.spacing_mut().interact_size.y = saved_interact;
     ui.spacing_mut().button_padding.y = saved_pad;
@@ -1526,17 +1642,30 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState) {
                 }
             });
         let tip = if state.unlogged_qso.is_some() { "Write this QSO to the log" } else { "Open the QSO log" };
-        let log_btn = if state.unlogged_qso.is_some() { theme::accent_button(label("LOG QSO"), theme::GREEN) } else { egui::Button::new(label("LOG")) };
-        if ui.add_sized(full, log_btn).on_hover_text(tip).clicked() {
-            if state.unlogged_qso.is_some() {
-                state.log_qso_requested = true;
-            } else {
-                state.qso_log_open = true;
+        let log_btn = if state.unlogged_qso.is_some() { theme::accent_button(label("LOG QSO"), theme::GREEN) } else { egui::Button::new(label("LOG")).into() };
+        let log_row = |ui: &mut egui::Ui, size: Vec2, state: &mut GuiState| {
+            if ui.add_sized(size, log_btn).on_hover_text(tip).clicked() {
+                if state.unlogged_qso.is_some() {
+                    state.log_qso_requested = true;
+                } else {
+                    state.qso_log_open = true;
+                }
             }
-        }
-        ui.spacing_mut().interact_size.y = 20.0;
-        if ui.checkbox(&mut state.auto_log_qso, label("Auto log QSO")).changed() {
-            state.settings_form.auto_log_qso = state.auto_log_qso;
+        };
+        let auto_log = |ui: &mut egui::Ui, state: &mut GuiState| {
+            if ui.checkbox(&mut state.auto_log_qso, label("Auto log QSO")).changed() {
+                state.settings_form.auto_log_qso = state.auto_log_qso;
+            }
+        };
+        if compact {
+            ui.horizontal(|ui| {
+                log_row(ui, Vec2::new((w - 4.0) / 2.0, BTN_H), state);
+                auto_log(ui, state);
+            });
+        } else {
+            log_row(ui, full, state);
+            ui.spacing_mut().interact_size.y = 20.0;
+            auto_log(ui, state);
         }
     });
     ui.ctx().data_mut(|d| d.insert_temp(bottom_id, bottom.response.rect.height()));
@@ -1593,7 +1722,7 @@ fn side_button(ui: &mut egui::Ui, state: &mut GuiState, i: usize, size: Vec2, co
         }
         3 => {
             let text = if state.unread_vmails > 0 { format!("VMAIL ({})", state.unread_vmails) } else { "VMAIL".into() };
-            let btn = if state.unread_vmails > 0 { theme::accent_button(label(&text), theme::YELLOW) } else { egui::Button::new(label(&text)) };
+            let btn = if state.unread_vmails > 0 { theme::accent_button(label(&text), theme::YELLOW) } else { egui::Button::new(label(&text)).into() };
             if ui.add_sized(size, btn).on_hover_text("VMail folders").clicked() {
                 state.vmail_window_open = !state.vmail_window_open;
             }
@@ -1613,18 +1742,61 @@ fn side_button(ui: &mut egui::Ui, state: &mut GuiState, i: usize, size: Vec2, co
 }
 
 /// The option checkboxes at the top of VarAC's right-hand column.
-fn draw_options_card(ui: &mut egui::Ui, state: &mut GuiState) {
+/// (compact: two by two, the away message under them)
+fn draw_options_card(ui: &mut egui::Ui, state: &mut GuiState, compact: bool) {
     theme::card().inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.spacing_mut().interact_size.y = 20.0;
         let label = |text: &str| RichText::new(text).size(12.5);
-
-        ui.checkbox(&mut state.is_typing_enabled, label("Send 'is typing'"));
+        let cell = Vec2::new((ui.available_width() - 4.0) / 2.0, 20.0);
+        // One option: a row of its own, or a cell of the two-by-two grid
+        let option = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            if compact {
+                // (a full half each, so the second column lines up)
+                ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(cell.x);
+                    add(ui);
+                });
+            } else {
+                add(ui);
+            }
+        };
         let was_away = state.away_active;
-        ui.checkbox(&mut state.away_active, label("I'm away"));
-        if state.away_active {
-            ui.add(TextEdit::singleline(&mut state.away_message).desired_width(f32::INFINITY).hint_text("Away message"));
+        let unattended_was = state.unattended_links;
+        let connected = state.session_state == SessionState::Connected;
+        let mut vsnr = state.verbose_snr;
+        let mut vsnr_changed = false;
+        let mut grid = |ui: &mut egui::Ui| {
+            option(ui, &mut |ui| {
+                ui.checkbox(&mut state.is_typing_enabled, label("Send 'is typing'"));
+            });
+            option(ui, &mut |ui| {
+                ui.checkbox(&mut state.away_active, label("I'm away"));
+            });
+            if !compact && state.away_active {
+                ui.add(TextEdit::singleline(&mut state.away_message).desired_width(f32::INFINITY).hint_text("Away message"));
+            }
+            option(ui, &mut |ui| {
+                ui.checkbox(&mut state.unattended_links, label("Unattended links"))
+                    .on_hover_text("While away, the radio may answer links and send automatic replies (beacons are always allowed)");
+            });
+            option(ui, &mut |ui| {
+                vsnr_changed = ui.add_enabled(connected || vsnr, egui::Checkbox::new(&mut vsnr, label("Verbose SNR")))
+                    .on_hover_text("Exchange SNR reports every minute with your partner (invites them with <VSI>)")
+                    .changed();
+            });
+        };
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+                grid(ui);
+            });
+            if state.away_active {
+                ui.add(TextEdit::singleline(&mut state.away_message).desired_width(f32::INFINITY).hint_text("Away message"));
+            }
+        } else {
+            grid(ui);
         }
         if state.away_active != was_away {
             // (VarAC: away counts as idle for the auto-away time; back counts as activity)
@@ -1641,20 +1813,12 @@ fn draw_options_card(ui: &mut egui::Ui, state: &mut GuiState) {
                 state.send_cmd(GuiCommand::SetAway(None));
             }
         }
-        if ui.checkbox(&mut state.unattended_links, label("Unattended links"))
-            .on_hover_text("While away, the radio may answer links and send automatic replies (beacons are always allowed)")
-            .changed()
-        {
+        if state.unattended_links != unattended_was {
             let on = state.unattended_links;
             state.send_cmd(GuiCommand::SetUnattended(on));
             crate::config::update_config_file(|c| c.unattended_links = Some(on));
         }
-        let connected = state.session_state == SessionState::Connected;
-        let mut vsnr = state.verbose_snr;
-        if ui.add_enabled(connected || vsnr, egui::Checkbox::new(&mut vsnr, label("Verbose SNR")))
-            .on_hover_text("Exchange SNR reports every minute with your partner (invites them with <VSI>)")
-            .changed()
-        {
+        if vsnr_changed {
             state.verbose_snr = vsnr;
             state.send_cmd(GuiCommand::VerboseSnr(vsnr));
         }
@@ -1765,10 +1929,6 @@ pub(super) fn pick_canned(state: &mut GuiState, i: usize) {
 
 fn draw_composer(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage, qso_guid: &Option<String>) {
     let mut do_send = std::mem::take(&mut state.send_requested);
-    if state.compose_open {
-        draw_compose_window(ui, state, db);
-        return;
-    }
     let connected = state.session_state == SessionState::Connected;
 
     // VarAC's "REPLYING TO:" box above the input
@@ -2250,5 +2410,83 @@ fn end_sniff(state: &mut GuiState) {
             state.send_cmd(GuiCommand::SetPttDisabled(false));
         }
         state.add_log("SLOT sniffer: Changing frequency back".into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The main window, drawn for a few frames (the layout settles on what it measured the
+    /// frame before) at `w` × `h`, below bars as tall as the Linux app's modem bar and the menu
+    /// bar; `top_h`, a top section dragged (or remembered) that tall. Returns the clickable
+    /// widgets' rects, the top section's height and what its controls need, and whether the
+    /// right-hand column was compact.
+    fn draw(w: f32, h: f32, top_h: Option<f32>) -> (Vec<(egui::Id, egui::Rect)>, f32, f32, bool) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = GuiState::new("N0CALL".into(), true, tx);
+        let db = Storage::open_in_memory().unwrap();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h))), ..Default::default() };
+        let mut frame = |ctx: &egui::Context| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                theme::apply_with(ctx, true, 14.0, false);
+                egui::TopBottomPanel::top("modem_bar").exact_height(33.0).show(ctx, |_| {});
+                egui::TopBottomPanel::top("menu_bar").exact_height(33.0).show(ctx, |_| {});
+                draw_main_window(ctx, &mut state, &db, &None);
+            });
+        };
+        for _ in 0..4 {
+            frame(&ctx);
+        }
+        if let Some(top_h) = top_h {
+            let id = egui::Id::new("top_section");
+            let mut s = egui::containers::panel::PanelState::load(&ctx, id).unwrap();
+            s.rect.set_height(top_h);
+            ctx.data_mut(|d| d.insert_persisted(id, s));
+        }
+        for _ in 0..6 {
+            frame(&ctx);
+        }
+        let rects = ctx.viewport(|vp| {
+            let widgets = &vp.prev_pass.widgets;
+            let layers: Vec<_> = widgets.layer_ids().collect();
+            layers.into_iter()
+                .flat_map(|l| widgets.get_layer(l).cloned().collect::<Vec<_>>())
+                // (as clipped: what is drawn and takes clicks)
+                .filter(|r| r.sense.interactive() && r.interact_rect.is_positive())
+                .map(|r| (r.id, r.interact_rect))
+                .collect()
+        });
+        let top = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("top_section")).unwrap().rect.height();
+        let side = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("side_column")).unwrap().rect.width();
+        let top_need = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(TOP_NEED_H))).unwrap();
+        (rects, top, top_need, side > SIDE_COL_W + 20.0)
+    }
+
+    fn check(w: f32, h: f32, top_h: Option<f32>) -> bool {
+        let (rects, top, top_need, compact) = draw(w, h, top_h);
+        let what = format!("{w}x{h}, top section {top_h:?}");
+        for (i, (_, a)) in rects.iter().enumerate() {
+            assert!(a.max.y <= h + 0.5, "{what}: a widget runs off the window: {a:?}");
+            for (_, b) in &rects[i + 1..] {
+                let o = a.intersect(*b);
+                // (one inside the other is a widget and its parts)
+                let nested = a.contains_rect(*b) || b.contains_rect(*a);
+                assert!(nested || !(o.is_positive() && o.area() > 4.0), "{what}: widgets overlap: {a:?} and {b:?}");
+            }
+        }
+        assert!(top + 0.5 >= top_need, "{what}: top section {top} shorter than its controls ({top_need})");
+        compact
+    }
+
+    /// A 1366×768 laptop, maximized (701 px inside the window): the column goes compact and
+    /// nothing overlaps, also with the top section dragged tall; a 1080p screen keeps VarAC's
+    /// one-per-row column.
+    #[test]
+    fn fits_a_laptop_screen() {
+        assert!(check(1366.0, 701.0, None), "1366x768: expected the compact column");
+        assert!(check(1366.0, 701.0, Some(320.0)), "1366x768, tall top: expected the compact column");
+        assert!(!check(1920.0, 1013.0, None), "1080p: expected the full column");
     }
 }

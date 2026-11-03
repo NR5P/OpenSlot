@@ -828,6 +828,9 @@ pub struct GuiState {
     // Chat search filter
     pub chat_search: String,
     pub chat_search_active: bool,
+    /// The broadcasts' Search box, as the chat's
+    pub broadcast_search: String,
+    pub broadcast_search_active: bool,
 
     /// The chat and message box are in their own big window (Pop out / Shrink back)
     pub chat_window_open: bool,
@@ -1351,6 +1354,8 @@ impl GuiState {
             contact_adding: false,
             chat_search: String::new(),
             chat_search_active: false,
+            broadcast_search: String::new(),
+            broadcast_search_active: false,
             chat_window_open: false,
             broadcasts_window_open: false,
             broadcasts_share: None,
