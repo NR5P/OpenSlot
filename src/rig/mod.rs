@@ -149,6 +149,9 @@ pub enum CatModel {
     Ftdx3000,
     YaesuGeneric,
     KenwoodGeneric,
+    /// Icom CI-V (and radios that speak it: Xiegu and others), at this CI-V address;
+    /// 0 = find the radio's address when connecting.
+    Icom(u8),
 }
 
 impl CatModel {
@@ -156,6 +159,10 @@ impl CatModel {
         match key {
             "yaesu" => CatModel::YaesuGeneric,
             "kenwood" | "qmx" => CatModel::KenwoodGeneric,
+            // "icom", or "icom:94" with the radio's CI-V address in hex
+            k if k.starts_with("icom") => {
+                CatModel::Icom(k.strip_prefix("icom:").and_then(|a| u8::from_str_radix(a, 16).ok()).unwrap_or(0))
+            }
             _ => CatModel::Ftdx3000,
         }
     }
@@ -167,6 +174,8 @@ impl fmt::Display for CatModel {
             CatModel::Ftdx3000 => write!(f, "FTDX3000"),
             CatModel::YaesuGeneric => write!(f, "Yaesu (generic)"),
             CatModel::KenwoodGeneric => write!(f, "Kenwood/QMX"),
+            CatModel::Icom(0) => write!(f, "Icom CI-V"),
+            CatModel::Icom(a) => write!(f, "Icom CI-V ({a:02X}h)"),
         }
     }
 }
@@ -194,6 +203,8 @@ pub struct PortInfo {
     /// On a dual-port radio interface: Some(true) for the CAT port, Some(false) for the
     /// keying (PTT/CW) port. None when the port isn't known to be either.
     pub cat_port: Option<bool>,
+    /// A USB device (a radio's own port, a USB-serial cable), not Bluetooth or a built-in port
+    pub usb: bool,
 }
 
 impl PortInfo {
@@ -283,7 +294,7 @@ pub fn replacement_cat_port(_saved: &str) -> Option<String> {
 
 fn port_info(p: serialport::SerialPortInfo) -> PortInfo {
     let serialport::SerialPortType::UsbPort(usb) = p.port_type else {
-        return PortInfo { name: p.port_name, description: String::new(), cat_port: None };
+        return PortInfo { name: p.port_name, description: String::new(), cat_port: None, usb: false };
     };
     // Windows gives the device's friendly name, which ends in "(COM4)": the name is shown already.
     let product = usb.product.unwrap_or_default();
@@ -307,7 +318,7 @@ fn port_info(p: serialport::SerialPortInfo) -> PortInfo {
             None
         }
     });
-    PortInfo { name: p.port_name, description, cat_port }
+    PortInfo { name: p.port_name, description, cat_port, usb: true }
 }
 
 /// What "Detect radio" found: the settings to use and the radio's name.
@@ -315,8 +326,8 @@ fn port_info(p: serialport::SerialPortInfo) -> PortInfo {
 pub struct DetectedRig {
     pub port: String,
     pub baud: u32,
-    /// As in the settings: "ftdx3000", "yaesu" or "kenwood"
-    pub model: &'static str,
+    /// As in the settings: "ftdx3000", "yaesu", "kenwood" or "icom:94"
+    pub model: String,
     pub radio: String,
 }
 
@@ -324,12 +335,21 @@ pub struct DetectedRig {
 const DETECT_BAUDS: [u32; 6] = [38400, 4800, 9600, 19200, 57600, 115200];
 
 /// Looks for a radio on the serial ports by asking each one "ID;" at each baud rate (a read-only
-/// query in both the Yaesu and Kenwood CAT sets). DTR is held low throughout. RTS is raised only on
-/// ports known to be a radio's CAT port, where Yaesu's "CAT RTS" needs it; a port that may key the
-/// transmitter on RTS (a CP2105 Standard port, a Digirig) is never touched with it, and a
-/// CP2105 Standard port is skipped altogether. Takes a few seconds per port; run it off the UI thread.
-pub fn detect_cat(ports: &[PortInfo]) -> Result<DetectedRig, String> {
-    let candidates: Vec<&PortInfo> = ports.iter().filter(|p| p.cat_port != Some(false)).collect();
+/// query in both the Yaesu and Kenwood CAT sets) and, on ports that aren't a Yaesu's CAT port, for
+/// the frequency in Icom's CI-V. DTR is held low throughout. RTS is raised only on ports known to
+/// be a radio's CAT port, where Yaesu's "CAT RTS" needs it; a port that may key the transmitter on
+/// RTS (a CP2105 Standard port, a Digirig) is never touched with it, and a CP2105 Standard port is
+/// skipped altogether. `usb_only` leaves out Bluetooth and built-in ports (looking at startup).
+/// Takes a few seconds per port; run it off the UI thread.
+pub fn detect_cat(ports: &[PortInfo], usb_only: bool) -> Result<DetectedRig, String> {
+    let mut candidates: Vec<&PortInfo> = ports
+        .iter()
+        .filter(|p| p.cat_port != Some(false) && (p.usb || !usb_only))
+        // (macOS lists each port twice: /dev/tty.* waits for carrier, /dev/cu.* is for calling out)
+        .filter(|p| !p.name.starts_with("/dev/tty."))
+        .collect();
+    // A known CAT port first, then the other USB ones
+    candidates.sort_by_key(|p| (p.cat_port != Some(true), !p.usb));
     if candidates.is_empty() {
         return Err("no serial ports found — is the radio's USB cable plugged in and the radio on?".into());
     }
@@ -339,13 +359,19 @@ pub fn detect_cat(ports: &[PortInfo]) -> Result<DetectedRig, String> {
             match probe_id(&p.name, baud, p.cat_port == Some(true)) {
                 Ok(Some(id)) => {
                     let (model, radio) = model_for_id(&id);
-                    return Ok(DetectedRig { port: p.name.clone(), baud, model, radio });
+                    return Ok(DetectedRig { port: p.name.clone(), baud, model: model.to_string(), radio });
                 }
                 Ok(None) => {}
                 Err(e) => {
                     busy.push(format!("{} ({e})", p.name));
                     break;
                 }
+            }
+            if p.cat_port == Some(true) {
+                continue;
+            }
+            if let Ok(Some(addr)) = probe_civ(&p.name, baud) {
+                return Ok(DetectedRig { port: p.name.clone(), baud, model: format!("icom:{addr:02x}"), radio: icom_name(addr) });
             }
         }
     }
@@ -355,6 +381,75 @@ pub fn detect_cat(ports: &[PortInfo]) -> Result<DetectedRig, String> {
     }
     msg += ". Check the radio is on and its CAT RATE, or set the port and baud by hand and press TEST.";
     Err(msg)
+}
+
+/// The CI-V addresses radios come set to (Hamlib's defaults), for finding one that doesn't
+/// answer the broadcast address.
+const CIV_ADDRESSES: [u8; 17] =
+    [0x94, 0xA4, 0x98, 0xA2, 0x88, 0x8E, 0x70, 0x7C, 0x76, 0x80, 0x7A, 0x5E, 0x66, 0x74, 0x6A, 0x6E, 0xAC];
+
+/// Asks for the frequency in CI-V (read-only), at the broadcast address and each usual one, at one
+/// baud rate: Ok(Some(the radio's address)) when one answers. RTS and DTR stay low (an Icom can
+/// key on either, by its USB SEND / USB keying settings).
+fn probe_civ(port: &str, baud: u32) -> Result<Option<u8>, String> {
+    use std::io::{Read, Write};
+    let mut sp = serialport::new(port, baud)
+        .timeout(Duration::from_millis(50))
+        .stop_bits(serialport::StopBits::One)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .flow_control(serialport::FlowControl::None)
+        .open()
+        .map_err(|e| e.to_string())?;
+    let _ = sp.write_data_terminal_ready(false);
+    let _ = sp.write_request_to_send(false);
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = sp.clear(serialport::ClearBuffer::Input);
+    let mut out = cat::civ_frame(0x00, &[0x03]);
+    for a in CIV_ADDRESSES {
+        out.extend(cat::civ_frame(a, &[0x03]));
+    }
+    sp.write_all(&out).map_err(|e| e.to_string())?;
+    let _ = sp.flush();
+    let mut reply = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(400);
+    let mut buf = [0u8; 256];
+    while Instant::now() < deadline {
+        match sp.read(&mut buf) {
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+        if let Some(a) = cat::civ_answer(&reply) {
+            return Ok(Some(a));
+        }
+    }
+    Ok(None)
+}
+
+/// A name for an Icom by its CI-V address (Hamlib's defaults; a radio can be set to another).
+fn icom_name(addr: u8) -> String {
+    let name = match addr {
+        0x94 => "Icom IC-7300",
+        0xA4 => "Icom IC-705",
+        0x98 => "Icom IC-7610",
+        0xA2 => "Icom IC-9700",
+        0x88 => "Icom IC-7100",
+        0x8E => "Icom IC-7851",
+        0x70 => "Icom IC-7000",
+        0x7C => "Icom IC-9100",
+        0x76 => "Icom IC-7200",
+        0x80 => "Icom IC-7410",
+        0x7A => "Icom IC-7600",
+        0x5E => "Icom IC-718",
+        0x66 => "Icom IC-746PRO",
+        0x74 => "Icom IC-7700",
+        0x6A => "Icom IC-7800",
+        0x6E => "Icom IC-756PROIII",
+        0xAC => "Icom IC-905",
+        _ => return format!("Icom-compatible radio (CI-V {addr:02X}h)"),
+    };
+    format!("{name} (CI-V {addr:02X}h)")
 }
 
 /// One "ID;" at one baud rate: Ok(Some(id digits)) on a reply, Ok(None) on silence or noise.
@@ -912,6 +1007,8 @@ mod tests {
             RigBackend::CatSerial { port: "/dev/ttyUSB0".into(), baud: 38400, model: CatModel::KenwoodGeneric }
         );
         assert_eq!(RigBackend::from_settings("none", "", "", "", "", ""), RigBackend::None);
+        assert_eq!(CatModel::from_key("icom:94"), CatModel::Icom(0x94));
+        assert_eq!(CatModel::from_key("icom"), CatModel::Icom(0));
     }
 
     /// The ID reply is found among auto-information output, and noise isn't taken for one.
@@ -930,9 +1027,9 @@ mod tests {
 
     #[test]
     fn port_labels() {
-        let p = PortInfo { name: "COM4".into(), description: "Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port".into(), cat_port: Some(true) };
+        let p = PortInfo { name: "COM4".into(), description: "Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port".into(), cat_port: Some(true), usb: true };
         assert_eq!(p.label(), "COM4 — Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port (CAT)");
-        let p = PortInfo { name: "/dev/ttyS0".into(), description: String::new(), cat_port: None };
+        let p = PortInfo { name: "/dev/ttyS0".into(), description: String::new(), cat_port: None, usb: false };
         assert_eq!(p.label(), "/dev/ttyS0");
     }
 
@@ -952,8 +1049,12 @@ mod tests {
     /// A port that may key on RTS is never probed (detect_cat filters it before opening).
     #[test]
     fn detect_skips_keying_ports() {
-        let keying = PortInfo { name: "COM3".into(), description: String::new(), cat_port: Some(false) };
-        assert!(detect_cat(&[keying]).unwrap_err().starts_with("no serial ports found"));
+        let keying = PortInfo { name: "COM3".into(), description: String::new(), cat_port: Some(false), usb: true };
+        assert!(detect_cat(&[keying], false).unwrap_err().starts_with("no serial ports found"));
+        // Looking at startup leaves out Bluetooth and built-in ports, and macOS's tty.* twins
+        let bt = PortInfo { name: "/dev/cu.Bluetooth-Incoming-Port".into(), description: String::new(), cat_port: None, usb: false };
+        let twin = PortInfo { name: "/dev/tty.usbserial-1".into(), description: String::new(), cat_port: None, usb: true };
+        assert!(detect_cat(&[bt, twin], true).unwrap_err().starts_with("no serial ports found"));
     }
 
     /// A QSY agreed on the air moves the VFO relative to where it is (rig worker,

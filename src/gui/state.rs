@@ -974,6 +974,8 @@ pub struct GuiState {
     pub rig_detect_requested: bool,
     pub rig_detect_rx: Option<std::sync::mpsc::Receiver<Result<crate::rig::DetectedRig, String>>>,
     pub rig_detect_status: Option<String>,
+    /// The search was started by the radio not answering at startup (not the button)
+    pub rig_detect_auto: bool,
 
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<GuiCommand>,
 }
@@ -1430,6 +1432,7 @@ impl GuiState {
             rig_detect_requested: false,
             rig_detect_rx: None,
             rig_detect_status: None,
+            rig_detect_auto: false,
             cmd_tx,
         }
     }

@@ -133,6 +133,9 @@ pub struct VaracApp {
     repaint_debug: Option<(std::time::Instant, u32, std::collections::BTreeMap<String, u32>)>,
     /// The frequency scheduler's pick: tune the radio to it when it connects
     restore_freq_pending: bool,
+    /// The radio hasn't answered since startup yet: if the first try fails, look for it on the
+    /// serial ports (it may be on another port, or another radio), else open Settings › RIG
+    rig_first_try: bool,
     /// Otherwise, at start: the calling frequency of the band the radio is on (first reading)
     start_on_radio_band: bool,
     /// PSKReporter (stations heard), and the dial it last heard about
@@ -414,6 +417,7 @@ impl VaracApp {
             }
         }
 
+        let rig_first_try = rig_detectable(&state.rig_backend);
         let app = Self {
             state,
             session_rx,
@@ -434,6 +438,7 @@ impl VaracApp {
             last_frame: None,
             repaint_debug: std::env::var_os("OPENSLOT_DEBUG_REPAINT").map(|_| (std::time::Instant::now(), 0, Default::default())),
             restore_freq_pending: sched_tuned,
+            rig_first_try,
             start_on_radio_band: !sched_tuned,
             psk: crate::varac::pskreporter::spawn(|m| tracing::info!(target: "gui", "{m}")),
             psk_freq: 0,
@@ -2547,6 +2552,7 @@ impl VaracApp {
             for ev in rig.poll_events() {
                 match ev {
                     crate::rig::RigEvent::Connected(name) => {
+                        self.rig_first_try = false;
                         self.state.rig_connected = true;
                         self.state.rig_error = None;
                         self.state.add_log(format!("Rig connected: {name}"));
@@ -2628,6 +2634,11 @@ impl VaracApp {
                     crate::rig::RigEvent::Error(e) => {
                         self.state.add_log(format!("Rig error: {e}"));
                         self.state.rig_error = Some(e);
+                        if std::mem::take(&mut self.rig_first_try) && self.state.rig_detect_rx.is_none() {
+                            self.state.add_log("Looking for the radio on the serial ports…".into());
+                            self.state.rig_detect_requested = true;
+                            self.state.rig_detect_auto = true;
+                        }
                     }
                 }
             }
@@ -2652,27 +2663,46 @@ impl VaracApp {
             self.state.rig_ptt = false;
             self.state.rig_ports = crate::rig::list_serial_ports();
             let ports = self.state.rig_ports.clone();
+            let usb_only = self.state.rig_detect_auto;
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 // (the port the old manager held is released once its worker stops)
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = tx.send(crate::rig::detect_cat(&ports));
+                let _ = tx.send(crate::rig::detect_cat(&ports, usb_only));
             });
             self.state.rig_detect_rx = Some(rx);
             self.state.rig_detect_status = Some("Looking for the radio…".into());
         }
         if let Some(r) = self.state.rig_detect_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.state.rig_detect_rx = None;
+            let auto = std::mem::take(&mut self.state.rig_detect_auto);
             match r {
                 Ok(d) => {
-                    self.state.rig_detect_status =
-                        Some(format!("Found {} on {} at {} baud. Press Save to keep it.", d.radio, d.port, d.baud));
                     self.state.rig_settings_backend = "cat".into();
-                    self.state.rig_settings_serial = d.port;
+                    self.state.rig_settings_serial = d.port.clone();
                     self.state.rig_settings_baud = d.baud.to_string();
-                    self.state.rig_settings_model = d.model.into();
+                    self.state.rig_settings_model = d.model;
+                    if auto {
+                        // Found at startup: use it from now on
+                        save_config_file(&self.state);
+                        let found = format!("Found {} on {} at {} baud: using it (saved in Settings › RIG)", d.radio, d.port, d.baud);
+                        self.state.add_log(found.clone());
+                        self.state.status_msg = format!("Radio: {}", d.radio);
+                        self.state.rig_detect_status = Some(found);
+                    } else {
+                        self.state.rig_detect_status =
+                            Some(format!("Found {} on {} at {} baud. Press Save to keep it.", d.radio, d.port, d.baud));
+                    }
                 }
-                Err(e) => self.state.rig_detect_status = Some(format!("Not found: {e}")),
+                Err(e) => {
+                    if auto {
+                        // No radio answered at startup: show where to set it up
+                        self.state.add_log(format!("Radio not found: {e}"));
+                        self.state.settings_open = true;
+                        self.state.settings_form.settings_tab = 5;
+                    }
+                    self.state.rig_detect_status = Some(format!("Not found: {e}"));
+                }
             }
             // Connect with what was found, or back to the settings as they were
             self.state.rig_reconnect_requested = true;
@@ -6202,14 +6232,20 @@ fn draw_settings_window(
                                         egui::ComboBox::from_id_salt("rig_model")
                                             .selected_text(match state.rig_settings_model.as_str() {
                                                 "yaesu" => "Yaesu FT-991/891/710, FTDX10/101",
-                                                "kenwood" | "qmx" => "Kenwood / QRP Labs QMX",
+                                                "kenwood" | "qmx" => "Kenwood / Elecraft / QRP Labs QMX",
+                                                m if m.starts_with("icom") => "Icom / Xiegu (CI-V)",
                                                 _ => "Yaesu FTDX3000 / FT-950 / FTDX1200",
                                             })
                                             .width(230.0)
                                             .show_ui(ui, |ui| {
                                                 ui.selectable_value(&mut state.rig_settings_model, "ftdx3000".into(), "Yaesu FTDX3000 / FT-950 / FTDX1200");
                                                 ui.selectable_value(&mut state.rig_settings_model, "yaesu".into(), "Yaesu FT-991/891/710, FTDX10/101");
-                                                ui.selectable_value(&mut state.rig_settings_model, "kenwood".into(), "Kenwood / QRP Labs QMX");
+                                                ui.selectable_value(&mut state.rig_settings_model, "kenwood".into(), "Kenwood / Elecraft / QRP Labs QMX");
+                                                // (Detect radio fills in the radio's CI-V address; plain "icom" finds it on connecting)
+                                                let icom = state.rig_settings_model.starts_with("icom");
+                                                if ui.selectable_label(icom, "Icom / Xiegu (CI-V)").clicked() && !icom {
+                                                    state.rig_settings_model = "icom".into();
+                                                }
                                             });
                                         ui.end_row();
                                         ui.label("Port");
@@ -6267,7 +6303,7 @@ fn draw_settings_window(
                                             ui.colored_label(color, RichText::new(s).small());
                                         }
                                     });
-                                    ui.label(RichText::new("8 data bits, no parity; 2 stop bits for Yaesu, 1 for Kenwood. DTR held low, RTS high for Yaesu (CAT RTS).").small().color(GRAY));
+                                    ui.label(RichText::new("8 data bits, no parity; 2 stop bits for Yaesu, 1 for Kenwood and Icom. DTR held low, RTS high for Yaesu (CAT RTS).").small().color(GRAY));
                                     ui.label(RichText::new("Radios with two serial ports (Yaesu FTDX3000, FT-991, FT-891, FT-710, FTDX10/101) take CAT on the one marked (CAT), the Enhanced port; the other is for PTT/keying. The baud rate is the radio's CAT RATE menu setting.").small().color(GRAY));
                                 } else if state.rig_settings_backend == "rigctld" {
                                     ui.label(RichText::new("Host and port are set under Hamlib (Rigctld) on the right").small().color(GRAY));
@@ -6629,6 +6665,19 @@ fn draw_email_settings(ui: &mut egui::Ui, f: &mut state::SettingsForm, gate: Opt
             ui.colored_label(color, s);
         }
     });
+}
+
+/// Rig control that looks for the radio itself when it doesn't answer at startup: a radio on a
+/// serial port, or rigctld / FLRig on this computer (a radio somewhere else is left alone).
+fn rig_detectable(backend: &crate::rig::RigBackend) -> bool {
+    use crate::rig::RigBackend;
+    match backend {
+        RigBackend::CatSerial { .. } => true,
+        RigBackend::Rigctld { host, .. } | RigBackend::Flrig { host, .. } => {
+            matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
+        }
+        RigBackend::None => false,
+    }
 }
 
 fn save_config_file(state: &GuiState) {

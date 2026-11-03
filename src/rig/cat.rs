@@ -30,6 +30,7 @@ impl CatSerial {
                 CatModel::Ftdx3000 => 8,
                 CatModel::YaesuGeneric => 9,
                 CatModel::KenwoodGeneric => 11,
+                CatModel::Icom(_) => 10,
             },
         }
     }
@@ -86,6 +87,166 @@ impl CatSerial {
         std::thread::sleep(Duration::from_millis(50));
         Ok(())
     }
+
+    /// One CI-V command to the radio and its reply (the command byte(s) and data, or FB for
+    /// "OK"). Our own frames echoed back on the bus, and the radio's transceive broadcasts, are
+    /// skipped.
+    fn civ(&mut self, cmd: &[u8]) -> RigResult<Vec<u8>> {
+        let CatModel::Icom(addr) = self.model else { return Err(RigError::Protocol("not a CI-V radio".into())) };
+        let port = self.port.as_mut().ok_or(RigError::NotConnected)?;
+        let _ = port.clear(serialport::ClearBuffer::Input);
+        port.write_all(&civ_frame(addr, cmd))?;
+        port.flush()?;
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match port.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(RigError::Io(e)),
+            }
+            if let Some(reply) = civ_frames(&got).into_iter().find(|f| f.0 == CIV_ME && f.1 == addr).map(|f| f.2) {
+                if reply == [CIV_NG] {
+                    return Err(RigError::Protocol(format!("radio rejected CI-V {cmd:02X?}")));
+                }
+                return Ok(reply);
+            }
+        }
+        Err(RigError::Timeout)
+    }
+
+    /// The radio's CI-V address, asked for at the broadcast address and the usual ones.
+    fn find_civ_address(&mut self) -> RigResult<u8> {
+        let port = self.port.as_mut().ok_or(RigError::NotConnected)?;
+        let _ = port.clear(serialport::ClearBuffer::Input);
+        let mut out = civ_frame(0x00, &[0x03]);
+        for a in super::CIV_ADDRESSES {
+            out.extend(civ_frame(a, &[0x03]));
+        }
+        port.write_all(&out)?;
+        port.flush()?;
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match port.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(RigError::Io(e)),
+            }
+            if let Some(a) = civ_answer(&got) {
+                return Ok(a);
+            }
+        }
+        Err(RigError::Timeout)
+    }
+
+    fn civ_mode(&mut self) -> RigResult<RadioMode> {
+        let reply = self.civ(&[0x04])?;
+        let mode = *reply.get(1).ok_or_else(|| RigError::Protocol(format!("unexpected: {reply:02X?}")))?;
+        // DATA on (IC-7300 and later; older radios reject it)
+        let data = self.civ(&[0x1A, 0x06]).ok().and_then(|r| r.get(2).copied()).unwrap_or(0) != 0;
+        Ok(match (mode, data) {
+            (0x00, false) => RadioMode::Lsb,
+            (0x00, true) => RadioMode::LsbData,
+            (0x01, false) => RadioMode::Usb,
+            (0x01, true) => RadioMode::UsbData,
+            (0x02, _) => RadioMode::Am,
+            (0x03 | 0x07, _) => RadioMode::Cw,
+            (0x05, false) => RadioMode::Fm,
+            (0x05, true) => RadioMode::FmData,
+            _ => RadioMode::Usb,
+        })
+    }
+
+    fn set_civ_mode(&mut self, mode: RadioMode) -> RigResult<()> {
+        let (m, data) = match mode {
+            RadioMode::Lsb => (0x00, false),
+            RadioMode::LsbData => (0x00, true),
+            RadioMode::Usb => (0x01, false),
+            RadioMode::UsbData => (0x01, true),
+            RadioMode::Am => (0x02, false),
+            RadioMode::Cw => (0x03, false),
+            RadioMode::Fm => (0x05, false),
+            RadioMode::FmData => (0x05, true),
+        };
+        self.civ(&[0x06, m])?;
+        // (filter 1 with DATA on, as the radio's own D button)
+        let set_data = self.civ(&[0x1A, 0x06, u8::from(data), u8::from(data)]);
+        if data { set_data.map(|_| ()) } else { Ok(()) }
+    }
+}
+
+/// Our CI-V address (the usual controller address)
+const CIV_ME: u8 = 0xE0;
+/// CI-V "NG": the radio rejected the command
+const CIV_NG: u8 = 0xFA;
+
+/// A CI-V frame from us to `to`: FE FE to E0 command… FD
+pub(super) fn civ_frame(to: u8, cmd: &[u8]) -> Vec<u8> {
+    let mut f = vec![0xFE, 0xFE, to, CIV_ME];
+    f.extend_from_slice(cmd);
+    f.push(0xFD);
+    f
+}
+
+/// The complete frames in `bytes`: (to, from, command and data).
+fn civ_frames(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0xFE || bytes[i + 1] != 0xFE {
+            i += 1;
+            continue;
+        }
+        let mut start = i + 2;
+        // (a run of preamble bytes)
+        while bytes.get(start) == Some(&0xFE) {
+            start += 1;
+        }
+        let Some(len) = bytes[start..].iter().position(|&b| b == 0xFD) else { break };
+        let body = &bytes[start..start + len];
+        if body.len() >= 3 {
+            frames.push((body[0], body[1], body[2..].to_vec()));
+        }
+        i = start + len + 1;
+    }
+    frames
+}
+
+/// The address of a radio that answered our frequency query, in what came back.
+pub(super) fn civ_answer(bytes: &[u8]) -> Option<u8> {
+    civ_frames(bytes).into_iter().find(|f| f.0 == CIV_ME && f.1 != CIV_ME && f.2.first() == Some(&0x03) && f.2.len() >= 5).map(|f| f.1)
+}
+
+/// CI-V frequency: 5 BCD bytes, least significant first (some radios send 4 below 1 GHz).
+fn civ_freq(data: &[u8]) -> RigResult<u64> {
+    if data.len() < 4 {
+        return Err(RigError::Protocol(format!("bad CI-V frequency {data:02X?}")));
+    }
+    let mut hz = 0u64;
+    for &b in data.iter().take(5).rev() {
+        let (hi, lo) = (b >> 4, b & 0x0F);
+        if hi > 9 || lo > 9 {
+            return Err(RigError::Protocol(format!("bad CI-V frequency {data:02X?}")));
+        }
+        hz = hz * 100 + u64::from(hi) * 10 + u64::from(lo);
+    }
+    Ok(hz)
+}
+
+fn civ_freq_bytes(hz: u64) -> [u8; 5] {
+    let mut out = [0u8; 5];
+    let mut f = hz;
+    for b in &mut out {
+        let lo = (f % 10) as u8;
+        f /= 10;
+        let hi = (f % 10) as u8;
+        f /= 10;
+        *b = (hi << 4) | lo;
+    }
+    out
 }
 
 impl RigControl for CatSerial {
@@ -93,7 +254,7 @@ impl RigControl for CatSerial {
         // Yaesu CAT is spec'd 8N2; Kenwood/QMX 8N1. (Receivers only check the first stop bit,
         // so 2 is safe either way on the RX side.)
         let stop_bits = match self.model {
-            CatModel::KenwoodGeneric => serialport::StopBits::One,
+            CatModel::KenwoodGeneric | CatModel::Icom(_) => serialport::StopBits::One,
             _ => serialport::StopBits::Two,
         };
         // A saved Linux /dev/ttyUSBn that is gone (the radio came back under another number): use
@@ -122,9 +283,26 @@ impl RigControl for CatSerial {
         // asserted. On the Enhanced (CAT) port RTS is not a keying line, so this is safe.
         // DTR stays low so a port wired for DTR keying can't transmit on open.
         let _ = port.write_data_terminal_ready(false);
-        let _ = port.write_request_to_send(!matches!(self.model, CatModel::KenwoodGeneric));
+        // (An Icom can key on RTS or DTR, by its USB SEND / USB keying settings: both stay low.)
+        let _ = port.write_request_to_send(!matches!(self.model, CatModel::KenwoodGeneric | CatModel::Icom(_)));
 
         self.port = Some(port);
+
+        if self.model == CatModel::Icom(0) {
+            match self.find_civ_address() {
+                Ok(a) => {
+                    self.model = CatModel::Icom(a);
+                    self.name = format!("{} ({a:02X}h)", self.name);
+                }
+                Err(_) => {
+                    self.port = None;
+                    return Err(RigError::Protocol(format!(
+                        "no CI-V reply on {port_name} at {} baud — check port, baud rate and the radio's CI-V settings",
+                        self.baud
+                    )));
+                }
+            }
+        }
 
         // Verify by reading frequency; this also learns the FA field width.
         if let Err(e) = self.get_freq() {
@@ -163,6 +341,10 @@ impl RigControl for CatSerial {
                 let reply = self.send_cat_query("FA;")?;
                 parse_kenwood_freq(&reply)
             }
+            CatModel::Icom(_) => {
+                let reply = self.civ(&[0x03])?;
+                civ_freq(&reply[1..])
+            }
         }
     }
 
@@ -175,6 +357,11 @@ impl RigControl for CatSerial {
             CatModel::KenwoodGeneric => {
                 let cmd = format!("FA{:011};", hz);
                 self.send_cat_set(&cmd)
+            }
+            CatModel::Icom(_) => {
+                let mut cmd = vec![0x05];
+                cmd.extend(civ_freq_bytes(hz));
+                self.civ(&cmd).map(|_| ())
             }
         }
     }
@@ -189,6 +376,7 @@ impl RigControl for CatSerial {
                 let reply = self.send_cat_query("MD;")?;
                 parse_kenwood_mode(&reply)
             }
+            CatModel::Icom(_) => self.civ_mode(),
         }
     }
 
@@ -204,6 +392,7 @@ impl RigControl for CatSerial {
                 let cmd = format!("MD{digit};");
                 self.send_cat_set(&cmd)
             }
+            CatModel::Icom(_) => self.set_civ_mode(mode),
         }
     }
 
@@ -217,6 +406,7 @@ impl RigControl for CatSerial {
                 let cmd = if on { "TX;" } else { "RX;" };
                 self.send_cat_set(cmd)
             }
+            CatModel::Icom(_) => self.civ(&[0x1C, 0x00, u8::from(on)]).map(|_| ()),
         }
     }
 
@@ -230,6 +420,7 @@ fn model_name(model: CatModel) -> &'static str {
         CatModel::Ftdx3000 => "FTDX3000 CAT",
         CatModel::YaesuGeneric => "Yaesu CAT",
         CatModel::KenwoodGeneric => "Kenwood/QMX CAT",
+        CatModel::Icom(_) => "Icom CI-V",
     }
 }
 
@@ -338,6 +529,21 @@ mod tests {
         assert_eq!(freq_field_width("?;"), None);
         assert_eq!(parse_yaesu_freq("FA14074000;").unwrap(), 14_074_000);
         assert_eq!(parse_kenwood_freq("FA00014074000;").unwrap(), 14_074_000);
+    }
+
+    #[test]
+    fn civ_frames_and_frequency() {
+        assert_eq!(civ_frame(0x94, &[0x03]), [0xFE, 0xFE, 0x94, 0xE0, 0x03, 0xFD]);
+        // 14.074 MHz is 00 40 07 14 00
+        assert_eq!(civ_freq_bytes(14_074_000), [0x00, 0x40, 0x07, 0x14, 0x00]);
+        assert_eq!(civ_freq(&[0x00, 0x40, 0x07, 0x14, 0x00]).unwrap(), 14_074_000);
+        // Our echoed query, a transceive broadcast and then the IC-7300's answer
+        let mut bus = civ_frame(0x94, &[0x03]);
+        bus.extend([0xFE, 0xFE, 0x00, 0x94, 0x00, 0x00, 0x40, 0x07, 0x14, 0x00, 0xFD]);
+        assert_eq!(civ_answer(&bus), None);
+        bus.extend([0xFE, 0xFE, 0xE0, 0x94, 0x03, 0x00, 0x40, 0x07, 0x14, 0x00, 0xFD]);
+        assert_eq!(civ_answer(&bus), Some(0x94));
+        assert_eq!(civ_answer(b"ID0462;"), None);
     }
 
     #[test]

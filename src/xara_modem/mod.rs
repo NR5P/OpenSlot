@@ -459,6 +459,12 @@ impl BuiltInModem {
             self.page = Page::Modem;
             return Err("choose the audio in and out on the Modem tab".into());
         }
+        if let Err(e) = self.find_audio() {
+            self.tab = Tab::Modem;
+            self.page = Page::Modem;
+            return Err(e);
+        }
+        let s = &self.settings;
         if port_open(self.cmd_port) {
             return Err(format!(
                 "port {} is already in use (is another modem, such as the XARA app, running?)",
@@ -478,6 +484,34 @@ impl BuiltInModem {
             }
             None => Err("a XARA modem is already running in this app".into()),
         }
+    }
+
+    /// Checks the radio's audio is plugged in. A USB sound card plugged into another port (or
+    /// hub) comes back under a new name: the location in a CoreAudio UID, the "2-" in a Windows
+    /// endpoint, the card number on Linux. Then the one device whose name differs only in its
+    /// numbers is the same device, and is saved in place of the old name.
+    fn find_audio(&mut self) -> Result<(), String> {
+        let Ok((inputs, outputs)) = xara::audio::list(AUDIO.1) else {
+            // (can't tell: let the modem try the names it has)
+            return Ok(());
+        };
+        let capture = moved_device(&self.settings.capture, &inputs)
+            .ok_or_else(|| format!("the radio's audio input ({}) isn't plugged in", self.settings.capture))?;
+        let playback = moved_device(&self.settings.playback, &outputs)
+            .ok_or_else(|| format!("the radio's audio output ({}) isn't plugged in", self.settings.playback))?;
+        if capture != self.settings.capture || playback != self.settings.playback {
+            self.settings.capture = capture.clone();
+            self.settings.playback = playback.clone();
+            self.draft.capture = capture;
+            self.draft.playback = playback;
+            let line = match self.settings.save() {
+                Ok(()) => "xara: the radio's audio moved to another USB port: using it there".to_string(),
+                Err(e) => format!("xara: the radio's audio moved to another USB port (couldn't save it: {e})"),
+            };
+            tracing::info!("{line}");
+            self.log.push_back(line);
+        }
+        Ok(())
     }
 
     /// Shows in the bar why it didn't start at launch.
@@ -1287,6 +1321,22 @@ impl WaterfallView {
     }
 }
 
+/// The saved audio device in `list` (pairs of name and description): itself, or the one device
+/// whose name is the same apart from its digits (see find_audio). None when it isn't there, or
+/// when more than one could be it (two radios with the same USB sound chip).
+fn moved_device(saved: &str, list: &[(String, String)]) -> Option<String> {
+    if list.iter().any(|(n, _)| n == saved) {
+        return Some(saved.to_string());
+    }
+    let shape = |s: &str| s.chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+    let want = shape(saved);
+    let mut same = list.iter().filter(|(n, _)| shape(n) == want);
+    match (same.next(), same.next()) {
+        (Some((n, _)), None) => Some(n.clone()),
+        _ => None,
+    }
+}
+
 /// Serial ports for PTT. Linux: by their /dev/serial/by-id names where they have one, so the PTT
 /// port survives the radio being power cycled. macOS: the call-out devices in /dev (no
 /// Bluetooth), described as the system says.
@@ -1310,6 +1360,7 @@ fn serial_ports() -> Vec<crate::rig::PortInfo> {
                     name,
                     description: String::new(),
                     cat_port: None,
+                    usb: false,
                 })
             })
             .collect();
@@ -1427,6 +1478,21 @@ mod tests {
         let fm = XaraSettings { mode: "fm-wide".into(), monitor: true, ..Default::default() }.arguments("nr5p", 8300, 8100);
         assert!(!fm.contains(&"--monitor".into()) && !fm.contains(&"--ptt".into()) && !fm.contains(&"--registered".into()));
         assert!(fm.windows(2).any(|w| w[0] == "--addr" && w[1] == "127.0.0.1"));
+    }
+
+    #[test]
+    fn audio_found_on_another_usb_port() {
+        let codec = |loc: &str| (format!("AppleUSBAudioEngine:Burr-Brown from TI:USB Audio CODEC:{loc}:2"), "USB Audio CODEC".to_string());
+        let mic = ("BuiltInMicrophoneDevice".to_string(), "MacBook Air Microphone".to_string());
+        let old = codec("142000").0;
+        // still there, moved, gone, and two of them (can't tell which)
+        assert_eq!(moved_device(&old, &[mic.clone(), codec("142000")]), Some(old.clone()));
+        assert_eq!(moved_device(&old, &[mic.clone(), codec("1112000")]), Some(codec("1112000").0));
+        assert_eq!(moved_device(&old, &[mic.clone()]), None);
+        assert_eq!(moved_device(&old, &[codec("1112000"), codec("1113000")]), None);
+        // Windows numbers the endpoint
+        let win = |n: &str| (format!("Microphone ({n}- USB Audio CODEC )"), String::new());
+        assert_eq!(moved_device(&win("2").0, &[win("3")]), Some(win("3").0));
     }
 
     #[test]
