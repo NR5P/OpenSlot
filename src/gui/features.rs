@@ -582,7 +582,7 @@ pub fn draw_alert_setup(ctx: &egui::Context, state: &mut GuiState) {
                         if ui.add(TextEdit::singleline(&mut emails).desired_width(140.0)).changed() {
                             t.emails = emails.split('|').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
                         }
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("×").clicked() {
                             remove = Some(i);
                         }
                         ui.end_row();
@@ -741,7 +741,7 @@ pub fn draw_sched_editor(ctx: &egui::Context, state: &mut GuiState) {
                         ui.horizontal(|ui| {
                             ui.add(TextEdit::singleline(t).desired_width(50.0).hint_text("06:00"));
                             ui.add(TextEdit::singleline(f).desired_width(100.0).hint_text("14.105.000"));
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("×").clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -776,7 +776,7 @@ pub fn draw_sched_editor(ctx: &egui::Context, state: &mut GuiState) {
                             ui.checkbox(&mut r.tune, "").on_hover_text("Start the antenna tuner when arriving (rigctld)");
                             ui.add(TextEdit::singleline(&mut r.start).desired_width(42.0).hint_text("hh:mm"));
                             ui.add(TextEdit::singleline(&mut r.end).desired_width(42.0).hint_text("hh:mm"));
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("×").clicked() {
                                 remove = Some(i);
                             }
                             ui.end_row();

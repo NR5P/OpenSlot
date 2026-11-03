@@ -158,6 +158,13 @@ impl VaracApp {
     ) -> Self {
         // pictures in the gallery and the QSL card preview
         egui_extras::install_image_loaders(&_cc.egui_ctx);
+        // The proportional font has no arrows, triangles or bar blocks (→ ▲ ▼ ▁…█): they
+        // showed as boxes. Hack, the monospace font egui ships, has them: fall back to it.
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            prop.push("Hack".to_owned());
+        }
+        _cc.egui_ctx.set_fonts(fonts);
         let mut state = GuiState::new(callsign, modem_connected, cmd_tx);
         // Our profile from the start (tags, the typed-CQ locator check, the status bar), not
         // only once Settings has been opened
@@ -924,7 +931,7 @@ impl VaracApp {
                         (crate::vara::kiss::AdvancedBeacon::EMCOMM, "EMCOMM"),
                     ].into_iter().filter(|(bit, _)| b.services() & bit != 0).map(|(_, n)| n)
                         // VarAC's ≫: the station scans several frequencies (be patient connecting)
-                        .chain(b.is_scanning().then_some("≫ SCANNING"))
+                        .chain(b.is_scanning().then_some("» SCANNING"))
                         .collect();
                     let entry = CqEntry {
                         time: self.state.format_time(),
@@ -1845,6 +1852,9 @@ impl VaracApp {
             }
             IncomingMessage::VMailAck => {
                 self.state.add_system_chat("VMAIL DELIVERED SUCCESSFULLY".into());
+                // (the session moved it from the Outbox or Parking to Sent: the counts and
+                // folders showed it still waiting)
+                refresh_all_vmail_lists(&mut self.state, &self.db);
             }
             IncomingMessage::Reaction { like, id } => {
                 sound::play(sound::Sound::Reaction);
@@ -3947,7 +3957,9 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
                             // Reply / like beside the bubble (inside it the bubble's own click
                             // area sits on top and swallows them)
                             if let Some(id) = line.chat_id.filter(|_| can_react) {
-                                ui.vertical(|ui| {
+                                // (on our right-aligned lines, against the bubble: a plain
+                                // vertical put the button at the chat's far left)
+                                ui.with_layout(Layout::top_down(if out { Align::Max } else { Align::Min }), |ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
                                     if ui.small_button("↩").on_hover_text("Reply to this message").clicked() {
                                         let quote: String = line.text.replace('\n', " ").chars().take(50).collect();

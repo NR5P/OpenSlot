@@ -133,7 +133,7 @@ pub fn draw_help(ctx: &egui::Context, state: &mut GuiState) {
             ui.horizontal(|ui| {
                 ui.label("Search:");
                 ui.add(egui::TextEdit::singleline(&mut state.help_search).desired_width(220.0).hint_text("e.g. VMail, slot, gateway"));
-                if !state.help_search.is_empty() && ui.small_button("✕").clicked() {
+                if !state.help_search.is_empty() && ui.small_button("×").clicked() {
                     state.help_search.clear();
                 }
             });

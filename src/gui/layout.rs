@@ -103,12 +103,15 @@ pub(super) fn draw_main_window(
     // other takes the space, with a note where the popped one was)
     // (a laptop screen leaves the chat barely two lines otherwise)
     let default_bc = if screen.height() < 760.0 { 64.0 } else { 96.0 };
+    // (hovered, the chat grows over the broadcasts and the top section's cards)
+    let expand_over = egui::containers::panel::PanelState::load(ctx, egui::Id::new("top_section"))
+        .map_or(egui::Rect::NOTHING, |p| p.rect);
     egui::CentralPanel::default()
         // (top: clear of the top section's resize handle, which took clicks on the bar below)
         .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 8.0, top: 6.0, bottom: 4.0 }))
         .show(ctx, |ui| {
             match (state.broadcasts_window_open, state.chat_window_open) {
-                (false, false) => draw_chat_split(ui, state, default_bc),
+                (false, false) => draw_chat_split(ui, state, default_bc, expand_over),
                 (false, true) => {
                     let w = ui.available_width();
                     let bc_h = (ui.available_height() - 48.0).max(56.0);
@@ -122,7 +125,7 @@ pub(super) fn draw_main_window(
                     if chat_out {
                         draw_chat_placeholder(ui, state);
                     } else {
-                        draw_chat_area(ui, state);
+                        draw_chat_expandable(ui, state, expand_over);
                     }
                 }
             }
@@ -144,7 +147,7 @@ const CHAT_MIN_H: f32 = 120.0;
 
 /// The broadcasts and the chat, one above the other, with a bar between them to drag
 /// (up: a bigger chat, to the top: no broadcasts) or double-click (big chat / back).
-fn draw_chat_split(ui: &mut egui::Ui, state: &mut GuiState, default_bc: f32) {
+fn draw_chat_split(ui: &mut egui::Ui, state: &mut GuiState, default_bc: f32, expand_over: egui::Rect) {
     let total = ui.available_height();
     let w = ui.available_width();
     let max_bc = (total - SPLIT_BAR_H - CHAT_MIN_H).max(0.0);
@@ -194,7 +197,66 @@ fn draw_chat_split(ui: &mut egui::Ui, state: &mut GuiState, default_bc: f32) {
         crate::config::update_config_file(|c| c.broadcasts_share = share);
     }
 
-    draw_chat_area(ui, state);
+    draw_chat_expandable(ui, state, expand_over);
+}
+
+/// Hover this long before the chat grows (a mouse on its way to the message box doesn't
+/// flash it open).
+const CHAT_EXPAND_DELAY_S: f64 = 0.35;
+
+/// The chat in its place, grown over the broadcasts and the top section (`expand_over`)
+/// while the mouse is over it, to read back the whole QSO; it shrinks back when the mouse
+/// leaves. Pop out still gives it a window of its own.
+fn draw_chat_expandable(ui: &mut egui::Ui, state: &mut GuiState, expand_over: egui::Rect) {
+    let expand_top = if expand_over.is_positive() { expand_over.top() + 8.0 } else { ui.cursor().top() };
+    let ctx = ui.ctx().clone();
+    let home = egui::Rect::from_min_size(ui.cursor().min, ui.available_size().max(Vec2::ZERO));
+    let id = egui::Id::new("chat_hover_expand");
+    let area_id = id.with("area");
+    let now = ctx.input(|i| i.time);
+    let (mut open, hover_since) = ctx.data(|d| d.get_temp::<(bool, Option<f64>)>(id)).unwrap_or((false, None));
+    let t = ctx.animate_bool_with_time(id.with("t"), open, 0.12);
+    let top = egui::lerp(home.top()..=expand_top.min(home.top()), t);
+    let rect = egui::Rect::from_min_max(egui::pos2(home.left(), top), home.max);
+
+    // Over the chat itself, not a window (VMail, settings…) or menu lying on top of it
+    let pointer = ctx.input(|i| i.pointer.latest_pos());
+    let on_chat = |r: egui::Rect| pointer.is_some_and(|p| {
+        r.contains(p) && ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background || l.id == area_id)
+    });
+    let mut since = None;
+    if open {
+        // (kept open while a chat line's menu is up or a drag that started in it goes on)
+        open = on_chat(rect) || ctx.is_context_menu_open() || (ctx.is_using_pointer() && pointer.is_some_and(|p| rect.contains(p)));
+    } else if on_chat(home) && !ctx.input(|i| i.pointer.any_down()) {
+        let start = hover_since.unwrap_or(now);
+        open = now - start >= CHAT_EXPAND_DELAY_S;
+        if !open {
+            since = Some(start);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(CHAT_EXPAND_DELAY_S));
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, (open, since)));
+
+    if t == 0.0 {
+        draw_chat_area(ui, state);
+        return;
+    }
+    // Grown (or growing / shrinking): its place stays empty, the chat lies on top
+    ui.allocate_rect(home, egui::Sense::hover());
+    egui::Area::new(area_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .constrain(false)
+        .show(&ctx, |ui| {
+            ui.painter().rect_filled(rect.expand(6.0), theme::RADIUS + 6.0, theme::BG);
+            // (the top section's strip above the right-hand column, cleared to match)
+            if expand_over.is_positive() && expand_over.right() > rect.right() + 6.0 {
+                let strip = egui::Rect::from_min_max(egui::pos2(rect.right() + 6.0, top - 8.0), egui::pos2(expand_over.right(), expand_over.bottom()));
+                ui.painter().rect_filled(strip, 0.0, theme::BG);
+            }
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| draw_chat_area(ui, state));
+        });
 }
 
 // ---------------------------------------------------------------- chat in its own window
@@ -483,7 +545,7 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
                         if ui.selectable_label(state.current_frequency == sf.hz, label).clicked() {
                             pick = Some(sf.hz);
                         }
-                        if ui.small_button("✕").on_hover_text("Remove from my frequencies").clicked() {
+                        if ui.small_button("×").on_hover_text("Remove from my frequencies").clicked() {
                             remove = Some(i);
                         }
                     });
@@ -618,7 +680,12 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             };
             // (truncated, never wider than its column: a wider one pushed AUTO under CALL CQ)
             let beacon = theme::accent_button(RichText::new(label).size(12.5), theme::PURPLE).wrap_mode(egui::TextWrapMode::Truncate);
-            let beacon_click = ui.add_sized([w, 26.0], beacon).on_hover_text(tip).clicked();
+            // (no beacon over a link or a call in progress, as the automatic one; with the
+            // scanner on, the button only stops it)
+            let idle = state.session_state == SessionState::Idle;
+            let beacon_click = ui.add_enabled_ui(idle || state.freq_mode.scanning(), |ui| {
+                ui.add_sized([w, 26.0], beacon).on_hover_text(tip).on_disabled_hover_text("No beacons during a QSO")
+            }).inner.clicked();
             if beacon_click && state.freq_mode.scanning() {
                 // VarAC: pressing BEACON while the scanner runs switches the scanner off
                 state.set_freq_mode(crate::varac::scheduler::Mode::Inactive);
@@ -683,7 +750,10 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
                     }
                     state.status_msg = "CQ stopped".into();
                 }
-            } else if ui.add_sized([w, 26.0], theme::accent_button("CALL CQ", theme::PURPLE).wrap_mode(egui::TextWrapMode::Truncate)).clicked()
+            } else if ui.add_enabled_ui(state.session_state == SessionState::Idle, |ui| {
+                    ui.add_sized([w, 26.0], theme::accent_button("CALL CQ", theme::PURPLE).wrap_mode(egui::TextWrapMode::Truncate))
+                        .on_disabled_hover_text("No CQ during a QSO")
+                }).inner.clicked()
                 && state.modem_connected
             {
                 // VarAC: choose the slot to stand by on, unless the slot system is off
@@ -1961,7 +2031,7 @@ fn draw_composer(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage, qso_guid
     if let Some((_, quote)) = state.reply_to_chat.clone() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("REPLYING TO: {quote}")).small().color(theme::ACCENT));
-            if ui.small_button("✕").on_hover_text("Cancel the reply").clicked() {
+            if ui.small_button("×").on_hover_text("Cancel the reply").clicked() {
                 state.reply_to_chat = None;
             }
         });
