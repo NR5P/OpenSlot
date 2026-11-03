@@ -384,8 +384,8 @@ pub struct BuiltInModem {
     restart_after_stop: bool,
     /// The GUI's drive level as last seen, to notice the Tune window changing it.
     gui_drive: Option<i32>,
-    /// Started, its port not open yet: when, the status to show once it is, the last check
-    starting: Option<(Instant, String, Instant)>,
+    /// Started, not reporting its status yet: when, and the status to show once it does
+    starting: Option<(Instant, String)>,
     feed: Option<Arc<Feed>>,
     waterfall: WaterfallView,
 }
@@ -473,7 +473,7 @@ impl BuiltInModem {
                 RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
                 let running = format!("Running {} as {}", s.mode_label(), self.call.to_uppercase());
                 self.status = "Starting…".into();
-                self.starting = Some((Instant::now(), running, Instant::now()));
+                self.starting = Some((Instant::now(), running));
                 Ok(())
             }
             None => Err("a XARA modem is already running in this app".into()),
@@ -553,17 +553,18 @@ impl BuiltInModem {
             self.starting = None;
             self.status = format!("Stopped (exit {code}): {}", self.last_error());
         }
-        // Until its port opens. A long wait on macOS is usually it asking for the microphone
-        // (the audio can't start before that's answered), with its dialog behind this window.
-        if let Some((since, running, checked)) = &mut self.starting {
-            if checked.elapsed() >= Duration::from_millis(500) {
-                *checked = Instant::now();
-                if port_open(self.cmd_port) {
-                    self.status = std::mem::take(running);
-                    self.starting = None;
-                } else if cfg!(target_os = "macos") && since.elapsed() >= Duration::from_secs(4) {
-                    self.status = "Waiting for the audio to start — if macOS asks to use the microphone, click Allow".into();
-                }
+        // Until its status feed answers (its audio is up then). Not by trying its command port:
+        // it takes one client at a time, so once the GUI is connected that never answers, and a
+        // try could take the place the GUI is about to connect to. A long wait on macOS is
+        // usually it asking for the microphone (the audio can't start before that's answered),
+        // with its dialog behind this window.
+        if let Some((since, running)) = &mut self.starting {
+            let up = self.feed.as_ref().is_some_and(|f| f.latest().status.is_some());
+            if up || since.elapsed() >= Duration::from_secs(20) {
+                self.status = std::mem::take(running);
+                self.starting = None;
+            } else if cfg!(target_os = "macos") && since.elapsed() >= Duration::from_secs(4) {
+                self.status = "Waiting for the audio to start — if macOS asks to use the microphone, click Allow".into();
             }
         }
         if self.stopping.as_ref().is_some_and(|t| t.is_finished()) {
