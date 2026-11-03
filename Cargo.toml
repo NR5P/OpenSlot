@@ -1,6 +1,6 @@
 [package]
 name = "openslot"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 description = "Openslot: independent cross-platform client compatible with VarAC, built on the VARA modem TCP interface"
 license = "MIT OR Apache-2.0"
