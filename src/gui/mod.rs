@@ -2356,6 +2356,7 @@ impl VaracApp {
             }
             IncomingMessage::Broadcast(bc) => {
                 if bc.from.split('-').next().unwrap_or("").eq_ignore_ascii_case(self.state.my_callsign.split('-').next().unwrap_or("")) {
+                    self.state.broadcast_went_out(&bc.to);
                     sound::narrate(sound::Topic::MyBroadcasts, format!("Sending broadcast to {}", if bc.to.eq_ignore_ascii_case("ALL") { "all".to_string() } else { sound::phonetic(&bc.to) }));
                 } else {
                     sound::play(sound::Sound::Broadcast);
@@ -3453,7 +3454,18 @@ impl eframe::App for VaracApp {
         if self.state.settings_form.emcomm_mode {
             vmail_badge.push_str(" — EMCOMM");
         }
-        let title = if let Some(ref call) = self.state.connected_to {
+        let remote = self.remote_client.as_ref().map(|c| (c.view(), c.config.host.clone()));
+        let title = if let Some((v, host)) = remote {
+            // Controlling another station: its name, not this computer's (idle) modem
+            let name = if v.name.is_empty() { host.clone() } else { v.name.clone() };
+            let link = match &v.phase {
+                crate::remote::client::Phase::Connected => String::new(),
+                crate::remote::client::Phase::Connecting => " [CONNECTING]".into(),
+                crate::remote::client::Phase::Retrying(_) => " [RECONNECTING]".into(),
+                crate::remote::client::Phase::Denied(_) => " [REFUSED]".into(),
+            };
+            format!("Openslot — remote control of {name} ({host}){link}")
+        } else if let Some(ref call) = self.state.connected_to {
             format!("Openslot — {} [{}]{vmail_badge}", self.state.my_callsign, call)
         } else if !self.state.modem_connected {
             format!("Openslot — {} [OFFLINE]{vmail_badge}", self.state.my_callsign)
@@ -5702,7 +5714,7 @@ fn draw_broadcast_window(ctx: &egui::Context, state: &mut GuiState) {
                     state.send_cmd(GuiCommand::SendBroadcast { to, via, text });
                     state.broadcast_qsy_khz.clear();
                     state.broadcast_compose_open = false;
-                    state.status_msg = "Broadcast queued (goes out when the channel is free)".into();
+                    state.status_msg = state::BROADCAST_QUEUED.into();
                 }
                 if ui.button("Cancel").clicked() {
                     state.broadcast_compose_open = false;

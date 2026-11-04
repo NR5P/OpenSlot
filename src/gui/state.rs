@@ -88,6 +88,9 @@ pub enum SessionMsg {
     ModemFailed(String),
 }
 
+/// The status line while a broadcast waits in the queue (GuiState::broadcast_went_out).
+pub const BROADCAST_QUEUED: &str = "Broadcast queued (goes out when the channel is free)";
+
 /// Commands from the GUI to the async session.
 pub enum GuiCommand {
     Connect(String),
@@ -2233,6 +2236,14 @@ impl GuiState {
         crate::config::update_config_file(|c| c.schedule_last_state = Some(key));
     }
 
+    /// Our broadcast went out of the queue: the status line said it was waiting (it stayed
+    /// saying so after it was sent). A newer status line is left alone.
+    pub fn broadcast_went_out(&mut self, to: &str) {
+        if self.status_msg == BROADCAST_QUEUED {
+            self.status_msg = format!("Broadcast sent to {to}");
+        }
+    }
+
     /// The modem is calling a station for us (SessionMsg::Dialing): CONNECTING until it
     /// answers or the modem gives up, with the connect timeout counting from now.
     pub fn dialing(&mut self) {
@@ -2642,6 +2653,18 @@ mod connect_state_tests {
         assert_eq!((st.session_state, st.connect_started), (SessionState::Idle, None));
         assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
         assert!(st.status_msg.contains("timed out"));
+    }
+
+    /// The queued-broadcast status line gives way once it's sent, and only that line.
+    #[test]
+    fn a_sent_broadcast_is_no_longer_queued() {
+        let (mut st, _rx) = station();
+        st.status_msg = BROADCAST_QUEUED.into();
+        st.broadcast_went_out("ALL");
+        assert_eq!(st.status_msg, "Broadcast sent to ALL");
+        st.status_msg = "CQ stopped".into();
+        st.broadcast_went_out("ALL");
+        assert_eq!(st.status_msg, "CQ stopped", "a newer status line stays");
     }
 
     /// Only an idle station starts dialing: in a QSO (or already calling) nothing changes.
