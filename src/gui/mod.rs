@@ -221,6 +221,7 @@ impl VaracApp {
             if let Some(v) = cfg.allow_info_request { state.settings_form.allow_info_request = v; }
             if let Some(v) = cfg.load_history { state.settings_form.load_history = v; }
             state.broadcasts_share = cfg.broadcasts_share.map(|v| v.clamp(0.0, 1.0));
+            if let Some(v) = cfg.chat_grow_on_hover { state.chat_grow_on_hover = v; }
             if let Some(v) = cfg.font_size {
                 state.font_size = v.clamp(10.0, 24.0);
                 state.settings_form.font_size = v.to_string();
@@ -3810,6 +3811,18 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
                 if ui.small_button(RichText::new(label).color(theme::ACCENT)).on_hover_text(tip).clicked() {
                     state.chat_window_open = !state.chat_window_open;
                 }
+                // Pinned, the chat stays in its place in the main window instead of growing
+                // while hovered (a mouse passing over it opened it). Not in its own window.
+                if !state.chat_window_open {
+                    let pinned = !state.chat_grow_on_hover;
+                    let tip = if pinned { "Grow the chat on hover" } else { "Don't grow the chat on hover" };
+                    let glyph = RichText::new("📌").color(if pinned { theme::ACCENT } else { theme::MUTED });
+                    if ui.add(egui::Button::new(glyph).small().selected(pinned)).on_hover_text(tip).clicked() {
+                        state.chat_grow_on_hover = pinned;
+                        let v = state.chat_grow_on_hover;
+                        crate::config::update_config_file(|c| c.chat_grow_on_hover = Some(v));
+                    }
+                }
                 // Search toggle
                 if ui.small_button(if state.chat_search_active { "X" } else { "Search" }).clicked() {
                     state.chat_search_active = !state.chat_search_active;
@@ -6773,6 +6786,7 @@ fn save_config_file(state: &GuiState) {
         load_history: Some(form.load_history),
         font_size: form.font_size.parse().ok(),
         broadcasts_share: state.broadcasts_share,
+        chat_grow_on_hover: Some(state.chat_grow_on_hover),
         notifications_enabled: Some(form.notifications_enabled),
         sound_alerts: Some(form.sound_alerts),
         use_local_time: Some(form.use_local_time),

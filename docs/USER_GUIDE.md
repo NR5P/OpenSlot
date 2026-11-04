@@ -110,7 +110,7 @@ Type a callsign to connect to, ping or send VMail to. On VARA FM, `CALL VIA DIGI
 ### Centre: the QSO
 
 - **In QSO with** shows your partner: name, QTH, locator, distance and bearing, country, services, signal reports and a small SNR graph.
-- The **chat area** shows the conversation. System lines (in capitals) are Openslot's and VarAC's own notices.
+- The **chat area** shows the conversation. System lines (in capitals) are Openslot's and VarAC's own notices. Rest the mouse on it a moment and it grows over the broadcasts and the cards above to show the whole QSO, shrinking back when the mouse leaves; the 📌 button in its header pins it in place instead (click again to let it grow). **Pop out** opens the chat in a big window of its own.
 - The **message box** is where you type. With **Enter to send** on, Enter sends; off, Enter starts a new line and Ctrl+Enter sends. The small ↩ and ♡ buttons on a line reply to it or like it; right-click a line to copy or bookmark it.
 - Buttons around it: **SNR** (ask for a signal report), **INFO** (ask for their station info), **BBS LIST**, **INQUIRE…** (questions their VarAC answers by itself), **QSY**, **SEND VMAIL**, **SEND FILE**, **BROADCAST**, **PATH FINDER**, **LOG / LOG QSO**.
 - The **QSO log fields** (call, reports, band, name, QTH, locator, power, start and end time) fill in by themselves; you can correct them before logging.

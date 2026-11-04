@@ -145,6 +145,9 @@ pub struct ConfigFile {
     pub font_size: Option<f32>,
     /// Main window: the broadcasts' share of the space they split with the chat (drag bar)
     pub broadcasts_share: Option<f32>,
+    /// Main window: the chat grows over the broadcasts and top cards while hovered (the
+    /// chat's 📌 button); None = on
+    pub chat_grow_on_hover: Option<bool>,
     pub notifications_enabled: Option<bool>,
     pub sound_alerts: Option<bool>,
     pub use_local_time: Option<bool>,
