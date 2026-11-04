@@ -67,6 +67,16 @@ const AUDIO: (&str, xara::audio::Backend) = ("coreaudio", xara::audio::Backend::
 #[cfg(windows)]
 const AUDIO: (&str, xara::audio::Backend) = ("wasapi", xara::audio::Backend::Wasapi);
 
+/// The sound cards (inputs, outputs), listed on a thread of their own. Listing them through
+/// WASAPI puts the calling thread into multithreaded COM for good; done on the GUI's thread
+/// before its window opens (the modem starting at launch), winit's OleInitialize then fails
+/// and the Windows app panicked at start whenever the built-in modem was set up.
+fn audio_devices() -> std::io::Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    std::thread::spawn(|| xara::audio::list(AUDIO.1))
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("listing the sound cards failed")))
+}
+
 #[cfg(target_os = "linux")]
 const VIRTUAL_OUT: &str = "a PulseAudio / PipeWire null sink, e.g. pactl load-module module-null-sink sink_name=xara_out";
 #[cfg(target_os = "macos")]
@@ -491,7 +501,7 @@ impl BuiltInModem {
     /// endpoint, the card number on Linux. Then the one device whose name differs only in its
     /// numbers is the same device, and is saved in place of the old name.
     fn find_audio(&mut self) -> Result<(), String> {
-        let Ok((inputs, outputs)) = xara::audio::list(AUDIO.1) else {
+        let Ok((inputs, outputs)) = audio_devices() else {
             // (can't tell: let the modem try the names it has)
             return Ok(());
         };
@@ -613,7 +623,7 @@ impl BuiltInModem {
 
     fn refresh_devices(&mut self) {
         self.devices_listed = true;
-        match xara::audio::list(AUDIO.1) {
+        match audio_devices() {
             Ok((i, o)) => {
                 // (a description reads better than a device name; keep the name when there's none)
                 let named = |v: Vec<(String, String)>| -> Vec<(String, String)> {
@@ -1462,7 +1472,7 @@ pub fn register_remote_audio() {
             let mut a = xara::audio::open_capture(AUDIO.1, name)?;
             Ok(Box::new(move |buf: &mut [i16]| a.read(buf)) as Reader)
         }),
-        inputs: Box::new(|| xara::audio::list(AUDIO.1).map(|(inputs, _)| inputs).unwrap_or_default()),
+        inputs: Box::new(|| audio_devices().map(|(inputs, _)| inputs).unwrap_or_default()),
         default_input: Box::new(|| {
             let s = XaraSettings::load();
             if s.enabled { s.capture } else { String::new() }
