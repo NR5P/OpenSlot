@@ -1286,6 +1286,7 @@ impl Bridge {
             SessionEvent::Notice(m) => system(m),
             SessionEvent::FrameId { .. } => {}
             SessionEvent::TxStarted { .. } => {}
+            SessionEvent::RxProgress { .. } => {}
             SessionEvent::HandshakeComplete => {
                 self.conduct.link_open = true;
                 self.offer_mail().await;

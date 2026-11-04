@@ -268,6 +268,8 @@ Turn on **BBS File Transfer** in Settings → My Information and pick the folder
 
 Connect, click **BBS LIST**, then double-click a file to download it. Files bigger than your incoming-files limit are shown in red. The BBS list isn't available on a calling frequency; QSY first.
 
+While a file comes in, a card at the top of the chat shows how far along it is: how much has arrived, the speed and the time left. It turns green when the whole file is here and then fades away.
+
 ## Email gateways
 
 ### Using a gateway

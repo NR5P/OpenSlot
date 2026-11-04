@@ -659,6 +659,12 @@ impl VaracSession {
                 }
                 // (with the pause dropped no timer will release what waits: send it now)
                 let _ = self.pump_tx().await;
+                // A file on its way in: how much of its frame is here
+                if self.file_incoming {
+                    if let Some((received, total)) = partial_file_frame(&self.data_buf) {
+                        self.pending.push_back(SessionEvent::RxProgress { received, total });
+                    }
+                }
                 self.pending.pop_front()
             }
             SessionInput::SlotTimeout => {
@@ -2703,6 +2709,8 @@ pub enum SessionEvent {
     FrameId { outgoing: bool, id: u32, text: String },
     /// A frame of ours went to the modem: its text (lines joined by CRLF) and size in bytes.
     TxStarted { text: String, bytes: usize },
+    /// Part of an incoming file frame (`<SFB>`) is here: bytes so far of the frame's total.
+    RxProgress { received: usize, total: usize },
     /// A status line VarAC shows in the chat (e.g. a QSY request it ignored).
     Notice(String),
     /// Opening reports exchanged; normal traffic (queued VMail etc.) may start.
@@ -2718,6 +2726,18 @@ pub enum SessionEvent {
     /// `send_qsy_invitation` (VarAC's "Send QSY Invitation" dialog).
     QsyInvitationRequested,
     VaraEvent(VaraEvent),
+}
+
+/// The incoming `<SFB>` file frame at the head of `buf`, not complete yet: (bytes of it
+/// here, its declared length). The payload is base64, so one character is one byte.
+pub fn partial_file_frame(buf: &[u8]) -> Option<(usize, usize)> {
+    let space = buf.iter().take(12).position(|&b| b == b' ')?;
+    let total: usize = std::str::from_utf8(&buf[..space]).ok()?.parse().ok()?;
+    let payload = &buf[space + 1..];
+    if !payload.starts_with(b"<SFB") || total == 0 {
+        return None;
+    }
+    Some((payload.len().min(total), total))
 }
 
 /// Zip a VMail's attachments the way VarAC packages them (`<SFM:name.zip…>`).
@@ -2762,6 +2782,16 @@ pub fn vmail_package(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, std::io::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_file_frame_progress() {
+        assert_eq!(partial_file_frame(b"105 <SFB>H4sIAAAA"), Some((13, 105)));
+        // more than the frame (the next one started): capped at its length
+        assert_eq!(partial_file_frame(b"9 <SFB>QUJD12 <Q>"), Some((9, 9)));
+        assert_eq!(partial_file_frame(b"12 <Q>hello"), None);
+        assert_eq!(partial_file_frame(b"<SFB>"), None);
+        assert_eq!(partial_file_frame(b""), None);
+    }
 
     #[test]
     fn parse_opening_report() {

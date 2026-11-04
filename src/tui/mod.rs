@@ -965,7 +965,7 @@ async fn handle_session_event(
             let _ = session.answer_qsy(offset.is_some(), false, offset.unwrap_or(0)).await;
         }
         SessionEvent::QsyResolved => {}
-        SessionEvent::FrameId { .. } | SessionEvent::TxStarted { .. } => {}
+        SessionEvent::FrameId { .. } | SessionEvent::TxStarted { .. } | SessionEvent::RxProgress { .. } => {}
         SessionEvent::QsyInvitationRequested => {
             // No slot picker in the TUI: stay on frequency
             let _ = session.send_qsy_invitation(0).await;

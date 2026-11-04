@@ -410,9 +410,51 @@ impl RigControl for CatSerial {
         }
     }
 
+    fn get_alc(&mut self) -> RigResult<f32> {
+        match self.model {
+            // RM4 = the ALC meter, 000…255 (FTDX101/FT-710 add a second field)
+            CatModel::Ftdx3000 | CatModel::YaesuGeneric => {
+                let reply = self.send_cat_query("RM4;")?;
+                parse_yaesu_alc(&reply)
+            }
+            // RM reads the meter the radio shows: only an ALC one (P1 = 3, 0…30) counts
+            CatModel::KenwoodGeneric => {
+                let reply = self.send_cat_query("RM;")?;
+                parse_kenwood_alc(&reply)
+            }
+            // 15 13 = the ALC meter, BCD 0000…0120 across the ALC zone (Hamlib's IC-7300 scale)
+            CatModel::Icom(_) => {
+                let reply = self.civ(&[0x15, 0x13])?;
+                civ_alc(&reply)
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
+}
+
+fn parse_yaesu_alc(reply: &str) -> RigResult<f32> {
+    let digits = reply.trim().strip_prefix("RM4").and_then(|d| d.get(..3)).filter(|d| d.bytes().all(|b| b.is_ascii_digit()));
+    let raw: u32 = digits.and_then(|d| d.parse().ok()).ok_or_else(|| RigError::Protocol(format!("unexpected ALC reply: {reply}")))?;
+    Ok((raw as f32 / 255.0).min(1.0))
+}
+
+fn civ_alc(reply: &[u8]) -> RigResult<f32> {
+    let bcd = match reply {
+        [0x15, 0x13, hi, lo, ..] => [*hi, *lo],
+        _ => return Err(RigError::Protocol(format!("unexpected ALC reply: {reply:02X?}"))),
+    };
+    let raw = bcd.iter().fold(0u32, |n, b| n * 100 + u32::from(b >> 4) * 10 + u32::from(b & 0x0F));
+    Ok((raw as f32 / 120.0).min(1.0))
+}
+
+fn parse_kenwood_alc(reply: &str) -> RigResult<f32> {
+    let s = reply.trim().trim_end_matches(';');
+    let raw = s.strip_prefix("RM3").filter(|d| d.len() == 4).and_then(|d| d.parse::<u32>().ok())
+        .ok_or_else(|| RigError::Protocol(format!("the radio's meter isn't on ALC ({reply})")))?;
+    Ok((raw as f32 / 30.0).min(1.0))
 }
 
 fn model_name(model: CatModel) -> &'static str {
@@ -544,6 +586,19 @@ mod tests {
         bus.extend([0xFE, 0xFE, 0xE0, 0x94, 0x03, 0x00, 0x40, 0x07, 0x14, 0x00, 0xFD]);
         assert_eq!(civ_answer(&bus), Some(0x94));
         assert_eq!(civ_answer(b"ID0462;"), None);
+    }
+
+    #[test]
+    fn reads_alc_meters() {
+        assert_eq!(parse_yaesu_alc("RM4000;").unwrap(), 0.0);
+        assert_eq!(parse_yaesu_alc("RM4255;").unwrap(), 1.0);
+        assert!((parse_yaesu_alc("RM4051000;").unwrap() - 0.2).abs() < 1e-6);
+        assert!(parse_yaesu_alc("?;").is_err());
+        assert_eq!(parse_kenwood_alc("RM30015;").unwrap(), 0.5);
+        assert!(parse_kenwood_alc("RM10005;").is_err());
+        assert_eq!(civ_alc(&[0x15, 0x13, 0x00, 0x60]).unwrap(), 0.5);
+        assert_eq!(civ_alc(&[0x15, 0x13, 0x02, 0x55]).unwrap(), 1.0);
+        assert!(civ_alc(&[0xFB]).is_err());
     }
 
     #[test]
