@@ -81,6 +81,8 @@ pub enum SessionMsg {
     RxProgress { received: usize, total: usize },
     /// VARA's BITRATE line: speed level, bps, transmitting?
     Bitrate { level: u8, bps: u32, tx: bool },
+    /// The modem took our CONNECT: the call is on until CONNECTED or DISCONNECTED
+    Dialing,
     ModemConnected,
     ModemDisconnected,
     ModemFailed(String),
@@ -2231,6 +2233,34 @@ impl GuiState {
         crate::config::update_config_file(|c| c.schedule_last_state = Some(key));
     }
 
+    /// The modem is calling a station for us (SessionMsg::Dialing): CONNECTING until it
+    /// answers or the modem gives up, with the connect timeout counting from now.
+    pub fn dialing(&mut self) {
+        if self.session_state == SessionState::Idle {
+            self.session_state = SessionState::Connecting;
+            self.connect_started = Some(Utc::now());
+        }
+    }
+
+    /// The connect timeout: a call still unanswered after connect_timeout_secs is aborted
+    /// and the station is idle again (the modem's DISCONNECTED, if it comes, changes nothing).
+    pub fn check_connect_timeout(&mut self, now: chrono::DateTime<Utc>) {
+        let Some(start) = self.connect_started else { return };
+        if self.session_state != SessionState::Connecting {
+            // (answered, or not dialing yet: SessionMsg::Dialing starts the clock again)
+            self.connect_started = None;
+            return;
+        }
+        let timeout = self.connect_timeout_secs as i64;
+        if (now - start).num_seconds() >= timeout {
+            self.connect_started = None;
+            self.session_state = SessionState::Idle;
+            self.status_msg = "Connection timed out — aborting".into();
+            self.add_log(format!("Connection timeout after {timeout}s — sending abort"));
+            self.send_cmd(GuiCommand::Abort);
+        }
+    }
+
     /// Something that pauses the scanner (and defers a scheduled QSY): a QSO or connect,
     /// a CQ or beacon on the air, a ping, a slot wait, a tune.
     pub fn freq_mode_busy(&self) -> bool {
@@ -2573,5 +2603,59 @@ mod auto_tune_tests {
         assert_eq!(f.bps(), Some(800.0));
         f.samples = vec![s(0, 500), s(5, 500)];
         assert_eq!(f.bps(), None, "nothing new: no speed");
+    }
+}
+
+#[cfg(test)]
+mod connect_state_tests {
+    use super::*;
+
+    fn station() -> (GuiState, tokio::sync::mpsc::UnboundedReceiver<GuiCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (GuiState::new("NR5P".into(), true, tx), rx)
+    }
+
+    fn sent(rx: &mut tokio::sync::mpsc::UnboundedReceiver<GuiCommand>) -> Vec<GuiCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The modem taking our CONNECT makes the station CONNECTING (it used to stay IDLE, so
+    /// the timeout never ran and a second connect or a CQ wasn't refused).
+    #[test]
+    fn dialing_is_connecting_until_the_timeout() {
+        let (mut st, mut rx) = station();
+        st.connect_timeout_secs = 30;
+        // try_connect's stamp, before the modem has the call: cleared, nothing aborted
+        st.connect_started = Some(Utc::now());
+        st.check_connect_timeout(Utc::now());
+        assert_eq!((st.session_state, st.connect_started), (SessionState::Idle, None));
+
+        st.dialing();
+        assert_eq!(st.session_state, SessionState::Connecting);
+        let start = st.connect_started.expect("the timeout counts from the dialing");
+        assert!(st.freq_mode_busy(), "a call in progress pauses the scanner");
+        st.check_connect_timeout(start + chrono::Duration::seconds(29));
+        assert_eq!(st.session_state, SessionState::Connecting);
+        assert!(sent(&mut rx).is_empty());
+
+        st.check_connect_timeout(start + chrono::Duration::seconds(30));
+        assert_eq!((st.session_state, st.connect_started), (SessionState::Idle, None));
+        assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
+        assert!(st.status_msg.contains("timed out"));
+    }
+
+    /// Only an idle station starts dialing: in a QSO (or already calling) nothing changes.
+    #[test]
+    fn dialing_only_from_idle() {
+        let (mut st, _rx) = station();
+        st.session_state = SessionState::Connected;
+        st.dialing();
+        assert_eq!((st.session_state, st.connect_started), (SessionState::Connected, None));
+        // answered: the clock stops
+        st.session_state = SessionState::Idle;
+        st.dialing();
+        st.session_state = SessionState::Connected;
+        st.check_connect_timeout(Utc::now() + chrono::Duration::seconds(300));
+        assert_eq!((st.session_state, st.connect_started), (SessionState::Connected, None));
     }
 }

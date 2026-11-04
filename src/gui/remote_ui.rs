@@ -145,6 +145,7 @@ pub fn snapshot(state: &GuiState, server: &crate::remote::server::RemoteServer) 
 pub fn apply(state: &mut GuiState, db: &crate::storage::Storage, qso_guid: &Option<String>, who: &str, cmd: Command) -> Option<String> {
     use super::state::GuiCommand;
     let in_qso = matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect);
+    let dialing = state.session_state == SessionState::Connecting;
     let what = match &cmd {
         Command::Chat { .. } => "chat".to_string(),
         Command::Connect { call } => format!("connect to {call}"),
@@ -170,6 +171,9 @@ pub fn apply(state: &mut GuiState, db: &crate::storage::Storage, qso_guid: &Opti
             if in_qso {
                 return Some("Already in a QSO".into());
             }
+            if dialing {
+                return Some("Already connecting: abort first".into());
+            }
             if call.trim().is_empty() {
                 return Some("No callsign to connect to".into());
             }
@@ -187,8 +191,8 @@ pub fn apply(state: &mut GuiState, db: &crate::storage::Storage, qso_guid: &Opti
             if !state.modem_connected {
                 return Some("Modem not connected".into());
             }
-            if state.cq_active || in_qso {
-                return Some(if in_qso { "In a QSO".into() } else { "Already calling CQ".into() });
+            if state.cq_active || in_qso || dialing {
+                return Some(if in_qso { "In a QSO".into() } else if dialing { "Connecting to a station".into() } else { "Already calling CQ".into() });
             }
             // (on the slot the operator chose last, which needs the rig to move there)
             let slot = if state.rig_connected { state.cq_slot } else { 0 };
@@ -205,6 +209,10 @@ pub fn apply(state: &mut GuiState, db: &crate::storage::Storage, qso_guid: &Opti
         Command::Beacon => {
             if !state.modem_connected {
                 return Some("Modem not connected".into());
+            }
+            // (as the station's BEACON button, which only works idle)
+            if in_qso || dialing {
+                return Some("No beacons during a QSO".into());
             }
             super::layout::beacon_now(state);
         }
@@ -733,9 +741,20 @@ mod tests {
         assert!(!st.cq_active);
         assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
 
+        // Calling a station: a second connect, a CQ or a beacon is refused; ABORT stops it
+        st.session_state = SessionState::Connecting;
+        assert_eq!(apply(&mut st, &db, &none, "test", Command::Connect { call: "K1ABC".into() }), Some("Already connecting: abort first".into()));
+        assert_eq!(apply(&mut st, &db, &none, "test", Command::Cq), Some("Connecting to a station".into()));
+        assert_eq!(apply(&mut st, &db, &none, "test", Command::Beacon), Some("No beacons during a QSO".into()));
+        assert!(!st.cq_active);
+        assert!(sent(&mut rx).is_empty(), "nothing more went to the modem while calling");
+        assert_eq!(apply(&mut st, &db, &none, "test", Command::Abort), None);
+        assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
+
         // In a QSO: chat goes out (logged as ours), connect is refused, disconnect works
         st.session_state = SessionState::Connected;
         st.connected_to = Some("W5TST".into());
+        assert_eq!(apply(&mut st, &db, &none, "test", Command::Beacon), Some("No beacons during a QSO".into()));
         assert_eq!(apply(&mut st, &db, &none, "test", Command::Chat { text: "hello there".into() }), None);
         assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::SendChat(t)] if t == "hello there"));
         assert!(st.chat_lines.back().is_some_and(|l| l.is_outgoing && l.text == "hello there"));

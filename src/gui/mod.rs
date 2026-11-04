@@ -1236,6 +1236,7 @@ impl VaracApp {
                         band: Some(self.state.current_band.clone()),
                     });
                 }
+                SessionMsg::Dialing => self.state.dialing(),
                 SessionMsg::ModemConnected => {
                     self.state.modem_connected = true;
                     // (the modem was set to 500 Hz, VarAC's start; VARA HF only)
@@ -3112,20 +3113,7 @@ impl VaracApp {
         }
 
         // Connection timeout
-        if let Some(start) = self.state.connect_started {
-            if self.state.session_state == SessionState::Connecting {
-                let elapsed = (Utc::now() - start).num_seconds();
-                let timeout = self.state.connect_timeout_secs as i64;
-                if elapsed >= timeout {
-                    self.state.connect_started = None;
-                    self.state.status_msg = "Connection timed out — aborting".into();
-                    self.state.add_log(format!("Connection timeout after {timeout}s — sending abort"));
-                    self.state.send_cmd(GuiCommand::Abort);
-                }
-            } else {
-                self.state.connect_started = None;
-            }
-        }
+        self.state.check_connect_timeout(Utc::now());
 
         // Modem auto-reconnect
         if self.state.modem_auto_reconnect
@@ -10574,12 +10562,15 @@ async fn process_command(
         GuiCommand::Connect(dest) => {
             if let Some(sess) = session.as_mut() {
                 sess.mark_dialing();
-                let _ = sess.vara.send_command(
+                let sent = sess.vara.send_command(
                     &crate::vara::commands::VaraCommand::Connect {
                         source: callsign.to_string(),
                         destination: dest,
                     },
                 ).await;
+                if sent.is_ok() {
+                    let _ = session_tx.send(SessionMsg::Dialing);
+                }
             }
         }
         GuiCommand::Disconnect => {
