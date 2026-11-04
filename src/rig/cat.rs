@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use serialport::SerialPort;
 
-use super::{CatModel, RadioMode, RigControl, RigError, RigResult};
+use super::extras::interpolate;
+use super::{Agc, CatModel, Level, Meter, RadioMode, RigControl, RigError, RigResult, Switch};
 
 pub struct CatSerial {
     /// The port from the settings
@@ -36,6 +37,10 @@ impl CatSerial {
     }
 
     fn send_cat_query(&mut self, cmd: &str) -> RigResult<String> {
+        self.query_within(cmd, Duration::from_secs(2))
+    }
+
+    fn query_within(&mut self, cmd: &str, limit: Duration) -> RigResult<String> {
         let port = self.port.as_mut().ok_or(RigError::NotConnected)?;
 
         // Drop stale bytes (late replies, "?;" from a rejected set) before querying
@@ -48,7 +53,7 @@ impl CatSerial {
 
         let mut buf = [0u8; 256];
         let mut response = String::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + limit;
 
         loop {
             match port.read(&mut buf) {
@@ -176,6 +181,55 @@ impl CatSerial {
         let set_data = self.civ(&[0x1A, 0x06, u8::from(data), u8::from(data)]);
         if data { set_data.map(|_| ()) } else { Ok(()) }
     }
+
+    fn yaesu(&self) -> bool {
+        !matches!(self.model, CatModel::KenwoodGeneric)
+    }
+
+    /// The extra controls speak the Yaesu/Kenwood text CAT set; a CI-V radio isn't asked.
+    fn text_cat(&self) -> RigResult<()> {
+        if matches!(self.model, CatModel::Icom(_)) { Err(super::unsupported()) } else { Ok(()) }
+    }
+
+    /// The number in an extra control's reply ("AG0128;" after "AG0" → 128). A short wait:
+    /// a radio that doesn't know the command may just stay silent.
+    fn read_number(&mut self, cmd: &str, digits: usize) -> RigResult<u32> {
+        let prefix = cmd.trim_end_matches(';');
+        let reply = self.query_within(cmd, Duration::from_millis(400))?;
+        let body = reply.trim().trim_end_matches(';');
+        let rest = body.strip_prefix(prefix).ok_or_else(|| RigError::Protocol(format!("unexpected reply {reply:?} to {cmd}")))?;
+        let n: String = rest.chars().take(digits).collect();
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(RigError::Protocol(format!("unexpected reply {reply:?} to {cmd}")));
+        }
+        n.parse().map_err(|_| RigError::Protocol(format!("unexpected reply {reply:?} to {cmd}")))
+    }
+
+    /// Command prefix and full scale of a level, in this radio's CAT set.
+    fn level_cmd(&self, level: Level) -> (&'static str, f32) {
+        match (level, self.yaesu()) {
+            (Level::RfPower, _) => ("PC", 100.0),
+            (Level::AfGain, _) => ("AG0", 255.0),
+            (Level::RfGain, true) => ("RG0", 255.0),
+            (Level::RfGain, false) => ("RG", 255.0),
+            (Level::Squelch, true) => ("SQ0", 100.0),
+            (Level::Squelch, false) => ("SQ0", 255.0),
+            (Level::MicGain, _) => ("MG", 100.0),
+        }
+    }
+
+    fn switch_cmd(&self, switch: Switch) -> &'static str {
+        match (switch, self.yaesu()) {
+            (Switch::NoiseBlanker, true) => "NB0",
+            (Switch::NoiseReduction, true) => "NR0",
+            (Switch::Preamp, true) => "PA0",
+            (Switch::Attenuator, true) => "RA0",
+            (Switch::NoiseBlanker, false) => "NB",
+            (Switch::NoiseReduction, false) => "NR",
+            (Switch::Preamp, false) => "PA",
+            (Switch::Attenuator, false) => "RA",
+        }
+    }
 }
 
 /// Our CI-V address (the usual controller address)
@@ -248,6 +302,13 @@ fn civ_freq_bytes(hz: u64) -> [u8; 5] {
     }
     out
 }
+
+/// Yaesu's SWR meter (RM6, 0-255) as a ratio, after Hamlib's FTDX3000 table.
+const YAESU_SWR: [(f32, f32); 7] = [(0.0, 1.0), (26.0, 1.2), (52.0, 1.5), (89.0, 2.0), (126.0, 3.0), (173.0, 4.0), (236.0, 5.0)];
+/// Yaesu's S-meter (SM0, 0-255) in dB over S9 (S9 at 130, S9+60 at 255).
+const YAESU_S: [(f32, f32); 4] = [(0.0, -54.0), (12.0, -48.0), (130.0, 0.0), (255.0, 60.0)];
+/// Kenwood's S-meter (SM0, 0-30): S9 at 15, S9+60 at 30.
+const KENWOOD_S: [(f32, f32); 3] = [(0.0, -54.0), (15.0, 0.0), (30.0, 60.0)];
 
 impl RigControl for CatSerial {
     fn connect(&mut self) -> RigResult<()> {
@@ -427,6 +488,95 @@ impl RigControl for CatSerial {
                 let reply = self.civ(&[0x15, 0x13])?;
                 civ_alc(&reply)
             }
+        }
+    }
+
+    /// Yaesu: AC002 (tuner on, start tuning). The Kenwood family's AC differs per radio.
+    fn tune_atu(&mut self) -> RigResult<()> {
+        if !self.yaesu() {
+            return Err(RigError::Protocol("this radio's tuner isn't started over Kenwood CAT".into()));
+        }
+        self.send_cat_set("AC002;")
+    }
+
+    fn get_level(&mut self, level: Level) -> RigResult<f32> {
+        self.text_cat()?;
+        let (cmd, full) = self.level_cmd(level);
+        Ok(self.read_number(&format!("{cmd};"), 3)? as f32 / full)
+    }
+
+    fn set_level(&mut self, level: Level, value: f32) -> RigResult<()> {
+        self.text_cat()?;
+        let (cmd, full) = self.level_cmd(level);
+        let mut n = (value * full).round() as u32;
+        if level == Level::RfPower {
+            // (5 W is the least these radios take)
+            n = n.max(5);
+        }
+        self.send_cat_set(&format!("{cmd}{n:03};"))
+    }
+
+    fn get_switch(&mut self, switch: Switch) -> RigResult<bool> {
+        self.text_cat()?;
+        let cmd = self.switch_cmd(switch);
+        // (Kenwood's attenuator answers two digits: RA01)
+        let digits = if switch == Switch::Attenuator && !self.yaesu() { 2 } else { 1 };
+        Ok(self.read_number(&format!("{cmd};"), digits)? != 0)
+    }
+
+    fn set_switch(&mut self, switch: Switch, on: bool) -> RigResult<()> {
+        self.text_cat()?;
+        let cmd = self.switch_cmd(switch);
+        // (Kenwood's attenuator takes two digits)
+        let v = if switch == Switch::Attenuator && !self.yaesu() { format!("{:02}", on as u8) } else { (on as u8).to_string() };
+        self.send_cat_set(&format!("{cmd}{v};"))
+    }
+
+    fn get_agc(&mut self) -> RigResult<Agc> {
+        self.text_cat()?;
+        if !self.yaesu() {
+            // (the Kenwood family's GT values differ from radio to radio)
+            return Err(RigError::Protocol("AGC isn't read on Kenwood CAT".into()));
+        }
+        // GT0: 0 off, 1 fast, 2 mid, 3 slow, 4-6 auto (reported as auto-fast/mid/slow)
+        Ok(match self.read_number("GT0;", 1)? {
+            0 => Agc::Off,
+            1 => Agc::Fast,
+            2 => Agc::Medium,
+            3 => Agc::Slow,
+            _ => Agc::Auto,
+        })
+    }
+
+    fn set_agc(&mut self, agc: Agc) -> RigResult<()> {
+        self.text_cat()?;
+        if !self.yaesu() {
+            return Err(RigError::Protocol("AGC isn't set on Kenwood CAT".into()));
+        }
+        let n = match agc {
+            Agc::Off => 0,
+            Agc::Fast => 1,
+            Agc::Medium => 2,
+            Agc::Slow => 3,
+            Agc::Auto => 4,
+        };
+        self.send_cat_set(&format!("GT0{n};"))
+    }
+
+    fn get_meter(&mut self, meter: Meter) -> RigResult<f32> {
+        if matches!(self.model, CatModel::Icom(_)) {
+            // (CI-V: the ALC meter only, as the Tune window reads it)
+            return if matches!(meter, Meter::Alc) { self.get_alc() } else { Err(super::unsupported()) };
+        }
+        match (meter, self.yaesu()) {
+            (Meter::Signal, true) => Ok(interpolate(&YAESU_S, self.read_number("SM0;", 3)? as f32)),
+            (Meter::Signal, false) => Ok(interpolate(&KENWOOD_S, self.read_number("SM0;", 4)? as f32)),
+            // RM: 4 ALC, 5 power out, 6 SWR, each 0-255
+            (Meter::Power, true) => Ok(self.read_number("RM5;", 3)? as f32 / 255.0),
+            (Meter::Swr, true) => Ok(interpolate(&YAESU_SWR, self.read_number("RM6;", 3)? as f32)),
+            (Meter::Alc, true) => Ok(self.read_number("RM4;", 3)? as f32 / 255.0),
+            // (the Kenwood family's RM numbering differs from radio to radio)
+            (_, false) => Err(RigError::Protocol("not read on Kenwood CAT".into())),
         }
     }
 
@@ -617,5 +767,19 @@ mod tests {
     fn ftdx3000_defaults_to_8_digits() {
         let c = CatSerial::new("/dev/null", 38400, CatModel::Ftdx3000);
         assert_eq!(format!("FA{:0w$};", 14_105_000u64, w = c.freq_digits), "FA14105000;");
+    }
+
+    /// Extra controls' replies are read after their own prefix, whatever follows.
+    #[test]
+    fn extra_control_commands() {
+        let y = CatSerial::new("/dev/null", 38400, CatModel::Ftdx3000);
+        assert_eq!(y.level_cmd(Level::AfGain), ("AG0", 255.0));
+        assert_eq!(y.switch_cmd(Switch::Preamp), "PA0");
+        let k = CatSerial::new("/dev/null", 38400, CatModel::KenwoodGeneric);
+        assert_eq!(k.level_cmd(Level::RfGain), ("RG", 255.0));
+        assert_eq!(k.switch_cmd(Switch::NoiseBlanker), "NB");
+        assert_eq!(interpolate(&YAESU_S, 130.0), 0.0);
+        assert_eq!(interpolate(&YAESU_SWR, 0.0), 1.0);
+        assert_eq!(interpolate(&KENWOOD_S, 30.0), 60.0);
     }
 }

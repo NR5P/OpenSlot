@@ -5,7 +5,8 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use super::{RadioMode, RigControl, RigError, RigResult};
+use super::extras::interpolate;
+use super::{Level, Meter, RadioMode, RigControl, RigError, RigResult, Switch};
 
 pub struct FlrigClient {
     host: String,
@@ -13,6 +14,8 @@ pub struct FlrigClient {
     connected: bool,
     /// FLRig's own name for the data mode (its mode list differs per radio)
     data_mode: Option<String>,
+    /// The radio's full power in watts (rig.get_maxpwr; 100 where FLRig doesn't say)
+    max_power: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,7 +62,7 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
 
 impl FlrigClient {
     pub fn new(host: &str, port: u16) -> Self {
-        Self { host: host.to_string(), port, connected: false, data_mode: None }
+        Self { host: host.to_string(), port, connected: false, data_mode: None, max_power: None }
     }
 
     fn call(&mut self, method: &str, params: &[Value]) -> RigResult<String> {
@@ -95,6 +98,18 @@ impl FlrigClient {
             .unwrap_or_else(|| "USB-D".into());
         self.data_mode = Some(pick.clone());
         pick
+    }
+
+    fn number(&mut self, method: &str) -> RigResult<f32> {
+        let v = self.call(method, &[])?;
+        v.trim().parse::<f32>().map_err(|_| RigError::Protocol(format!("FLRig: bad value {v:?} from {method}")))
+    }
+
+    fn full_power(&mut self) -> f32 {
+        if self.max_power.is_none() {
+            self.max_power = Some(self.number("rig.get_maxpwr").ok().filter(|&w| w >= 1.0).unwrap_or(100.0));
+        }
+        self.max_power.unwrap_or(100.0)
     }
 
     fn raw_modes(&mut self) -> Vec<String> {
@@ -179,8 +194,66 @@ impl RigControl for FlrigClient {
         self.call("rig.tune", &[Value::Int(1)]).map(|_| ())
     }
 
+    // FLRig's levels are 0-100 (power in watts); a method this FLRig or radio lacks is a fault
+    fn get_level(&mut self, level: Level) -> RigResult<f32> {
+        if level == Level::RfPower {
+            let full = self.full_power();
+            return Ok(self.number("rig.get_power")? / full);
+        }
+        Ok(self.number(&format!("rig.get_{}", level_method(level)))? / 100.0)
+    }
+
+    fn set_level(&mut self, level: Level, value: f32) -> RigResult<()> {
+        let n = if level == Level::RfPower { value * self.full_power() } else { value * 100.0 };
+        let method = if level == Level::RfPower { "rig.set_power".to_string() } else { format!("rig.set_{}", level_method(level)) };
+        self.call(&method, &[Value::Int(n.round() as i64)]).map(|_| ())
+    }
+
+    fn get_switch(&mut self, switch: Switch) -> RigResult<bool> {
+        Ok(self.number(&format!("rig.get_{}", switch_method(switch)))? != 0.0)
+    }
+
+    fn set_switch(&mut self, switch: Switch, on: bool) -> RigResult<()> {
+        self.call(&format!("rig.set_{}", switch_method(switch)), &[Value::Int(on as i64)]).map(|_| ())
+    }
+
+    fn get_meter(&mut self, meter: Meter) -> RigResult<f32> {
+        match meter {
+            Meter::Signal => Ok(interpolate(&FLRIG_S, self.number("rig.get_smeter")?)),
+            Meter::Power => {
+                let full = self.full_power();
+                Ok(self.number("rig.get_pwrmeter")? / full)
+            }
+            Meter::Swr => Ok(interpolate(&FLRIG_SWR, self.number("rig.get_swrmeter")?)),
+            Meter::Alc => Err(RigError::Protocol("FLRig has no ALC reading".into())),
+        }
+    }
+
     fn name(&self) -> &str {
         "FLRig"
+    }
+}
+
+/// FLRig's S-meter (0-100: S9 at 50) in dB over S9, and its SWR meter (0-100) as a ratio.
+const FLRIG_S: [(f32, f32); 3] = [(0.0, -54.0), (50.0, 0.0), (100.0, 60.0)];
+const FLRIG_SWR: [(f32, f32); 5] = [(0.0, 1.0), (25.0, 1.5), (50.0, 2.0), (75.0, 3.0), (100.0, 5.0)];
+
+fn level_method(level: Level) -> &'static str {
+    match level {
+        Level::RfPower => "power",
+        Level::AfGain => "volume",
+        Level::RfGain => "rfgain",
+        Level::Squelch => "squelch",
+        Level::MicGain => "micgain",
+    }
+}
+
+fn switch_method(switch: Switch) -> &'static str {
+    match switch {
+        Switch::NoiseBlanker => "noise",
+        Switch::NoiseReduction => "noise_reduction",
+        Switch::Preamp => "preamp",
+        Switch::Attenuator => "attenuator",
     }
 }
 

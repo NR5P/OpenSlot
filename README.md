@@ -54,6 +54,14 @@ Openslot is **not** VarAC itself and is not affiliated with or endorsed by its a
 - **Frequency Polling** — Reads the radio frequency about every 1.5 seconds; on CAT a missed frequency change is retried (as VarAC does)
 - **Mode Control** — Sets the configured radio mode (USB, USB-D, DATA-U, FM, FM-D; VarAC UsbMode) before every frequency change
 - **Settings Persistence** — Rig backend, host/port, serial port, baud rate, model saved to config
+- **Rig controls window** — Power, AF/RF gain, squelch, mic gain, NB/NR, preamp, attenuator, AGC, mode, S/power/SWR/ALC meters and the antenna tuner, in a window opened from the frequency card; only the controls the radio offers are shown
+- **Tune AUTO** — Steps the modem drive level on the tune carrier to the highest one where the radio's ALC barely moves
+- **Share the radio** — A Hamlib `rigctld`-compatible server (NET rigctl) so loggers, WSJT-X, fldigi and others use the radio through Openslot (Settings → RIG); transmitting only when allowed, and never unkeying a VARA transmission
+
+### Remote Control
+- **Control the station from elsewhere on the LAN** — Another Openslot (Mac, Windows or Linux, any mix) or a phone's web browser runs the Openslot at the radio: chat, connect, CQ, beacons, frequency, rig controls (Remote menu)
+- **Receive audio** — Listen to the radio on the remote, when the station has an audio input for it (optional)
+- **Password protected** — Challenge-response (the password is never sent), lockout after wrong passwords; `--remote HOST` starts straight into a station
 
 ### Desktop GUI
 - **Native desktop GUI** (egui) with VarAC-like layout:

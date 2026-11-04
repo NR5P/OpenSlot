@@ -446,9 +446,6 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             if !state.current_band.is_empty() {
                 theme::pill(ui, state.current_band.clone(), theme::ACCENT).on_hover_text("Band");
             }
-            if let Some(m) = state.rig_mode {
-                theme::pill(ui, m.to_string(), theme::PURPLE).on_hover_text("Radio mode");
-            }
             if state.freq_mode.scanning() {
                 theme::pill(ui, if state.freq_mode == crate::varac::scheduler::Mode::Ale { "ALE" } else { "SCANNING" }, theme::YELLOW);
             }
@@ -685,14 +682,8 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
             if beacon_click && state.freq_mode.scanning() {
                 // VarAC: pressing BEACON while the scanner runs switches the scanner off
                 state.set_freq_mode(crate::varac::scheduler::Mode::Inactive);
-            } else if beacon_click
-                && state.modem_connected
-                && !state.refuse_wide_on_calling_freq()
-            {
-                let source = state.beacon_source();
-                let bandwidth = state.cq_bandwidth();
-                state.send_cmd(GuiCommand::SendCq { source, bandwidth });
-                state.last_beacon_sent = Some(Utc::now());
+            } else if beacon_click {
+                beacon_now(state);
             }
             auto_toggle(ui, &mut state.beacon_auto_enabled, "Send beacons automatically".into());
         });
@@ -811,11 +802,18 @@ fn draw_slot_row(ui: &mut egui::Ui, state: &mut GuiState) {
         {
             state.return_to_cf();
         }
+        // The radio's mode (beside the band, with RIG TX, it crowded the header)
+        if let Some(m) = state.rig_mode {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                theme::pill(ui, m.to_string(), theme::PURPLE).on_hover_text("Radio mode");
+            });
+        }
     });
     // VarAC's bandwidth buttons (VARA HF): the modem's speed; 500 Hz on calling frequencies
     // (a row of their own: beside the slot controls they ran over the CF label)
-    if state.modem_type() == crate::vara::commands::ModemType::Hf {
-        ui.horizontal(|ui| {
+    // (the rig controls button ends this row: beside the slot controls it ran into the CF)
+    ui.horizontal(|ui| {
+        if state.modem_type() == crate::vara::commands::ModemType::Hf {
             theme::caption(ui, "BW");
             ui.spacing_mut().item_spacing.x = 4.0;
             for hz in ["500", "2300", "2750"] {
@@ -827,8 +825,21 @@ fn draw_slot_row(ui: &mut egui::Ui, state: &mut GuiState) {
                     state.set_bandwidth(hz);
                 }
             }
+        }
+        // The rest of the radio's controls, in a window of their own
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let open = state.rig_panel_open;
+            let b = egui::Button::new(RichText::new("RIG CONTROLS").size(11.0).color(theme::TEXT))
+                .small().selected(open);
+            if ui.add_enabled(state.rig_backend != crate::rig::RigBackend::None, b)
+                .on_hover_text(if open { "Hide the rig controls" } else { "More rig controls: power, gains, NB/NR, preamp, AGC, mode, meters, tuner" })
+                .on_disabled_hover_text("Set up rig control first (Settings → RIG Control)")
+                .clicked()
+            {
+                state.rig_panel_open = !open;
+            }
         });
-    }
+    });
     if let Some((s, _, until)) = state.slot_wait {
         let left = (until - Utc::now()).num_seconds().max(0);
         ui.horizontal(|ui| {
@@ -1253,7 +1264,17 @@ fn draw_callsign_box(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
     }
 }
 
-fn try_connect(state: &mut GuiState) {
+/// SEND BEACONS: a beacon now (refused off the air, or too wide on a calling frequency).
+pub(super) fn beacon_now(state: &mut GuiState) {
+    if state.modem_connected && !state.refuse_wide_on_calling_freq() {
+        let source = state.beacon_source();
+        let bandwidth = state.cq_bandwidth();
+        state.send_cmd(GuiCommand::SendCq { source, bandwidth });
+        state.last_beacon_sent = Some(Utc::now());
+    }
+}
+
+pub(super) fn try_connect(state: &mut GuiState) {
     if state.connect_callsign.is_empty() || !state.modem_connected {
         if !state.modem_connected {
             state.status_msg = "Modem not connected".into();
@@ -2141,12 +2162,21 @@ fn draw_composer(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage, qso_guid
     }
     if do_send && !state.input_text.trim().is_empty() {
         let typed = std::mem::take(&mut state.input_text);
-        // Our chat commands work in a QSO too (/disconnect, /away…): they went out to the
-        // partner as text. Any other "/…" is still just text.
-        if connected && crate::gui::is_chat_command(&typed) {
-            handle_chat_slash_command(state, typed.trim());
-            return;
-        }
+        send_typed(state, db, qso_guid, typed);
+    }
+}
+
+/// Sends a typed message as SEND does (a remote station's chat lines too): VarAC's tags
+/// expanded, AI mode, the line it replies to, and logged; out of a QSO, a /command.
+pub(super) fn send_typed(state: &mut GuiState, db: &Storage, qso_guid: &Option<String>, typed: String) {
+    let connected = state.session_state == SessionState::Connected;
+    // Our chat commands work in a QSO too (/disconnect, /away…): they went out to the
+    // partner as text. Any other "/…" is still just text.
+    if connected && crate::gui::is_chat_command(&typed) {
+        handle_chat_slash_command(state, typed.trim());
+        return;
+    }
+    {
         // VarAC expands its tags in everything it sends (<NAME>, <RIG>, <HCALL>, <UTCDT> …)
         let mut text = if connected { state.expand_tags(&typed) } else { typed };
         // AI MODE (VarAC): everything we type goes to the partner's AI gateway

@@ -8,8 +8,12 @@ pub mod rigctld;
 pub mod cat;
 pub mod flrig;
 pub mod rotator;
+pub mod extras;
+pub mod share;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub use extras::{Agc, Item, Level, Meter, RigAction, RigExtras, Switch};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RadioMode {
     Usb,
     Lsb,
@@ -20,6 +24,14 @@ pub enum RadioMode {
     Fm,
     /// FM data (VarAC's "FM-D")
     FmData,
+}
+
+impl RadioMode {
+    /// The modes the Rig controls window offers, in its order.
+    pub const ALL: [RadioMode; 8] = [
+        RadioMode::UsbData, RadioMode::Usb, RadioMode::LsbData, RadioMode::Lsb,
+        RadioMode::Cw, RadioMode::Am, RadioMode::Fm, RadioMode::FmData,
+    ];
 }
 
 impl fmt::Display for RadioMode {
@@ -92,7 +104,34 @@ pub trait RigControl: Send {
     fn get_alc(&mut self) -> RigResult<f32> {
         Err(RigError::Protocol("this rig control can't read the ALC meter".into()))
     }
+    // The Rig controls window (see extras.rs). Each defaults to "not offered"; a backend
+    // answers for what its radio can do, and the worker hides whatever errors.
+    fn get_level(&mut self, _level: Level) -> RigResult<f32> {
+        Err(unsupported())
+    }
+    fn set_level(&mut self, _level: Level, _value: f32) -> RigResult<()> {
+        Err(unsupported())
+    }
+    fn get_switch(&mut self, _switch: Switch) -> RigResult<bool> {
+        Err(unsupported())
+    }
+    fn set_switch(&mut self, _switch: Switch, _on: bool) -> RigResult<()> {
+        Err(unsupported())
+    }
+    fn get_agc(&mut self) -> RigResult<Agc> {
+        Err(unsupported())
+    }
+    fn set_agc(&mut self, _agc: Agc) -> RigResult<()> {
+        Err(unsupported())
+    }
+    fn get_meter(&mut self, _meter: Meter) -> RigResult<f32> {
+        Err(unsupported())
+    }
     fn name(&self) -> &str;
+}
+
+fn unsupported() -> RigError {
+    RigError::Protocol("not offered by this rig control".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -544,6 +583,15 @@ pub enum RigCommand {
     TuneAtu,
     /// Read the ALC meter once (answered with [`RigEvent::Alc`]), also while transmitting
     ReadAlc,
+    /// Read the extra controls and meters (the Rig controls window is open, or a remote
+    /// station is watching); off, nothing but the frequency and mode is asked for.
+    WatchExtras(bool),
+    /// The modem is transmitting (keyed by VOX or the modem's own PTT, not through us):
+    /// read the transmit meters meanwhile.
+    TxHint(bool),
+    SetLevel(Level, f32),
+    SetSwitch(Switch, bool),
+    SetAgc(Agc),
     /// Unkey and stop the worker thread.
     Shutdown,
 }
@@ -559,6 +607,8 @@ pub enum RigEvent {
     AlcSupported(bool),
     /// An ALC reading, 0.0 … 1.0
     Alc(f32),
+    /// The extra controls' values (while watched)
+    Extras(RigExtras),
     Error(String),
 }
 
@@ -649,6 +699,9 @@ pub struct RigManager {
     connected: bool,
     last_freq: Option<u64>,
     last_mode: Option<RadioMode>,
+    /// WatchExtras and TxHint as last sent
+    watching: bool,
+    tx_hint: bool,
 }
 
 #[allow(dead_code)]
@@ -679,6 +732,8 @@ impl RigManager {
             connected: false,
             last_freq: None,
             last_mode: None,
+            watching: false,
+            tx_hint: false,
         }
     }
 
@@ -719,6 +774,32 @@ impl RigManager {
         self.send(RigCommand::PollFreq);
     }
 
+    /// Read the extra controls (or stop); sent only when it changes.
+    pub fn watch_extras(&mut self, on: bool) {
+        if on != self.watching {
+            self.watching = on;
+            self.send(RigCommand::WatchExtras(on));
+        }
+    }
+
+    /// The modem is transmitting (sent only when it changes).
+    pub fn tx_hint(&mut self, on: bool) {
+        if on != self.tx_hint {
+            self.tx_hint = on;
+            self.send(RigCommand::TxHint(on));
+        }
+    }
+
+    pub fn apply(&self, action: RigAction) {
+        self.send(match action {
+            RigAction::Mode { mode } => RigCommand::SetMode(mode),
+            RigAction::Level { level, value } => RigCommand::SetLevel(level, value),
+            RigAction::Switch { switch, on } => RigCommand::SetSwitch(switch, on),
+            RigAction::Agc { agc } => RigCommand::SetAgc(agc),
+            RigAction::Tune => RigCommand::TuneAtu,
+        });
+    }
+
     pub fn poll_events(&mut self) -> Vec<RigEvent> {
         let mut events = Vec::new();
         while let Ok(ev) = self.event_rx.try_recv() {
@@ -727,7 +808,7 @@ impl RigManager {
                 RigEvent::Disconnected => self.connected = false,
                 RigEvent::FreqUpdate(f) => self.last_freq = Some(*f),
                 RigEvent::ModeUpdate(m) => self.last_mode = Some(*m),
-                RigEvent::PttUpdate(_) | RigEvent::AlcSupported(_) | RigEvent::Alc(_) | RigEvent::Error(_) => {}
+                RigEvent::PttUpdate(_) | RigEvent::AlcSupported(_) | RigEvent::Alc(_) | RigEvent::Extras(_) | RigEvent::Error(_) => {}
             }
             events.push(ev);
         }
@@ -760,6 +841,12 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_FAILURES: u32 = 3;
 /// Safety net: never hold the transmitter keyed longer than this.
 const PTT_WATCHDOG: Duration = Duration::from_secs(180);
+/// While the extra controls are watched: one of them is read at most this often, between
+/// frequency polls, so a PTT command never waits behind more than one read.
+const EXTRA_INTERVAL: Duration = Duration::from_millis(150);
+/// Transmitting, the power/SWR/ALC meters are read no more often than this: some rigs
+/// dislike CAT traffic in TX, and unkeying must stay quick.
+const TX_METER_INTERVAL: Duration = Duration::from_millis(600);
 
 struct Worker {
     rig: Box<dyn RigControl>,
@@ -776,6 +863,17 @@ struct Worker {
     mode_readable: bool,
     /// The ALC meter answered at connect
     alc_readable: bool,
+    watch_extras: bool,
+    extras: RigExtras,
+    /// What the radio answers to, once asked (None: not yet)
+    offered: Option<Vec<Item>>,
+    /// Still to ask about, and where the round of reads is
+    to_probe: Vec<Item>,
+    next_read: usize,
+    last_extra: Instant,
+    extras_sent: Option<RigExtras>,
+    extras_sent_at: Instant,
+    tx_hint: bool,
 }
 
 impl Worker {
@@ -790,6 +888,11 @@ impl Worker {
                 self.failures = 0;
                 self.last_connect_error = None;
                 self.mode_readable = true;
+                // (another radio may answer now: ask about its controls again)
+                self.offered = None;
+                self.to_probe = Item::all();
+                self.extras = RigExtras::default();
+                self.extras_sent = None;
                 self.emit(RigEvent::Connected(self.rig.name().to_string()));
                 self.poll(true);
                 // (a refusal or no answer here only means no ALC: it doesn't count against the link)
@@ -934,6 +1037,39 @@ impl Worker {
             RigCommand::PollFreq if self.rig.is_connected() && self.ptt_since.is_none() => {
                 self.poll(false);
             }
+            RigCommand::WatchExtras(on) => {
+                self.watch_extras = on;
+                if on {
+                    // (the last values at once, even before the next read)
+                    self.extras_sent = None;
+                    self.send_extras();
+                }
+            }
+            RigCommand::TxHint(on) => self.tx_hint = on,
+            RigCommand::SetLevel(level, v) if self.rig.is_connected() => {
+                let v = v.clamp(0.0, 1.0);
+                match self.rig.set_level(level, v) {
+                    Ok(()) => {
+                        self.extras.levels.insert(level, v);
+                        self.send_extras();
+                    }
+                    Err(e) => self.emit(RigEvent::Error(format!("{}: {e}", level.label()))),
+                }
+            }
+            RigCommand::SetSwitch(sw, on) if self.rig.is_connected() => match self.rig.set_switch(sw, on) {
+                Ok(()) => {
+                    self.extras.switches.insert(sw, on);
+                    self.send_extras();
+                }
+                Err(e) => self.emit(RigEvent::Error(format!("{}: {e}", sw.tip()))),
+            },
+            RigCommand::SetAgc(agc) if self.rig.is_connected() => match self.rig.set_agc(agc) {
+                Ok(()) => {
+                    self.extras.agc = Some(agc);
+                    self.send_extras();
+                }
+                Err(e) => self.emit(RigEvent::Error(format!("AGC: {e}"))),
+            },
             RigCommand::Shutdown => return false,
             _ => {}
         }
@@ -956,14 +1092,122 @@ impl Worker {
                 )));
                 self.set_ptt(false);
             }
-            // Don't poll while transmitting: keeps PTT-off latency low and some rigs dislike CAT traffic in TX.
+            // Don't poll while transmitting: keeps PTT-off latency low and some rigs dislike
+            // CAT traffic in TX. (Only the TX meters, slowly, while someone is watching them.)
+            if self.watch_extras && self.last_extra.elapsed() >= TX_METER_INTERVAL {
+                self.read_extra(true);
+            }
             return;
         }
 
         let suppressed = self.poll_suppress_until.is_some_and(|t| Instant::now() < t);
         if !suppressed && self.last_poll.elapsed() >= POLL_INTERVAL {
             self.poll(true);
+        } else if self.watch_extras {
+            // (keyed by VOX or the modem: the transmit meters, as slowly as when we key it)
+            let every = if self.tx_hint { TX_METER_INTERVAL } else { EXTRA_INTERVAL };
+            if self.last_extra.elapsed() >= every {
+                self.read_extra(self.tx_hint);
+            }
         }
+    }
+
+    /// Reads one extra control: first each in turn to learn which the radio offers, then the
+    /// offered ones round and round (the S-meter every other read, so it moves).
+    fn read_extra(&mut self, transmitting: bool) {
+        self.last_extra = Instant::now();
+        // (transmitting, only the transmit meters are asked about: the rest after it, while
+        // those already found are read meanwhile)
+        let next = self.to_probe.iter().rposition(|&i| !transmitting || matches!(i, Item::Meter(m) if m.transmit()));
+        if let Some(at) = next {
+            let item = self.to_probe.remove(at);
+            if self.read_item(item) {
+                self.offered.get_or_insert_with(Vec::new).push(item);
+            }
+            if self.to_probe.is_empty() {
+                self.offered.get_or_insert_with(Vec::new);
+                self.extras.probed = true;
+            }
+            self.send_extras();
+            return;
+        }
+        // Every other read: the S-meter receiving, the ALC transmitting (Tune → AUTO SET)
+        let signal = Item::Meter(if transmitting { Meter::Alc } else { Meter::Signal });
+        let round: Vec<Item> = self.offered.iter().flatten().copied()
+            .filter(|&i| matches!(i, Item::Meter(m) if m.transmit()) == transmitting && i != signal)
+            .collect();
+        self.next_read = self.next_read.wrapping_add(1);
+        let has_signal = self.offered.iter().flatten().any(|&i| i == signal);
+        let item = match (has_signal, round.is_empty()) {
+            (false, true) => return,
+            (true, true) => signal,
+            (true, false) if self.next_read % 2 == 0 => signal,
+            _ => round[(self.next_read / 2) % round.len()],
+        };
+        if !self.read_item(item) {
+            // (rejected now: stop asking, as with the mode)
+            if let Some(o) = self.offered.as_mut() {
+                o.retain(|&i| i != item);
+            }
+        }
+        self.send_extras();
+    }
+
+    /// Reads `item` into `extras`; false when the radio doesn't offer it. A timeout or I/O
+    /// error counts as not offered too, but never as a lost link: the frequency poll
+    /// decides that.
+    fn read_item(&mut self, item: Item) -> bool {
+        let x = &mut self.extras;
+        match item {
+            Item::Level(l) => match self.rig.get_level(l) {
+                Ok(v) => {
+                    x.levels.insert(l, v.clamp(0.0, 1.0));
+                    true
+                }
+                Err(_) => {
+                    x.levels.remove(&l);
+                    false
+                }
+            },
+            Item::Switch(s) => match self.rig.get_switch(s) {
+                Ok(v) => {
+                    x.switches.insert(s, v);
+                    true
+                }
+                Err(_) => {
+                    x.switches.remove(&s);
+                    false
+                }
+            },
+            Item::Agc => {
+                x.agc = self.rig.get_agc().ok();
+                x.agc.is_some()
+            }
+            Item::Meter(m) => match self.rig.get_meter(m) {
+                Ok(v) if v.is_finite() => {
+                    x.meters.insert(m, v);
+                    if m == Meter::Alc {
+                        x.alc_reads = x.alc_reads.wrapping_add(1);
+                    }
+                    true
+                }
+                _ => {
+                    x.meters.remove(&m);
+                    false
+                }
+            },
+        }
+    }
+
+    fn send_extras(&mut self) {
+        // (unchanged, still once a second: a steady meter is still a fresh reading)
+        let same = self.extras_sent.as_ref() == Some(&self.extras);
+        if !self.watch_extras || (same && self.extras_sent_at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.extras_sent = Some(self.extras.clone());
+        self.extras_sent_at = Instant::now();
+        self.emit(RigEvent::Extras(self.extras.clone()));
     }
 
     fn shutdown(&mut self) {
@@ -992,6 +1236,15 @@ fn rig_worker(
         ptt_since: None,
         mode_readable: true,
         alc_readable: false,
+        watch_extras: false,
+        extras: RigExtras::default(),
+        offered: None,
+        to_probe: Item::all(),
+        next_read: 0,
+        last_extra: Instant::now(),
+        extras_sent: None,
+        extras_sent_at: Instant::now(),
+        tx_hint: false,
     };
 
     loop {
@@ -1136,6 +1389,148 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(got, Some(14_103_500));
+    }
+
+    /// The extra controls: read only while watched, only those the radio answers to, and a
+    /// change reads back at once.
+    #[test]
+    fn extras_are_learned_and_set() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let level_reads = Arc::new(AtomicUsize::new(0));
+        let reads = level_reads.clone();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut power = 0.5f32;
+            for line in BufReader::new(s).lines() {
+                let Ok(line) = line else { return };
+                let l = line.trim();
+                // (the one "l ALC" at connect is the Tune window's AUTO asking, not an extra)
+                if (l.starts_with("l ") || l.starts_with("u ")) && l != "l ALC" {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+                let reply = match l {
+                    "f" => "14105000\n".to_string(),
+                    "m" => "PKTUSB\n3000\n".to_string(),
+                    "l RFPOWER" => format!("{power}\n"),
+                    "l STRENGTH" => "-6\n".to_string(),
+                    "u NB" => "1\n".to_string(),
+                    "l ALC" => "0.25\n".to_string(),
+                    l if l.starts_with("L RFPOWER ") => {
+                        power = l[10..].parse().unwrap();
+                        "RPRT 0\n".to_string()
+                    }
+                    l if l.starts_with("l ") || l.starts_with("u ") => "RPRT -11\n".to_string(),
+                    _ => "RPRT 0\n".to_string(),
+                };
+                if w.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut mgr = RigBackend::Rigctld { host: "127.0.0.1".into(), port }.into_manager().unwrap();
+        let wait = |mgr: &mut RigManager, what: &str, f: &dyn Fn(&RigExtras) -> bool| -> RigExtras {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for ev in mgr.poll_events() {
+                    if let RigEvent::Extras(x) = ev {
+                        if f(&x) {
+                            return x;
+                        }
+                    }
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        while !mgr.is_connected() {
+            mgr.poll_events();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(level_reads.load(Ordering::SeqCst), 0, "nothing extra is read unless watched");
+
+        mgr.watch_extras(true);
+        let x = wait(&mut mgr, "the controls learned", &|x| x.probed);
+        assert_eq!(x.levels.keys().copied().collect::<Vec<_>>(), vec![Level::RfPower]);
+        assert_eq!(x.switches.get(&Switch::NoiseBlanker), Some(&true));
+        assert_eq!(x.meters.get(&Meter::Signal), Some(&-6.0));
+        assert_eq!(x.agc, None);
+
+        mgr.apply(RigAction::Level { level: Level::RfPower, value: 0.8 });
+        wait(&mut mgr, "the new power", &|x| x.levels.get(&Level::RfPower) == Some(&0.8));
+
+        // Keyed by VOX (not through us): the transmit meters are read meanwhile
+        mgr.tx_hint(true);
+        wait(&mut mgr, "an ALC reading in transmit", &|x| x.alc_reads > 0 && x.meters.get(&Meter::Alc) == Some(&0.25));
+        mgr.tx_hint(false);
+
+        mgr.watch_extras(false);
+        std::thread::sleep(Duration::from_millis(300));
+        let before = level_reads.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(level_reads.load(Ordering::SeqCst), before, "unwatched, the reads stop");
+    }
+
+    /// Keyed straight away (Tune → AUTO SET before the controls were ever learned): the
+    /// ALC is still read again and again, the rest learned after the transmission.
+    #[test]
+    fn transmit_meters_before_the_rest_is_learned() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            for line in BufReader::new(s).lines() {
+                let Ok(line) = line else { return };
+                let reply = match line.trim() {
+                    "f" => "7105000\n",
+                    "m" => "PKTUSB\n3000\n",
+                    "l ALC" => "0.1\n",
+                    "l AF" => "0.3\n",
+                    l if l.starts_with("l ") || l.starts_with("u ") => "RPRT -11\n",
+                    _ => "RPRT 0\n",
+                };
+                if w.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut mgr = RigBackend::Rigctld { host: "127.0.0.1".into(), port }.into_manager().unwrap();
+        while !mgr.is_connected() {
+            mgr.poll_events();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        mgr.watch_extras(true);
+        mgr.tx_hint(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = RigExtras::default();
+        while last.alc_reads < 4 {
+            assert!(Instant::now() < deadline, "the ALC wasn't read repeatedly: {last:?}");
+            for ev in mgr.poll_events() {
+                if let RigEvent::Extras(x) = ev {
+                    last = x;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!last.probed && last.levels.is_empty(), "the receive controls wait for the transmission to end");
+        mgr.tx_hint(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !last.probed {
+            assert!(Instant::now() < deadline, "not learned after the transmission");
+            for ev in mgr.poll_events() {
+                if let RigEvent::Extras(x) = ev {
+                    last = x;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(last.levels.get(&Level::AfGain), Some(&0.3));
     }
 
     #[test]

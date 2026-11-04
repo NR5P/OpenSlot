@@ -48,6 +48,11 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 mail-parser = "1.0.0"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+# Remote mode: playing a station's audio on this computer
+cpal = { version = "0.15.3", optional = true }
 
 # The XARA modem, from a checkout next to this one (Desktop\xara beside Desktop\varac-rust).
 # Registered VARA speeds are built in but used only when the user says they hold a VARA
@@ -60,6 +65,10 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [build-dependencies]
 embed-resource = "3"
+
+[features]
+default = ["remote-audio"]
+remote-audio = ["dep:cpal"]
 
 [profile.release]
 strip = true

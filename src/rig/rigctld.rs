@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use super::{RadioMode, RigControl, RigError, RigResult};
+use super::{Agc, Level, Meter, RadioMode, RigControl, RigError, RigResult, Switch};
 
 pub struct RigctldClient {
     host: String,
@@ -15,6 +15,8 @@ pub struct RigctldClient {
     /// a fresh `BufReader` per command would swallow buffered extra lines
     /// (e.g. the passband line after `m`) and desync every later reply.
     conn: Option<(TcpStream, BufReader<TcpStream>)>,
+    /// The preamp / attenuator step (dB) the radio accepted or reported, to switch back on
+    steps: std::collections::HashMap<&'static str, u32>,
 }
 
 impl RigctldClient {
@@ -23,7 +25,28 @@ impl RigctldClient {
             host: host.to_string(),
             port,
             conn: None,
+            steps: Default::default(),
         }
+    }
+
+    /// A one-line reply (`l`, `u`): its value, or the error code as an error.
+    fn query_value(&mut self, cmd: &str) -> RigResult<String> {
+        let reply = self.send_cmd(cmd)?;
+        if reply.starts_with("RPRT") {
+            Self::check_rprt(&reply)?;
+            return Err(RigError::Protocol(reply));
+        }
+        Ok(reply.trim().to_string())
+    }
+
+    fn query_f32(&mut self, cmd: &str) -> RigResult<f32> {
+        let v = self.query_value(cmd)?;
+        v.parse::<f32>().map_err(|_| RigError::Protocol(format!("bad value {v:?} for {cmd}")))
+    }
+
+    fn set(&mut self, cmd: &str) -> RigResult<()> {
+        let reply = self.send_cmd(cmd)?;
+        Self::check_rprt(&reply)
     }
 
     fn read_line(&mut self) -> RigResult<String> {
@@ -140,9 +163,114 @@ impl RigControl for RigctldClient {
         reply.trim().parse::<f32>().map_err(|e| RigError::Protocol(format!("bad ALC level {reply:?}: {e}")))
     }
 
+    fn get_level(&mut self, level: Level) -> RigResult<f32> {
+        self.query_f32(&format!("l {}", level_name(level)))
+    }
+
+    fn set_level(&mut self, level: Level, value: f32) -> RigResult<()> {
+        self.set(&format!("L {} {value:.3}", level_name(level)))
+    }
+
+    fn get_switch(&mut self, switch: Switch) -> RigResult<bool> {
+        match switch {
+            Switch::NoiseBlanker => Ok(self.query_value("u NB")? == "1"),
+            Switch::NoiseReduction => Ok(self.query_value("u NR")? == "1"),
+            // Hamlib has these as levels in dB (0 = off)
+            Switch::Preamp | Switch::Attenuator => {
+                let name = step_name(switch);
+                let db = self.query_f32(&format!("l {name}"))? as u32;
+                if db > 0 {
+                    self.steps.insert(name, db);
+                }
+                Ok(db > 0)
+            }
+        }
+    }
+
+    fn set_switch(&mut self, switch: Switch, on: bool) -> RigResult<()> {
+        match switch {
+            Switch::NoiseBlanker => self.set(&format!("U NB {}", on as u8)),
+            Switch::NoiseReduction => self.set(&format!("U NR {}", on as u8)),
+            Switch::Preamp | Switch::Attenuator => {
+                let name = step_name(switch);
+                if !on {
+                    return self.set(&format!("L {name} 0"));
+                }
+                // Hamlib takes only the radio's own steps: the one seen before, else the usual ones
+                let tries: Vec<u32> = match self.steps.get(name) {
+                    Some(&db) => vec![db],
+                    None if switch == Switch::Preamp => vec![10, 20, 12, 6, 1],
+                    None => vec![6, 12, 10, 20, 18, 3, 1],
+                };
+                let mut last = Err(unsupported_step());
+                for db in tries {
+                    last = self.set(&format!("L {name} {db}"));
+                    if last.is_ok() {
+                        self.steps.insert(name, db);
+                        break;
+                    }
+                    if last.as_ref().is_err_and(|e| e.is_link_failure()) {
+                        break;
+                    }
+                }
+                last
+            }
+        }
+    }
+
+    fn get_agc(&mut self) -> RigResult<Agc> {
+        // Hamlib's AGC levels: 0 off, 1 superfast, 2 fast, 3 slow, 4 user, 5 medium, 6 auto
+        Ok(match self.query_f32("l AGC")? as i32 {
+            0 => Agc::Off,
+            1 | 2 => Agc::Fast,
+            3 => Agc::Slow,
+            5 => Agc::Medium,
+            _ => Agc::Auto,
+        })
+    }
+
+    fn set_agc(&mut self, agc: Agc) -> RigResult<()> {
+        let n = match agc {
+            Agc::Off => 0,
+            Agc::Fast => 2,
+            Agc::Medium => 5,
+            Agc::Slow => 3,
+            Agc::Auto => 6,
+        };
+        self.set(&format!("L AGC {n}"))
+    }
+
+    fn get_meter(&mut self, meter: Meter) -> RigResult<f32> {
+        match meter {
+            // dB relative to S9, as Hamlib reports it
+            Meter::Signal => self.query_f32("l STRENGTH"),
+            Meter::Power => self.query_f32("l RFPOWER_METER"),
+            Meter::Swr => self.query_f32("l SWR"),
+            Meter::Alc => self.query_f32("l ALC"),
+        }
+    }
+
     fn name(&self) -> &str {
         "rigctld"
     }
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::RfPower => "RFPOWER",
+        Level::AfGain => "AF",
+        Level::RfGain => "RF",
+        Level::Squelch => "SQL",
+        Level::MicGain => "MICGAIN",
+    }
+}
+
+fn step_name(switch: Switch) -> &'static str {
+    if switch == Switch::Preamp { "PREAMP" } else { "ATT" }
+}
+
+fn unsupported_step() -> RigError {
+    RigError::Protocol("the radio took none of the usual steps".into())
 }
 
 fn parse_rigctld_mode(s: &str) -> RigResult<RadioMode> {
@@ -215,6 +343,16 @@ mod tests {
                         "RPRT 0\n".into()
                     } else if line == "l ALC" {
                         "0.250000\n".into()
+                    } else if line == "l RFPOWER" {
+                        "0.500000\n".into()
+                    } else if line == "l STRENGTH" {
+                        "-12\n".into()
+                    } else if line == "u NB" {
+                        "1\n".into()
+                    } else if line == "l PREAMP" {
+                        "0\n".into()
+                    } else if line == "L PREAMP 20" || line.starts_with("L RFPOWER ") {
+                        "RPRT 0\n".into()
                     } else {
                         "RPRT -11\n".into()
                     };
@@ -248,5 +386,24 @@ mod tests {
         c.connect().unwrap();
         c.set_mode(RadioMode::UsbData).unwrap();
         c.set_mode(RadioMode::Usb).unwrap();
+    }
+
+    /// The extra controls: values come back in Hamlib's units, and a refused one is an error.
+    #[test]
+    fn extra_controls() {
+        let port = fake_server();
+        let mut c = RigctldClient::new("localhost", port);
+        c.connect().unwrap();
+        assert_eq!(c.get_level(Level::RfPower).unwrap(), 0.5);
+        c.set_level(Level::RfPower, 0.25).unwrap();
+        assert!(c.get_level(Level::Squelch).is_err());
+        assert_eq!(c.get_meter(Meter::Signal).unwrap(), -12.0);
+        assert!(c.get_switch(Switch::NoiseBlanker).unwrap());
+        assert!(!c.get_switch(Switch::Preamp).unwrap());
+        // (10 dB refused, then 20 taken)
+        c.set_switch(Switch::Preamp, true).unwrap();
+        assert_eq!(c.steps.get("PREAMP"), Some(&20));
+        // still in step with the stream
+        assert_eq!(c.get_freq().unwrap(), 14_105_000);
     }
 }

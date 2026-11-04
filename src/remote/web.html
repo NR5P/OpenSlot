@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1017">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<title>Openslot Remote</title>
+<style>
+:root {
+  --bg: #0d1017; --surface: #141821; --raised: #1b2130; --border: #2d3445;
+  --text: #e2e8f0; --muted: #8c97ab; --accent: #38bdf8; --green: #34d399;
+  --yellow: #fbbf24; --red: #f87171; --purple: #c084fc; --tx: #ef4444;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-text-size-adjust: 100%; }
+body { display: flex; flex-direction: column; }
+button, input, select { font: inherit; color: inherit; }
+button { background: var(--raised); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
+  cursor: pointer; touch-action: manipulation; }
+button:active { filter: brightness(1.3); }
+button:disabled { opacity: .4; }
+button.on { background: color-mix(in srgb, var(--accent) 25%, var(--raised)); border-color: var(--accent); color: var(--accent); }
+button.primary { background: var(--accent); color: #04121b; border-color: var(--accent); font-weight: 600; }
+button.danger { background: color-mix(in srgb, var(--red) 22%, var(--raised)); border-color: var(--red); color: var(--red); font-weight: 600; }
+button.purple { background: color-mix(in srgb, var(--purple) 20%, var(--raised)); border-color: var(--purple); color: var(--purple); font-weight: 600; }
+input[type=text], input[type=password], select { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 10px; min-width: 0; }
+input:focus { outline: none; border-color: var(--accent); }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+  border: 1px solid currentColor; background: color-mix(in srgb, currentColor 14%, transparent); }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > .grow { flex: 1; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.caption { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.wrap { width: 100%; max-width: 760px; margin: 0 auto; padding: 0 12px; }
+header { padding: calc(env(safe-area-inset-top) + 8px) 0 8px; background: var(--surface); border-bottom: 1px solid var(--border); }
+header .name { font-weight: 700; font-size: 16px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; }
+.dot.ok { background: var(--green); } .dot.bad { background: var(--red); }
+.strip { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.freq { font-size: 26px; font-weight: 600; letter-spacing: .02em; }
+.freq small { font-size: 16px; color: var(--muted); }
+main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 12px 0; }
+section { display: none; flex-direction: column; gap: 12px; }
+section.show { display: flex; }
+nav { background: var(--surface); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom); }
+nav .wrap { display: flex; }
+nav button { flex: 1; background: none; border: 0; border-radius: 0; padding: 12px 4px; color: var(--muted); font-weight: 600; }
+nav button.on { color: var(--accent); background: none; box-shadow: inset 0 2px 0 var(--accent); }
+#chat { display: flex; flex-direction: column; gap: 4px; min-height: 120px; }
+.line { word-wrap: break-word; }
+.line .t { color: var(--muted); font-size: 11.5px; margin-right: 6px; }
+.line .c { font-weight: 700; margin-right: 6px; }
+.line.sys { color: var(--muted); font-style: italic; }
+.line.out .c { color: var(--accent); } .line.in .c { color: var(--green); }
+.composer { position: sticky; bottom: 0; background: var(--bg); padding-top: 8px; }
+.list button { width: 100%; text-align: left; display: flex; gap: 10px; margin-bottom: 6px; }
+.list .call { font-weight: 700; min-width: 86px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.lvl { display: grid; grid-template-columns: 74px 1fr 46px; gap: 8px; align-items: center; margin: 6px 0; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.meter { display: grid; grid-template-columns: 34px 1fr 64px; gap: 8px; align-items: center; margin: 4px 0; }
+.bar { height: 12px; border-radius: 4px; background: var(--raised); border: 1px solid var(--border); overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--green); transition: width .15s; }
+#login { flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px; }
+#login .card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 12px; }
+#notice { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(70px + env(safe-area-inset-bottom));
+  background: var(--raised); border: 1px solid var(--yellow); color: var(--yellow); padding: 8px 14px; border-radius: 10px;
+  max-width: 90%; display: none; z-index: 5; }
+.hide { display: none !important; }
+details summary { cursor: pointer; list-style: none; }
+details summary::-webkit-details-marker { display: none; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="card">
+    <div><span class="name" style="font-size:20px;font-weight:700">Open<span style="color:var(--accent)">slot</span></span>
+      <span class="muted"> remote</span></div>
+    <div class="muted small" id="loginInfo">Control the Openslot at your radio.</div>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+    <label class="small muted row"><input type="checkbox" id="remember"> Remember on this device</label>
+    <button class="primary" id="go">Connect</button>
+    <div class="small" id="loginErr" style="color:var(--red)"></div>
+  </div>
+</div>
+
+<div id="app" class="hide" style="display:flex;flex-direction:column;flex:1;min-height:0">
+  <header>
+    <div class="wrap">
+      <div class="row">
+        <span class="dot" id="dot"></span>
+        <span class="name" id="station">Openslot</span>
+        <span class="pill" id="txrx" style="color:var(--green)">RX</span>
+        <span class="grow"></span>
+        <input type="range" id="vol" min="0" max="1" step="0.05" value="0.8" class="hide" style="width:80px">
+        <button id="listen" class="hide">Listen</button>
+      </div>
+      <div class="strip">
+        <span class="freq mono" id="freq">—</span>
+        <span class="pill" id="band" style="color:var(--accent)"></span>
+        <span class="pill hide" id="mode" style="color:var(--purple)"></span>
+        <span class="pill hide" id="cf" style="color:var(--yellow)">CF</span>
+      </div>
+      <div class="small muted" id="partner"></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <!-- CHAT -->
+      <section id="tab-chat" class="show">
+        <div class="card">
+          <div class="row">
+            <input type="text" id="call" class="grow mono" placeholder="Callsign" autocapitalize="characters" autocomplete="off">
+            <button class="primary" id="connect">Connect</button>
+            <button id="abort">Abort</button>
+          </div>
+          <div class="small muted" id="link" style="margin-top:6px"></div>
+        </div>
+        <div class="card"><div id="chat"></div></div>
+        <div class="composer">
+          <div class="row">
+            <input type="text" id="msg" class="grow" placeholder="Message…" autocomplete="off" enterkeyhint="send">
+            <button class="primary" id="send">Send</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- STATIONS -->
+      <section id="tab-stations">
+        <div class="grid2">
+          <button id="cq">Call CQ</button>
+          <button class="purple" id="beacon">Send beacon</button>
+        </div>
+        <label class="row small"><input type="checkbox" id="autobeacon"> Automatic beacons</label>
+        <div class="card list"><div class="caption" id="cqTitle">CQ calls</div><div id="cqList"></div></div>
+        <div class="card list"><div class="caption" id="bcTitle">Beacons</div><div id="bcList"></div></div>
+      </section>
+
+      <!-- RADIO -->
+      <section id="tab-radio">
+        <div class="card">
+          <div class="caption">Frequency</div>
+          <div class="row" style="margin-top:8px">
+            <input type="text" id="tuneTo" class="grow mono" placeholder="14.1055 MHz" inputmode="decimal">
+            <button class="primary" id="tune">Tune</button>
+          </div>
+          <select id="cfs" style="width:100%;margin-top:8px"><option value="">VarAC calling frequencies…</option></select>
+        </div>
+        <div class="card">
+          <details id="rigBox">
+            <summary class="row"><span class="caption grow">Rig controls</span><span class="muted small" id="rigHint">tap to open</span></summary>
+            <div id="rig" style="margin-top:10px"></div>
+          </details>
+        </div>
+        <div class="small muted" id="statusLine"></div>
+      </section>
+    </div>
+  </main>
+
+  <nav>
+    <div class="wrap">
+      <button data-tab="chat" class="on">Chat</button>
+      <button data-tab="stations">Stations</button>
+      <button data-tab="radio">Radio</button>
+    </div>
+  </nav>
+</div>
+<div id="notice"></div>
+
+<script>
+"use strict";
+// ---- SHA-256 / HMAC (the password's proof; crypto.subtle needs HTTPS, which a LAN page isn't)
+function sha256(bytes) {
+  const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,
+    0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,
+    0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,
+    0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,
+    0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const len = bytes.length, total = ((len + 9 + 63) >> 6) << 6;
+  const m = new Uint8Array(total); m.set(bytes); m[len] = 0x80;
+  const dv = new DataView(m.buffer);
+  dv.setUint32(total - 4, (len * 8) >>> 0); dv.setUint32(total - 8, Math.floor(len / 0x20000000));
+  const w = new Uint32Array(64);
+  const r = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = r(w[i-15], 7) ^ r(w[i-15], 18) ^ (w[i-15] >>> 3), s1 = r(w[i-2], 17) ^ r(w[i-2], 19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+      const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+  }
+  const out = new Uint8Array(32); const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, H[i]);
+  return out;
+}
+function hmacHex(key, msg) {
+  const enc = new TextEncoder();
+  let k = enc.encode(key); if (k.length > 64) k = sha256(k);
+  const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ipad[i] = (k[i] || 0) ^ 0x36; opad[i] = (k[i] || 0) ^ 0x5c; }
+  const m = enc.encode(msg);
+  const inner = new Uint8Array(64 + m.length); inner.set(ipad); inner.set(m, 64);
+  const ih = sha256(inner);
+  const outer = new Uint8Array(96); outer.set(opad); outer.set(ih, 64);
+  return Array.from(sha256(outer), b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- state
+const $ = id => document.getElementById(id);
+const CFS = [[1838000,"160m"],[3595000,"80m"],[5357000,"60m"],[7105000,"40m"],[10133000,"30m"],[14105000,"20m"],
+  [18107000,"17m"],[21105000,"15m"],[24927000,"12m"],[28105000,"10m"],[50305000,"6m"]];
+let ws = null, password = "", authed = false, status = {}, rig = null, stations = {cq: [], beacons: []};
+let retry = null, pingTimer = null, denied = false;
+
+const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} } };
+
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function cmd(c) { if (!authed) return notice("Not connected to the station"); send(Object.assign({type: "cmd"}, c)); }
+function notice(text) {
+  const n = $("notice"); n.textContent = text; n.style.display = "block";
+  clearTimeout(notice.t); notice.t = setTimeout(() => n.style.display = "none", 4000);
+}
+function fmtFreq(hz) {
+  if (!hz) return "—";
+  const mhz = Math.floor(hz / 1e6), khz = Math.floor(hz / 1000) % 1000, h = hz % 1000;
+  return `${mhz}.${String(khz).padStart(3, "0")}<small>.${String(h).padStart(3, "0")}</small>`;
+}
+function parseFreq(t) {
+  t = t.trim().toLowerCase().replace(",", ".");
+  const n = parseFloat(t); if (!isFinite(n) || n <= 0) return null;
+  if (t.includes("khz") || (!t.includes("mhz") && n >= 1000)) return Math.round(n * 1000);
+  return Math.round(n * 1e6);
+}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+// ---- connection
+function connect() {
+  clearTimeout(retry);
+  denied = false;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  setDot("");
+  ws.onmessage = ev => {
+    if (typeof ev.data !== "string") return audioFrame(ev.data);
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    switch (m.type) {
+      case "hello":
+        $("loginInfo").textContent = `${m.name}'s Openslot ${m.version}`;
+        send({type: "auth", proof: hmacHex(password, "openslot:" + m.nonce), client: "Browser (" + (navigator.platform || "phone") + ")"});
+        break;
+      case "welcome":
+        authed = true;
+        if ($("remember").checked) store.set("openslot.pw", password);
+        $("login").classList.add("hide"); $("app").classList.remove("hide");
+        $("listen").classList.toggle("hide", !m.audio);
+        setDot("ok");
+        if (listening) cmd({cmd: "audio", on: true});
+        break;
+      case "denied":
+        denied = true; authed = false;
+        store.set("openslot.pw", null);
+        showLogin("The station refused: " + m.reason);
+        break;
+      case "status": status = m; renderStatus(); break;
+      case "chat": renderChat(m.lines); break;
+      case "stations": stations = m; renderStations(); break;
+      case "rig": rig = m; renderRig(); renderStatus(); break;
+      case "notice": notice(m.text); break;
+    }
+  };
+  ws.onclose = () => {
+    authed = false; setDot("bad");
+    clearInterval(pingTimer);
+    if (!denied && password) retry = setTimeout(connect, 3000);
+  };
+  clearInterval(pingTimer);
+  pingTimer = setInterval(() => send({type: "ping"}), 5000);
+}
+function setDot(c) { $("dot").className = "dot " + c; }
+function showLogin(err) {
+  $("app").classList.add("hide"); $("login").classList.remove("hide");
+  $("loginErr").textContent = err || "";
+}
+$("go").onclick = () => { password = $("pw").value; if (!password) return; $("loginErr").textContent = ""; connect(); };
+$("pw").onkeydown = e => { if (e.key === "Enter") $("go").click(); };
+document.addEventListener("visibilitychange", () => {
+  // (phones drop sockets in the background: back at once on return)
+  if (!document.hidden && password && !denied && (!ws || ws.readyState > 1)) connect();
+});
+
+// ---- rendering
+function renderStatus() {
+  const s = status;
+  $("station").textContent = s.callsign ? `${s.callsign}'s Openslot` : "Openslot";
+  $("freq").innerHTML = fmtFreq(s.frequency);
+  $("band").textContent = s.band || "";
+  $("band").classList.toggle("hide", !s.band);
+  $("cf").classList.toggle("hide", !s.on_calling_frequency);
+  const mode = rig && rig.mode ? ({UsbData: "USB-D", LsbData: "LSB-D", FmData: "FM-D"}[rig.mode] || rig.mode.toUpperCase()) : "";
+  $("mode").textContent = mode; $("mode").classList.toggle("hide", !mode);
+  const tx = $("txrx");
+  if (s.tx) { tx.textContent = "TX"; tx.style.color = "var(--tx)"; }
+  else if (s.busy) { tx.textContent = "BUSY"; tx.style.color = "var(--yellow)"; }
+  else { tx.textContent = s.modem ? "RX" : "NO MODEM"; tx.style.color = s.modem ? "var(--green)" : "var(--red)"; }
+  const inQso = s.link === "connected" || s.link === "disconnecting";
+  let p = "";
+  if (s.partner) p = `In QSO with <b style="color:var(--accent)">${esc(s.partner)}</b>` +
+    [s.partner_name, s.partner_qth, s.partner_locator].filter(Boolean).map(x => " · " + esc(x)).join("") +
+    (s.snr != null ? ` · SNR ${s.snr > 0 ? "+" : ""}${Math.round(s.snr)} dB` : "");
+  $("partner").innerHTML = p;
+  const c = $("connect");
+  c.textContent = inQso ? "Disconnect" : "Connect";
+  c.className = inQso ? "danger" : "primary";
+  $("link").textContent = {connecting: "Connecting…", connected: "Linked", disconnecting: "Disconnecting…"}[s.link]
+    || (s.modem ? "Ready" : "The station's modem isn't connected");
+  $("msg").placeholder = inQso ? "Message…" : "Connect to a station to chat";
+  $("send").disabled = !inQso;
+  const cq = $("cq");
+  cq.textContent = s.cq_active ? "End CQ" : "Call CQ";
+  cq.className = s.cq_active ? "danger" : "";
+  $("autobeacon").checked = !!s.beacon_auto;
+  $("statusLine").textContent = s.status || "";
+  if (!s.audio && s.audio_note) $("listen").title = s.audio_note;
+}
+let lastChat = "";
+function renderChat(lines) {
+  const key = JSON.stringify(lines.slice(-3)) + lines.length;
+  if (key === lastChat) return; lastChat = key;
+  const el = $("chat"), main = document.querySelector("main");
+  const atBottom = main.scrollTop + main.clientHeight >= main.scrollHeight - 40;
+  el.innerHTML = lines.length ? lines.map(l => l.system
+    ? `<div class="line sys"><span class="t">${esc(l.time)}</span>${esc(l.text)}</div>`
+    : `<div class="line ${l.out ? "out" : "in"}"><span class="t">${esc(l.time)}</span><span class="c">${esc(l.call)}</span>${esc(l.text)}</div>`).join("")
+    : `<div class="muted small">No chat yet</div>`;
+  if (atBottom) main.scrollTop = main.scrollHeight;
+}
+function renderStations() {
+  const item = s => `<button data-call="${esc(s.call)}"><span class="call mono">${esc(s.call)}</span>` +
+    `<span class="muted mono">${esc(s.snr || "")}</span><span class="grow"></span><span class="muted small">${esc(s.time)}</span></button>`;
+  $("cqTitle").textContent = `CQ calls (${stations.cq.length})`;
+  $("bcTitle").textContent = `Beacons (${stations.beacons.length})`;
+  $("cqList").innerHTML = stations.cq.map(item).join("") || `<div class="muted small">None heard yet</div>`;
+  $("bcList").innerHTML = stations.beacons.map(item).join("") || `<div class="muted small">None heard yet</div>`;
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-call]");
+  if (b) { $("call").value = b.dataset.call; showTab("chat"); }
+});
+
+// ---- the rig panel (the same controls as the desktop's Rig controls window)
+const LEVELS = {rf_power: "Power", af_gain: "AF gain", rf_gain: "RF gain", squelch: "Squelch", mic_gain: "Mic gain"};
+const SWITCHES = {noise_blanker: "NB", noise_reduction: "NR", preamp: "Preamp", attenuator: "ATT"};
+const AGCS = {off: "Off", fast: "Fast", medium: "Mid", slow: "Slow", auto: "Auto"};
+const MODES = [["UsbData", "USB-D"], ["Usb", "USB"], ["LsbData", "LSB-D"], ["Lsb", "LSB"], ["Cw", "CW"], ["Am", "AM"], ["Fm", "FM"], ["FmData", "FM-D"]];
+let dragging = null;
+function sUnits(db) { return db >= 0.5 ? `S9+${Math.round(db)}` : `S${Math.max(0, Math.min(9, Math.round(9 + db / 6)))}`; }
+function meter(label, frac, text, color) {
+  return `<div class="meter"><span class="mono muted">${label}</span><div class="bar"><i style="width:${Math.max(0, Math.min(1, frac)) * 100}%;background:${color}"></i></div><span class="mono small">${text}</span></div>`;
+}
+let rigShape = "";
+function meters(x) {
+  const m = x.meters || {};
+  let h = "";
+  if (rig.ptt) {
+    if (m.power != null) h += meter("PO", m.power, Math.round(m.power * 100) + " %", "var(--accent)");
+    if (m.swr != null) h += meter("SWR", (m.swr - 1) / 4, m.swr.toFixed(1), m.swr >= 2.5 ? "var(--red)" : m.swr >= 1.8 ? "var(--yellow)" : "var(--green)");
+    if (m.alc != null) h += meter("ALC", m.alc, Math.round(m.alc * 100) + " %", "var(--purple)");
+  } else if (m.signal != null) {
+    const db = m.signal, f = db <= 0 ? (db + 54) / 54 * 0.6 : 0.6 + db / 60 * 0.4;
+    h += meter("S", f, sUnits(db), "var(--green)");
+  }
+  return h;
+}
+// Built once for the controls the radio has; after that only the values change (a rebuild
+// under a finger would lose the tap: the S-meter updates several times a second)
+function renderRig() {
+  const el = $("rig"), x = rig && rig.extras || {};
+  if (!rig || rig.backend === "None") { rigShape = ""; el.innerHTML = `<div class="muted">The station has no rig control.</div>`; $("rigHint").textContent = ""; return; }
+  if (!rig.connected) { rigShape = ""; el.innerHTML = `<div class="muted">The station's radio isn't connected.</div>`; return; }
+  $("rigHint").textContent = $("rigBox").open ? "" : "tap to open";
+  const lv = x.levels || {}, sw = x.switches || {};
+  const lk = Object.keys(LEVELS).filter(k => k in lv), sk = Object.keys(SWITCHES).filter(k => k in sw);
+  const shape = JSON.stringify([rig.backend, !!x.probed, lk, sk, !!x.agc]);
+  if (shape !== rigShape) {
+    rigShape = shape;
+    let h = `<div id="rigMeters"></div>`;
+    h += `<div class="caption" style="margin-top:10px">Mode</div><div class="modes" style="margin-top:6px">` +
+      MODES.map(([k, l]) => `<button data-mode="${k}">${l}</button>`).join("") + `</div>`;
+    if (lk.length) h += `<div style="margin-top:10px">` + lk.map(k =>
+      `<div class="lvl"><span>${LEVELS[k]}</span><input type="range" min="0" max="1" step="0.01" data-level="${k}"><span class="mono small muted" id="lv-${k}"></span></div>`).join("") + `</div>`;
+    if (sk.length) h += `<div class="row" style="flex-wrap:wrap;margin-top:8px">` +
+      sk.map(k => `<button data-switch="${k}">${SWITCHES[k]}</button>`).join("") + `</div>`;
+    if (x.agc) h += `<div class="caption" style="margin-top:10px">AGC</div><div class="modes" style="grid-template-columns:repeat(5,1fr);margin-top:6px">` +
+      Object.entries(AGCS).map(([k, l]) => `<button data-agc="${k}">${l}</button>`).join("") + `</div>`;
+    if (!x.probed && !lk.length && !sk.length) h += `<div class="muted small" style="margin-top:8px">Asking the radio which controls it has…</div>`;
+    h += `<div class="row" style="margin-top:12px"><button id="atu">Tune ATU</button>` +
+      (x.probed && !lk.length && !sk.length && !x.agc ? `<span class="muted small">No other controls through ${esc(rig.backend)}</span>` : "") + `</div>`;
+    el.innerHTML = h;
+  }
+  $("rigMeters").innerHTML = meters(x);
+  for (const b of el.querySelectorAll("[data-mode]")) b.classList.toggle("on", rig.mode === b.dataset.mode);
+  for (const i of el.querySelectorAll("[data-level]")) {
+    const k = i.dataset.level;
+    if (dragging === k) continue;
+    i.value = lv[k]; $("lv-" + k).textContent = Math.round(lv[k] * 100) + " %";
+  }
+  for (const b of el.querySelectorAll("[data-switch]")) {
+    const on = !!sw[b.dataset.switch];
+    b.classList.toggle("on", on); b.dataset.on = on ? "1" : "0";
+  }
+  for (const b of el.querySelectorAll("[data-agc]")) b.classList.toggle("on", x.agc === b.dataset.agc);
+  $("atu").disabled = !(rig.may_transmit && !rig.ptt);
+}
+$("rig").addEventListener("input", e => {
+  const k = e.target.dataset.level; if (!k) return;
+  dragging = k; $("lv-" + k).textContent = Math.round(e.target.value * 100) + " %";
+});
+$("rig").addEventListener("change", e => {
+  const k = e.target.dataset.level; if (!k) return;
+  dragging = null;
+  cmd({cmd: "rig", action: {op: "level", level: k, value: parseFloat(e.target.value)}});
+});
+$("rig").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.mode) cmd({cmd: "rig", action: {op: "mode", mode: b.dataset.mode}});
+  if (b.dataset.switch) cmd({cmd: "rig", action: {op: "switch", switch: b.dataset.switch, on: b.dataset.on !== "1"}});
+  if (b.dataset.agc) cmd({cmd: "rig", action: {op: "agc", agc: b.dataset.agc}});
+  if (b.id === "atu" && confirm("Start the antenna tuner? The radio transmits while it tunes.")) cmd({cmd: "rig", action: {op: "tune"}});
+});
+$("rigBox").addEventListener("toggle", renderRig);
+
+// ---- controls
+$("connect").onclick = () => {
+  const inQso = status.link === "connected" || status.link === "disconnecting";
+  if (inQso) return cmd({cmd: "disconnect"});
+  const call = $("call").value.trim().toUpperCase();
+  if (!call) return notice("Type a callsign first");
+  cmd({cmd: "connect", call});
+};
+$("abort").onclick = () => cmd({cmd: "abort"});
+function sendMsg() {
+  const t = $("msg").value; if (!t.trim()) return;
+  cmd({cmd: "chat", text: t}); $("msg").value = "";
+}
+$("send").onclick = sendMsg;
+$("msg").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); sendMsg(); } };
+$("cq").onclick = () => cmd({cmd: status.cq_active ? "end_cq" : "cq"});
+$("beacon").onclick = () => cmd({cmd: "beacon"});
+$("autobeacon").onchange = e => cmd({cmd: "auto_beacon", on: e.target.checked});
+$("tune").onclick = () => {
+  const hz = parseFreq($("tuneTo").value);
+  if (!hz) return notice("Not a frequency");
+  cmd({cmd: "frequency", hz}); $("tuneTo").value = "";
+};
+$("tuneTo").onkeydown = e => { if (e.key === "Enter") $("tune").click(); };
+for (const [hz, band] of CFS) $("cfs").insertAdjacentHTML("beforeend", `<option value="${hz}">${band}  ${(hz / 1e6).toFixed(3)} MHz</option>`);
+$("cfs").onchange = e => { const hz = parseInt(e.target.value); if (hz) cmd({cmd: "frequency", hz}); e.target.value = ""; };
+function showTab(t) {
+  for (const s of document.querySelectorAll("section")) s.classList.toggle("show", s.id === "tab-" + t);
+  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("on", b.dataset.tab === t);
+}
+for (const b of document.querySelectorAll("nav button")) b.onclick = () => showTab(b.dataset.tab);
+
+// ---- receive audio: 12 kHz frames, played with a little buffer so Wi-Fi clumps don't click
+let actx = null, gain = null, nextAt = 0, listening = false, lastSeq = -1, prev = 0;
+$("listen").onclick = () => {
+  listening = !listening;
+  $("listen").classList.toggle("on", listening);
+  $("listen").textContent = listening ? "Listening" : "Listen";
+  $("vol").classList.toggle("hide", !listening);
+  if (listening) {
+    // (must start from a tap on phones)
+    if (!actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      gain = actx.createGain(); gain.gain.value = parseFloat($("vol").value); gain.connect(actx.destination);
+    }
+    actx.resume(); nextAt = 0; lastSeq = -1;
+  }
+  cmd({cmd: "audio", on: listening});
+};
+$("vol").oninput = e => { if (gain) gain.gain.value = parseFloat(e.target.value); };
+function audioFrame(buf) {
+  if (!listening || !actx) return;
+  const dv = new DataView(buf);
+  if (dv.byteLength < 5 || dv.getUint8(0) !== 1) return;
+  const seq = dv.getUint32(1, true);
+  if (lastSeq >= 0 && ((seq - lastSeq) >>> 0) > 0x7fffffff) return; // late
+  lastSeq = seq;
+  const n = (dv.byteLength - 5) >> 1, rate = 24000;
+  // (12 kHz doubled: every browser takes a 24 kHz buffer)
+  const b = actx.createBuffer(1, n * 2, rate), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) {
+    const v = dv.getInt16(5 + i * 2, true) / 32768;
+    d[i * 2] = (prev + v) / 2; d[i * 2 + 1] = v; prev = v;
+  }
+  const now = actx.currentTime;
+  if (nextAt < now + 0.03 || nextAt > now + 0.6) nextAt = now + 0.15;
+  const src = actx.createBufferSource(); src.buffer = b; src.connect(gain); src.start(nextAt);
+  nextAt += b.duration;
+}
+
+// ---- start
+const saved = store.get("openslot.pw");
+if (saved) { $("remember").checked = true; password = saved; connect(); }
+</script>
+</body>
+</html>

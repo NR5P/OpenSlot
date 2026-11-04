@@ -48,11 +48,20 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 mail-parser = "1.0.0"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+# Remote mode: playing a station's audio on this computer
+cpal = { version = "0.15.3", optional = true }
 
 # The XARA modem, from a checkout next to this one (~/Desktop/xara). Registered VARA speeds
 # are built in but used only when the user says they hold a VARA licence, as in XARA's apps.
 xara-ffi = { path = "../../xara/crates/xara-ffi", features = ["registered"] }
 xara = { path = "../../xara/crates/xara", default-features = false }
+
+[features]
+default = ["remote-audio"]
+remote-audio = ["dep:cpal"]
 
 [profile.release]
 strip = true

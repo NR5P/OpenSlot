@@ -22,8 +22,9 @@ The guide follows the order you will normally need things:
 12. Alerts, tags and blocking
 13. Extras: AI gateway, HamPlay, QSL cards, map
 14. Canned messages, message tags and chat commands
-15. Settings reference
-16. Troubleshooting and glossary
+15. Rig controls, sharing the radio, and remote control (another computer or a phone)
+16. Settings reference
+17. Troubleshooting and glossary
 
 ## What you need
 
@@ -81,6 +82,8 @@ Choose how Openslot reaches the radio:
 
 The frequency is read from the radio about every 1.5 seconds. If the radio did not reach a frequency it was sent to, Openslot asks again (CAT, up to 10 times).
 
+**Share the radio with other programs**: see *Sharing the radio with other programs* below.
+
 **Antenna rotator**: with a rotator run by PstRotator, tick **Turn the antenna** and give PstRotator's host and UDP port (default 127.0.0.1:12000), and turn on PstRotator's UDP control. **Rotate Antenna** in the beacon and CQ menus then turns to the station, using your locator and theirs.
 
 ### 4. QSO
@@ -91,11 +94,12 @@ The defaults match VarAC; the ones most people change are the welcome message, *
 
 ### Left column: frequency and controls
 
-- **Frequency** shows the radio's frequency, the radio mode and whether VARA is connected (green VARA = connected).
+- **Frequency** shows the radio's frequency and whether VARA and the radio are connected (green = connected); the radio's mode is at the end of the SLOT row.
 - The **frequency readout** is also the frequency picker. Click it to choose a VarAC calling frequency, one of **My frequencies**, or type any frequency (`14.1055` in MHz, `14105.5` in kHz) and press Tune. **Add** at the bottom keeps the frequency you are on in My frequencies, with an optional name; ✕ removes one. The band is shown next to the caption.
 - **FREQ SCHEDULE** switches between the frequency scheduler, the scanner and ALE. Right-click it to edit their lists.
 - **CONNECT MODEM / DISCONNECT MODEM** connects to VARA.
-- **TUNE / STOP** sends a tuning carrier through VARA.
+- **TUNE / STOP** sends a tuning carrier through VARA. Its window sets the modem's drive level; **AUTO** finds it for you (see *Setting the drive level automatically*).
+- **RIG CONTROLS** (on the BW row) opens the rest of the radio's controls in a window of their own; see *Rig controls*.
 - **Listen: ON / CQ / OFF**. ON answers connects and decodes CQs; CQ only decodes CQs; OFF doesn't listen.
 - **SEND BEACONS** sends a beacon now; the switch below it sends beacons automatically. It also shows the countdown to the next beacon.
 - **CONNECT / DISCONNECT** links to the callsign in the callsign box. **ABORT** cancels a connect in progress. **QUICK DISC** clears what is still waiting to be sent and disconnects at once.
@@ -367,11 +371,53 @@ Right-click **FREQ SCHEDULE** to edit the lists. All three need rig control.
 - `/bookmarks` opens your bookmarked messages.
 - `/help` lists these commands.
 
+## Rig controls, sharing the radio, and remote control
+
+### Rig controls
+
+**RIG CONTROLS** on the frequency card (or **Remote → Rig controls**) opens a small window with the radio's other controls; close it, or fold it with the arrow in its title bar, when you're done. It holds:
+
+- the **S-meter** while receiving, and the **power, SWR and ALC** meters while transmitting
+- the radio's **mode** (USB-D, USB, LSB-D, LSB, CW, AM, FM, FM-D)
+- **Power, AF gain, RF gain, Squelch and Mic gain** sliders (applied when you let go)
+- **NB, NR, Preamp and ATT** switches, and **AGC** (Off, Fast, Mid, Slow, Auto)
+- **TUNE ATU**, which starts the radio's antenna tuner (it transmits while it tunes, so not with PTT disabled)
+
+Openslot asks the radio which of these it has and shows only those: the list differs between rigctld, FLRig and the CAT families (Yaesu has the most; the Kenwood family has fewer, and no AGC or transmit meters). The extra controls are read only while the window is open (or a remote or a program needs them), so they add no CAT traffic otherwise. Openslot still sets the **Radio mode** from Settings before each frequency change, as VarAC does.
+
+### Setting the drive level automatically
+
+In the **Tune** window, **AUTO** keys the tune carrier and steps the modem's drive level to the highest one where the radio's ALC meter barely moves; the meter shows live while it runs. It needs rig control that can read the radio's ALC: Yaesu CAT, Icom CI-V, the Kenwood family (with the meter on ALC) or rigctld (and RigHelm); otherwise AUTO is greyed out. Use a clear frequency or a dummy load, and set the output power on the radio. **STOP AUTO** stops it at any time.
+
+### Sharing the radio with other programs
+
+Openslot can share the radio it controls with loggers and other programs (WSJT-X, JTDX, fldigi, GridTracker, Log4OM and most others that use Hamlib), so they don't fight over the CAT port. In **Settings → RIG → Share the radio with other programs**:
+
+- tick **Share the radio**, choose the **Port** (default 4532; if Openslot itself uses rigctld on 4532 on this computer, pick another such as 4533), and press **Apply**
+- **Programs on other computers too** lets a logger on another computer use it (else only this computer)
+- **Let them transmit** lets programs key the radio and start its tuner. Off, they can read and tune the radio but never key it. On, a program can unkey only what it keyed itself, never a VARA transmission.
+
+In the other program choose the Hamlib rig **NET rigctl** (model 2), and the address `127.0.0.1:4532` (or this computer's address and port). The frequency, mode and PTT come from what Openslot reads anyway, so they add nothing on the CAT port; levels and meters are read for half a minute after a program asks for them.
+
+### Remote control: running the station from another computer or a phone
+
+Openslot can be run from elsewhere on your network: the Openslot connected to the radio (the *station*) stays in charge of the modem, the radio, your logs and VMail, and another Openslot (on Mac, Windows or Linux, any mix) or a phone's web browser controls it.
+
+**On the station**: **Remote → Let other computers and phones control this station…**, tick **Allow remote control**, give a **Password** (required: a remote can transmit) and press **Apply**. The window shows the address to open on a phone, such as `http://192.168.1.20:8473`. **Radio audio** chooses the sound card input remotes can listen to; it defaults to the built-in modem's input (the radio). With no input, remotes simply get no audio; everything else works the same. The menu bar shows **REMOTE** while it's on, with the number of remotes connected.
+
+**From another computer**: **Remote → Control another Openslot…**, press **Find stations** (or type the station's address), give the password and press **CONNECT**. The window becomes the station's console: frequency (type one or pick a calling frequency), connect / disconnect / abort, CALL CQ, SEND BEACON and automatic beacons, the chat, the CQ calls and beacons heard (click one to fill in the call, double-click to connect), **RIG CONTROLS**, and **LISTEN** with a volume slider when the station sends audio. **Disconnect** returns to this computer's own Openslot. You can also start straight into a station with `openslot --remote 192.168.1.20` (and `--remote-password`, or the password saved in the window).
+
+**From a phone**: open the station's address in Safari or Chrome and give the password (tick **Remember on this device** to skip it next time; **Add to Home Screen** makes it an app icon). The page has the same controls on three tabs: **Chat**, **Stations** and **Radio** (frequency and the rig controls). Tap **Listen** to hear the radio. On an iPhone the ring/silent switch mutes web audio.
+
+What a remote does goes through the station as if pressed there (it's logged there too), and the station refuses what its own buttons would (no modem, not in a QSO…), with the reason shown on the remote. Remotes reconnect by themselves if the network or the station drops. Five wrong passwords lock an address out for a minute.
+
+Remote control is meant for your own network, or a VPN into it: the password is never sent, only proof of it, but the connection isn't encrypted, so don't forward the port to the internet. It uses TCP port 8473 (and UDP 8474 for **Find stations**); allow them in the station computer's firewall if asked.
+
 ## Settings reference
 
 ### RIG
 
-The rig-control method (COM port CAT, rigctld, FLRig or none) and its port/host settings. Also the radio mode set before every frequency change, the PTT method and a PTT test.
+The rig-control method (COM port CAT, rigctld, FLRig or none) and its port/host settings. Also the radio mode set before every frequency change, the PTT method and a PTT test, and sharing the radio with other programs.
 
 ### Vara
 

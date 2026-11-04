@@ -60,6 +60,14 @@ pub struct Cli {
     /// Use terminal UI instead of desktop GUI
     #[arg(long)]
     pub tui: bool,
+
+    /// Control the Openslot at this address (HOST or HOST:PORT) from the start: remote mode
+    #[arg(long, value_name = "HOST[:PORT]")]
+    pub remote: Option<String>,
+
+    /// Its password (else the one saved in the Remote control window)
+    #[arg(long, env = "OPENSLOT_REMOTE_PASSWORD", hide_env_values = true)]
+    pub remote_password: Option<String>,
 }
 
 impl Cli {
@@ -107,6 +115,40 @@ pub struct SavedFrequency {
     pub hz: u64,
     #[serde(default)]
     pub name: String,
+}
+
+/// Remote mode's settings ([remote] in the config file).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    /// Let other computers and phones on the LAN control this station
+    pub serve: bool,
+    pub port: Option<u16>,
+    pub password: String,
+    /// The radio's audio input for remotes to listen to ("" = the built-in modem's)
+    pub audio_device: String,
+    /// The station this Openslot controls
+    pub connect_host: String,
+    pub connect_port: Option<u16>,
+    pub connect_password: String,
+}
+
+pub fn remote_settings() -> RemoteSettings {
+    read_config_file().and_then(|f| f.remote).unwrap_or_default()
+}
+
+pub fn rig_share_settings() -> crate::rig::share::ShareSettings {
+    read_config_file().and_then(|f| f.rig_share).unwrap_or_default()
+}
+
+pub fn save_rig_share_settings(r: &crate::rig::share::ShareSettings) {
+    let r = r.clone();
+    update_config_file(|f| f.rig_share = Some(r));
+}
+
+pub fn save_remote_settings(r: &RemoteSettings) {
+    let r = r.clone();
+    update_config_file(|f| f.remote = Some(r));
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -361,6 +403,11 @@ pub struct ConfigFile {
     pub imap_password: Option<String>,
     /// Seconds between mailbox checks (VarAC default 300).
     pub imap_poll_seconds: Option<u64>,
+    /// Remote mode (the Remote control window): serving this station, and the station
+    /// last controlled from here
+    pub remote: Option<RemoteSettings>,
+    /// Settings → RIG: other programs share the radio through Openslot (a rigctld server)
+    pub rig_share: Option<crate::rig::share::ShareSettings>,
 }
 
 /// Resolved configuration with all values determined.
@@ -392,6 +439,13 @@ pub struct AppConfig {
 impl AppConfig {
     /// Merge CLI args over config file, with CLI taking precedence.
     pub fn resolve(mut cli: Cli) -> Result<Self, String> {
+        if let Some(at) = cli.remote.take() {
+            let (host, port) = match at.rsplit_once(':') {
+                Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().ok()),
+                _ => (at, None),
+            };
+            let _ = REMOTE_AT.set((host, port, cli.remote_password.take()));
+        }
         // VarAC's "Load the last used profile on startup": a pointer next to the default config
         if cli.config.is_none() {
             if let Some(ptr) = default_profile_pointer() {
@@ -478,6 +532,12 @@ impl AppConfig {
 }
 
 static CONFIG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// --remote: (host, port, password) to control from the start
+static REMOTE_AT: std::sync::OnceLock<(String, Option<u16>, Option<String>)> = std::sync::OnceLock::new();
+
+pub fn remote_at() -> Option<(String, Option<u16>, Option<String>)> {
+    REMOTE_AT.get().cloned()
+}
 
 /// The config file in use (--config, else the default location).
 pub fn active_config_path() -> Option<PathBuf> {

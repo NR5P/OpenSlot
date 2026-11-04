@@ -33,6 +33,19 @@ How the sharing works:
 Each platform folder is its own Cargo/Xcode/Gradle project with its own `target/` or
 `build/` (git-ignored), so building one never touches the root's `target/`.
 
+## Remote mode (src/remote)
+
+The desktop apps can serve their station to remotes and control another one (Remote menu;
+see the User Guide). It's shared code, so every desktop build has it, and remotes and
+stations mix freely across macOS, Windows and Linux. Phones use the web page the station
+serves (src/remote/web.html), not the native apps, so any phone works without an app update.
+
+Receive audio needs two things a platform crate supplies: capturing, through the built-in
+modem's own audio (`modem::register_remote_audio`, called at start in each of macos/,
+windows/ and linux/), and playing, through cpal (the `remote-audio` feature, on by default
+there). The root build has neither by default (`cargo build --features remote-audio` adds
+playing; it needs ALSA's headers on Linux), and offers no audio: everything else works.
+
 ## The phone apps' main-screen controls (Android, iOS)
 
 The desktop apps (Linux, macOS, Windows) share `src/gui`; the phone screens are native, so

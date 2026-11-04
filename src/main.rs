@@ -1,5 +1,6 @@
 mod config;
 mod gui;
+mod remote;
 mod rig;
 mod storage;
 mod tui;

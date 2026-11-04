@@ -7,6 +7,8 @@ mod config;
 #[allow(dead_code)] // run_gui: the Mac app has its own, with the modem bar
 #[path = "../../src/gui/mod.rs"]
 mod gui;
+#[path = "../../src/remote/mod.rs"]
+mod remote;
 #[path = "../../src/rig/mod.rs"]
 mod rig;
 #[path = "../../src/storage/mod.rs"]
@@ -35,6 +37,8 @@ use varac::session::{StationConfig, VaracSession};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_with_old_env();
+    // Remote stations can listen to the radio through the modem's own audio
+    modem::register_remote_audio();
     let log_level = cli.log_level.clone();
     let use_tui = cli.tui;
 

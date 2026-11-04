@@ -1010,6 +1010,19 @@ pub struct GuiState {
     pub rig_reconnect_requested: bool,
     pub rig_ptt: bool,
     pub rig_error: Option<String>,
+    /// The Rig controls window, the radio's extra controls as last read, and what was
+    /// asked of them (here or from a remote station) for the app to send to the rig
+    pub rig_panel_open: bool,
+    pub rig_extras: crate::rig::RigExtras,
+    pub rig_actions: Vec<crate::rig::RigAction>,
+    /// Remote mode: the Remote control window, and the console while controlling a station
+    pub remote: super::remote_ui::RemoteForm,
+    /// Settings → RIG → sharing the radio with other programs: the form, "Apply" asked
+    /// for, and the server's state (port and programs connected, or why it isn't running)
+    pub rig_share: crate::rig::share::ShareSettings,
+    pub rig_share_port: String,
+    pub rig_share_apply: bool,
+    pub rig_share_status: Option<Result<(u16, usize), String>>,
     pub rig_ports: Vec<crate::rig::PortInfo>,
     /// Settings → RIG "Detect radio": asked for, then running (the result comes back here)
     pub rig_detect_requested: bool,
@@ -1461,6 +1474,14 @@ impl GuiState {
             rig_connected: false,
             rig_freq: None,
             rig_mode: None,
+            rig_panel_open: false,
+            rig_extras: Default::default(),
+            rig_actions: Vec::new(),
+            remote: Default::default(),
+            rig_share: crate::config::rig_share_settings(),
+            rig_share_port: crate::config::rig_share_settings().port().to_string(),
+            rig_share_apply: true,
+            rig_share_status: None,
             rig_settings_backend: "none".into(),
             rig_settings_host: "127.0.0.1".into(),
             rig_settings_port: "4532".into(),

@@ -3,6 +3,8 @@ pub mod theme;
 mod layout;
 mod features;
 mod help;
+mod rig_panel;
+mod remote_ui;
 pub mod sound;
 
 use std::collections::VecDeque;
@@ -141,6 +143,12 @@ pub struct VaracApp {
     /// PSKReporter (stations heard), and the dial it last heard about
     psk: std::sync::mpsc::Sender<crate::varac::pskreporter::Command>,
     psk_freq: u64,
+    /// Remote mode: serving this station to remotes, or controlling another station
+    remote_server: Option<crate::remote::server::RemoteServer>,
+    remote_client: Option<crate::remote::client::RemoteClient>,
+    /// Other programs sharing the radio (Settings → RIG)
+    rig_share: Option<crate::rig::share::ShareServer>,
+    egui_ctx: egui::Context,
 }
 
 impl VaracApp {
@@ -426,6 +434,18 @@ impl VaracApp {
         }
 
         let rig_first_try = rig_detectable(&state.rig_backend);
+        // Remote control of this station, if it was on: started by the first tick
+        state.remote.apply_server = state.remote.settings.serve;
+        // --remote: straight into controlling that station
+        if let Some((host, port, password)) = crate::config::remote_at() {
+            let r = &mut state.remote.settings;
+            r.connect_host = host;
+            r.connect_port = port.or(r.connect_port);
+            if let Some(p) = password {
+                r.connect_password = p;
+            }
+            state.remote.connect_requested = true;
+        }
         let app = Self {
             state,
             session_rx,
@@ -450,6 +470,10 @@ impl VaracApp {
             start_on_radio_band: !sched_tuned,
             psk: crate::varac::pskreporter::spawn(|m| tracing::info!(target: "gui", "{m}")),
             psk_freq: 0,
+            remote_server: None,
+            remote_client: None,
+            rig_share: None,
+            egui_ctx: _cc.egui_ctx.clone(),
         };
         app.configure_psk();
         app
@@ -2747,6 +2771,7 @@ impl VaracApp {
                         self.state.rig_alc = false;
                         self.state.rig_freq = None;
                         self.state.rig_mode = None;
+                        self.state.rig_extras = Default::default();
                         self.state.add_log("Rig disconnected".into());
                     }
                     crate::rig::RigEvent::FreqUpdate(f) => {
@@ -2817,6 +2842,9 @@ impl VaracApp {
                             a.readings.push(v);
                         }
                     }
+                    crate::rig::RigEvent::Extras(x) => {
+                        self.state.rig_extras = x;
+                    }
                     crate::rig::RigEvent::Error(e) => {
                         self.state.add_log(format!("Rig error: {e}"));
                         self.state.rig_error = Some(e);
@@ -2829,8 +2857,27 @@ impl VaracApp {
                 }
             }
 
+            // The extra controls are read only while someone looks at them
+            let remotes = self.remote_server.as_ref().is_some_and(|s| s.sessions() > 0);
+            let programs = self.rig_share.as_ref().is_some_and(|s| s.wants_extras());
+            rig.watch_extras(self.state.rig_panel_open || remotes || programs);
+            // (the transmit meters while VARA transmits, keyed by VOX as much as by us)
+            rig.tx_hint(self.state.ptt);
+            for action in std::mem::take(&mut self.state.rig_actions) {
+                if matches!(action, crate::rig::RigAction::Tune) && self.state.ptt_disabled {
+                    self.state.status_msg = "PTT is disabled: the tuner wasn't started".into();
+                    continue;
+                }
+                if let crate::rig::RigAction::Mode { mode } = action {
+                    self.state.add_log(format!("Radio mode set to {mode}"));
+                }
+                rig.apply(action);
+            }
         }
         self.tune_meter_tick();
+        self.state.rig_actions.clear();
+        self.rig_share_tick();
+        self.remote_tick();
 
         // PTT test buttons in Settings → RIG
         if let Some(on) = self.state.rig_test_ptt.take() {
@@ -3128,6 +3175,119 @@ impl VaracApp {
         self.apply_tune_to();
     }
 
+    /// Other programs sharing the radio: (re)start the rigctld server when its settings are
+    /// applied, and keep it up to date with the radio.
+    fn rig_share_tick(&mut self) {
+        if std::mem::take(&mut self.state.rig_share_apply) {
+            let set = self.state.rig_share.clone();
+            crate::config::save_rig_share_settings(&set);
+            // (the old one first: it holds the port)
+            self.rig_share = None;
+            self.state.rig_share_status = None;
+            if set.enabled {
+                // Openslot's own rigctld on this computer, on the same port
+                let clash = matches!(&self.state.rig_backend, crate::rig::RigBackend::Rigctld { host, port }
+                    if *port == set.port() && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+                let r = if clash {
+                    Err(format!("Openslot itself uses rigctld on port {}: choose another port, such as {}", set.port(), set.port() + 1))
+                } else {
+                    crate::rig::share::ShareServer::start(&set).map_err(|e| format!("port {}: {e}", set.port()))
+                };
+                match r {
+                    Ok(srv) => {
+                        self.state.add_log(format!("Sharing the radio with other programs on port {}{}", srv.port,
+                            if set.lan { " (any computer on the network)" } else { " (this computer)" }));
+                        self.rig_share = Some(srv);
+                    }
+                    Err(e) => {
+                        self.state.add_log(format!("Rig sharing not started: {e}"));
+                        self.state.rig_share_status = Some(Err(e));
+                    }
+                }
+            }
+        }
+        if let Some(srv) = self.rig_share.as_ref() {
+            let snap = crate::rig::share::Snapshot {
+                connected: self.state.rig_connected,
+                freq: self.state.rig_freq,
+                mode: self.state.rig_mode,
+                ptt: self.state.rig_ptt,
+                extras: self.state.rig_extras.clone(),
+                may_transmit: !self.state.ptt_disabled,
+            };
+            srv.update(snap, self.rig.as_ref().map(|r| r.command_sender()));
+            for n in srv.notes() {
+                self.state.add_log(n);
+            }
+            self.state.rig_share_status = Some(Ok((srv.port, srv.clients())));
+        }
+    }
+
+    /// Remote mode: (re)start or stop serving this station, publish it to the remotes and
+    /// do what they ask; connect to or leave another station.
+    fn remote_tick(&mut self) {
+        use crate::remote::{client, server};
+        if std::mem::take(&mut self.state.remote.apply_server) {
+            let f = &mut self.state.remote;
+            crate::config::save_remote_settings(&f.settings);
+            // (the old one first: it holds the port)
+            self.remote_server = None;
+            f.serve_error = None;
+            f.phone_url = None;
+            if f.settings.serve {
+                let cfg = server::ServerConfig {
+                    port: f.settings.port.unwrap_or(crate::remote::DEFAULT_PORT),
+                    password: f.settings.password.clone(),
+                    name: self.state.my_callsign.clone(),
+                    audio_device: f.settings.audio_device.clone(),
+                };
+                match server::RemoteServer::start(&self.rt, cfg) {
+                    Ok(srv) => {
+                        f.phone_url = crate::remote::lan_address().map(|ip| format!("http://{ip}:{}", srv.port));
+                        let url = f.phone_url.clone().unwrap_or_else(|| format!("port {}", srv.port));
+                        self.state.add_log(format!("Remote control on: {url}"));
+                        self.remote_server = Some(srv);
+                    }
+                    Err(e) => {
+                        f.serve_error = Some(format!("Not started: {e}"));
+                        self.state.add_log(format!("Remote control not started: {e}"));
+                    }
+                }
+            }
+        }
+        if let Some(srv) = self.remote_server.as_ref() {
+            let (status, chat, stations, rig) = remote_ui::snapshot(&self.state, srv);
+            srv.publish_status(&status);
+            srv.publish_chat(chat);
+            srv.publish_stations(stations);
+            srv.publish_rig(&rig);
+            for (who, cmd) in srv.commands() {
+                if let Some(why) = remote_ui::apply(&mut self.state, &self.db, &self.current_qso_guid, &who, cmd) {
+                    srv.notice(why);
+                }
+            }
+            self.state.remote.serving = Some((srv.port, srv.sessions(), srv.audio_listeners(), srv.audio_note()));
+        } else {
+            self.state.remote.serving = None;
+        }
+
+        if std::mem::take(&mut self.state.remote.disconnect_requested) {
+            self.remote_client = None;
+        }
+        if std::mem::take(&mut self.state.remote.connect_requested) {
+            let f = &mut self.state.remote;
+            crate::config::save_remote_settings(&f.settings);
+            let cfg = client::ClientConfig {
+                host: f.settings.connect_host.trim().to_string(),
+                port: f.settings.connect_port.unwrap_or(crate::remote::DEFAULT_PORT),
+                password: f.settings.connect_password.clone(),
+            };
+            let ctx = self.egui_ctx.clone();
+            self.remote_client = Some(client::RemoteClient::connect(&self.rt, cfg, std::sync::Arc::new(move || ctx.request_repaint())));
+            f.window_open = false;
+        }
+    }
+
     fn apply_tune_to(&mut self) {
     if let Some(f) = self.state.tune_to.take() {
         sound::play(sound::Sound::FrequencyChange);
@@ -3342,7 +3502,14 @@ impl eframe::App for VaracApp {
         });
 
         draw_menu_bar(ctx, &mut self.state);
-        let band_changed = layout::draw_main_window(ctx, &mut self.state, &self.db, &self.current_qso_guid);
+        // Controlling another station: its console in place of this one's main window
+        let band_changed = match self.remote_client.as_ref() {
+            Some(client) => {
+                remote_ui::draw_console(ctx, &mut self.state, client);
+                false
+            }
+            None => layout::draw_main_window(ctx, &mut self.state, &self.db, &self.current_qso_guid),
+        };
         let confirmed = std::mem::take(&mut self.state.confirm_qso_yes);
         if std::mem::take(&mut self.state.log_qso_requested) || confirmed {
             // VarAC's LOG: the ADIF log and loggers (and our QSO history)
@@ -3395,6 +3562,8 @@ impl eframe::App for VaracApp {
         draw_relay_notifications(ctx, &mut self.state, &self.db);
         draw_emcomm_confirm(ctx, &mut self.state);
         layout::draw_tune_window(ctx, &mut self.state);
+        rig_panel::draw_rig_window(ctx, &mut self.state);
+        remote_ui::draw_remote_window(ctx, &mut self.state, self.remote_client.as_ref());
         help::draw_help(ctx, &mut self.state);
         draw_bw_refused(ctx, &mut self.state);
         draw_path_finder_window(ctx, &mut self.state);
@@ -3591,6 +3760,33 @@ fn draw_menu_bar(ctx: &egui::Context, state: &mut GuiState) {
                     ui.close_menu();
                 }
             });
+            ui.menu_button("Remote", |ui| {
+                if ui.button("Let other computers and phones control this station...").clicked() {
+                    state.remote.window_open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Control another Openslot...").clicked() {
+                    state.remote.window_open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Rig controls").clicked() {
+                    state.rig_panel_open = true;
+                    ui.close_menu();
+                }
+            });
+            // (on: how many remotes are connected; click for the window)
+            if let Some((_, n, _, _)) = state.remote.serving {
+                let label = if n > 0 { format!("REMOTE {n}") } else { "REMOTE ON".to_string() };
+                let color = if n > 0 { theme::GREEN } else { theme::MUTED };
+                ui.add_space(8.0);
+                let r = ui.add(egui::Button::new(RichText::new(label).size(11.0).strong().color(color)).frame(false))
+                    .on_hover_text(format!("Remote control is on ({n} connected)"));
+                // (a dot before it: egui's fonts have no bullet)
+                ui.painter().circle_filled(egui::pos2(r.rect.left() - 6.0, r.rect.center().y), 3.5, color);
+                if r.clicked() {
+                    state.remote.window_open = true;
+                }
+            }
             ui.menu_button("Tools", |ui| {
                 if ui.button("Calling Frequencies...").clicked() {
                     state.freq_ref_open = true;
@@ -6804,6 +7000,49 @@ fn draw_settings_window(
                                 }
                             });
 
+                            // ---- Sharing the radio with other programs (a rigctld server, as RigHelm has)
+                            group(&mut cols[0], "Share the radio with other programs", &mut |ui| {
+                                ui.label(RichText::new("Loggers, WSJT-X, fldigi, GridTracker… use this radio through Openslot: \
+                                    choose Hamlib \"NET rigctl\" in them, at this computer's address and the port below.").small().color(GRAY));
+                                ui.checkbox(&mut state.rig_share.enabled, "Share the radio (a rigctld server)");
+                                ui.add_enabled_ui(state.rig_share.enabled, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Port");
+                                        ui.add(TextEdit::singleline(&mut state.rig_share_port).desired_width(60.0));
+                                        if ui.small_button("Default 4532").clicked() {
+                                            state.rig_share_port = crate::rig::share::DEFAULT_PORT.to_string();
+                                        }
+                                    });
+                                    ui.checkbox(&mut state.rig_share.lan, "Programs on other computers too (else this computer only)");
+                                    ui.checkbox(&mut state.rig_share.allow_tx, "Let them transmit (PTT, the tuner)")
+                                        .on_hover_text("Off: they can read and tune the radio but never key it. On: a program may key it, \
+                                            and only unkey what it keyed, never a VARA transmission.");
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Apply").clicked() {
+                                        state.rig_share.port = state.rig_share_port.trim().parse().ok().filter(|&p: &u16| p > 0);
+                                        state.rig_share_apply = true;
+                                    }
+                                    match &state.rig_share_status {
+                                        Some(Ok((port, n))) => {
+                                            let who = match n { 0 => "no programs connected".to_string(), 1 => "1 program connected".into(), n => format!("{n} programs connected") };
+                                            ui.colored_label(GREEN, format!("On, port {port}: {who}"));
+                                        }
+                                        Some(Err(e)) => {
+                                            ui.colored_label(RED, RichText::new(e).small());
+                                        }
+                                        None => {
+                                            ui.colored_label(GRAY, "Off");
+                                        }
+                                    }
+                                });
+                                if state.rig_share.lan && state.rig_share.enabled {
+                                    if let Some(ip) = crate::remote::lan_address() {
+                                        ui.label(RichText::new(format!("Other computers: {ip} port {}", state.rig_share_port.trim())).small().monospace());
+                                    }
+                                }
+                            });
+
                             // ---- Hamlib (Rigctld)
                             group(&mut cols[1], "Hamlib (Rigctld) / RigHelm", &mut |ui| {
                                 ui.add_enabled_ui(state.rig_settings_backend == "rigctld", |ui| {
@@ -7324,6 +7563,8 @@ fn save_config_file(state: &GuiState) {
         imap_username: Some(form.imap_username.trim().to_string()).filter(|s| !s.is_empty()),
         imap_password: Some(form.imap_password.clone()).filter(|s| !s.is_empty()),
         imap_poll_seconds: form.imap_poll_seconds.trim().parse().ok(),
+        remote: existing.remote.clone(),
+        rig_share: existing.rig_share.clone(),
     };
 
     if let Some(path) = crate::config::active_config_path() {

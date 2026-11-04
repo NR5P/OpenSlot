@@ -1449,6 +1449,27 @@ fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut String, choices: &[(Str
     });
 }
 
+/// Remote mode's receive audio (crate::remote::audio): captured as the modem captures, from
+/// its input unless the Remote control window names another.
+pub fn register_remote_audio() {
+    use crate::remote::audio::{set_capture, CaptureHooks, Reader, CAPTURE_RATE};
+    // (the shared code takes 48 kHz mono, which is what the modem's audio delivers)
+    if xara::audio::RATE != CAPTURE_RATE {
+        return;
+    }
+    set_capture(CaptureHooks {
+        open: Box::new(|name| {
+            let mut a = xara::audio::open_capture(AUDIO.1, name)?;
+            Ok(Box::new(move |buf: &mut [i16]| a.read(buf)) as Reader)
+        }),
+        inputs: Box::new(|| xara::audio::list(AUDIO.1).map(|(inputs, _)| inputs).unwrap_or_default()),
+        default_input: Box::new(|| {
+            let s = XaraSettings::load();
+            if s.enabled { s.capture } else { String::new() }
+        }),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
