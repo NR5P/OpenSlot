@@ -5328,13 +5328,7 @@ fn draw_vmail_folders(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
                 .id_salt("vmail_scroll")
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    let list = match state.vmail_folder_tab {
-                        1 => &state.vmail_sent_list,
-                        2 => &state.vmail_outbox_list,
-                        3 => &state.vmail_parking_list,
-                        4 => &state.vmail_drafts_list,
-                        _ => &state.vmail_list,
-                    };
+                    let list = state.vmail_folder();
                     let vm_snapshot: Vec<_> = list.iter().enumerate()
                         .map(|(i, vm)| (i, vm.guid.clone(), vm.from.clone(), vm.to.clone(), vm.subject.clone(), vm.time.clone(), vm.read, vm.urgent))
                         .collect();
@@ -8110,14 +8104,9 @@ fn draw_vmail_viewer_window(ctx: &egui::Context, state: &mut GuiState, db: &Stor
         return;
     }
 
-    let active_list = match state.vmail_folder_tab {
-        1 => &state.vmail_sent_list,
-        2 => &state.vmail_outbox_list,
-        3 => &state.vmail_parking_list,
-        _ => &state.vmail_list,
-    };
+    // (the same folder the list shows: Drafts used to open the Inbox VMail on that row)
     let vmail = state.selected_vmail
-        .and_then(|i| active_list.get(i))
+        .and_then(|i| state.vmail_folder().get(i))
         .map(|v| (v.guid.clone(), v.from.clone(), v.to.clone(), v.subject.clone(), v.body.clone(), v.time.clone(), v.urgent));
 
     let Some((guid, from, to, subject, body, time, urgent)) = vmail else {
@@ -8188,8 +8177,9 @@ fn draw_vmail_viewer_window(ctx: &egui::Context, state: &mut GuiState, db: &Stor
                     state.viewing_vmail = false;
                 }
                 if ui.button("Forward").clicked() {
+                    // (a fresh VMail, as Reply: nothing kept from an edit or its attachments)
+                    clear_compose(state);
                     state.compose_open = true;
-                    state.compose_to.clear();
                     state.compose_subject = format!("Fwd: {subject}");
                     // (the compose box holds real line breaks, as the reader shows them)
                     state.compose_body = format!("--- Forwarded from {from} ---\n{}", body.replace("//n", "\n"));

@@ -1655,6 +1655,18 @@ impl GuiState {
         self.add_log(format!("QSY to slot {slot} ({:.3} MHz), waiting for replies", f as f64 / 1e6));
     }
 
+    /// The VMails of the open folder tab (Inbox, Sent, Outbox, Parking, Drafts): the list
+    /// and the reader must agree, or a row opens another folder's VMail.
+    pub fn vmail_folder(&self) -> &[VMailEntry] {
+        match self.vmail_folder_tab {
+            1 => &self.vmail_sent_list,
+            2 => &self.vmail_outbox_list,
+            3 => &self.vmail_parking_list,
+            4 => &self.vmail_drafts_list,
+            _ => &self.vmail_list,
+        }
+    }
+
     /// Leave the slot: back to the calling frequency.
     pub fn return_to_cf(&mut self) {
         let cf = self.slot_wait.take().map(|(_, cf, _)| cf).unwrap_or(self.current_frequency);

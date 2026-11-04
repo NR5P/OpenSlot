@@ -2524,6 +2524,27 @@ fn end_sniff(state: &mut GuiState) {
 mod tests {
     use super::*;
 
+    /// The reader opens the VMail of the folder the list shows: in Drafts, a draft, not the
+    /// Inbox VMail on the same row (whose Delete would then delete it).
+    #[test]
+    fn each_folder_tab_opens_its_own_vmail() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = GuiState::new("N0CALL".into(), true, tx);
+        let vm = |guid: &str| VMailEntry {
+            guid: guid.into(), time: String::new(), from: String::new(), to: String::new(),
+            subject: String::new(), body: String::new(), read: true, urgent: false,
+        };
+        s.vmail_list = vec![vm("inbox")];
+        s.vmail_sent_list = vec![vm("sent")];
+        s.vmail_outbox_list = vec![vm("outbox")];
+        s.vmail_parking_list = vec![vm("parking")];
+        s.vmail_drafts_list = vec![vm("draft")];
+        for (tab, guid) in ["inbox", "sent", "outbox", "parking", "draft"].into_iter().enumerate() {
+            s.vmail_folder_tab = tab;
+            assert_eq!(s.vmail_folder()[0].guid, guid, "folder tab {tab}");
+        }
+    }
+
     /// A CQ ends with its slot wait (END CQ doesn't stay lit), and one without a slot after
     /// its second transmission; Auto-CQ keeps it active to call again.
     #[test]
