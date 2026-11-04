@@ -321,6 +321,14 @@ impl Renderer {
             vp.native_pixels_per_point = Some(self.input.ppp);
             vp.focused = Some(true);
         }
+        if !raw.events.is_empty() {
+            tracing::debug!(target: "screen", "pass with {} events: {:?}", raw.events.len(),
+                raw.events.iter().map(|e| match e {
+                    egui::Event::PointerMoved(p) => format!("move {:.0},{:.0}", p.x, p.y),
+                    egui::Event::PointerButton { pos, pressed, .. } => format!("{} {:.0},{:.0}", if *pressed { "press" } else { "release" }, pos.x, pos.y),
+                    other => format!("{other:?}").chars().take(30).collect(),
+                }).collect::<Vec<_>>());
+        }
         let out = self.ctx.run(raw, draw);
         self.last_pass = Some(now);
         let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(MAX_GAP);
@@ -629,6 +637,66 @@ mod tests {
         assert_eq!(frame.shapes.len(), 2);
         assert!(frame.shapes[0].clip.contains(Pos2::new(1e6, -1e6)), "still unclipped");
         assert!(matches!(&frame.shapes[0].shape, Piece::Text { job, .. } if job.wrap.max_width > 1e29));
+    }
+
+    /// A click on a button in a window that it closes, then a click elsewhere: both land
+    /// (once, the second was lost: the CQ slot selector, then END CQ).
+    #[test]
+    fn a_click_after_a_closing_window() {
+        use std::cell::RefCell;
+        let st = RefCell::new((true, 0, 0)); // (window open, GO clicks, AFTER clicks)
+        let screen = |ctx: &egui::Context| {
+            let mut s = st.borrow_mut();
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(200.0);
+                if ui.button("AFTER").clicked() {
+                    s.2 += 1;
+                }
+            });
+            if s.0 {
+                egui::Window::new("Pick").default_pos([150.0, 20.0]).show(ctx, |ui| {
+                    if ui.button("GO").clicked() {
+                        s.0 = false;
+                        s.1 += 1;
+                    }
+                });
+            }
+        };
+        let mut r = Renderer::new(|_| {});
+        let mut t = Instant::now();
+        let mut feed = |r: &mut Renderer, events: Vec<egui::Event>| {
+            t += MIN_GAP;
+            r.take_input(vec![ScreenInput { size: [400.0, 300.0], ppp: 1.0, events, ..Default::default() }], t);
+            let f = r.pass(screen).map(|m| decode(&m).unwrap());
+            r.sent();
+            f
+        };
+        // (egui lays a new window out unseen first)
+        let mut frame = feed(&mut r, vec![]).unwrap();
+        for _ in 0..3 { if let Some(f) = feed(&mut r, vec![]) { frame = f; } }
+        let pos_of = |f: &Frame, text: &str| f.shapes.iter().find_map(|s| match &s.shape {
+            Piece::Text { pos, job, .. } if job.text == text => Some(*pos + Vec2::new(4.0, 4.0)),
+            _ => None,
+        });
+        let click = |p: Pos2| vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ];
+        // as the remote sends them: each event its own pass
+        let go = pos_of(&frame, "GO").expect("the window is up");
+        for e in click(go) {
+            if let Some(f) = feed(&mut r, vec![e]) { frame = f; }
+        }
+        for _ in 0..3 { if let Some(f) = feed(&mut r, vec![]) { frame = f; } }
+        assert_eq!((st.borrow().0, st.borrow().1), (false, 1), "GO clicked, the window closed");
+        let after = pos_of(&frame, "AFTER").expect("AFTER on screen");
+        for e in click(after) {
+            if let Some(f) = feed(&mut r, vec![e]) { frame = f; }
+        }
+        for _ in 0..2 { let _ = feed(&mut r, vec![]); }
+        assert_eq!(st.borrow().2, 1, "the click after the window closed lands");
+        let _ = frame;
     }
 
     #[test]
