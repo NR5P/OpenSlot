@@ -630,17 +630,22 @@ pub fn draw_console(ctx: &egui::Context, state: &mut GuiState, client: &RemoteCl
                             _ => "Reaching the station…".to_string(),
                         }).color(theme::MUTED));
                     }
+                    // One wrapped text per line: as separate labels in a wrapping row, a word
+                    // wider than the chat (a URL, a long run of characters) pushed that line
+                    // past the edge and every line after it drew shifted and cut off
+                    let style = ui.style().clone();
                     for line in &v.chat {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(&line.time).monospace().small().color(theme::MUTED));
-                            if line.system {
-                                ui.label(RichText::new(&line.text).italics().color(theme::MUTED));
-                            } else {
-                                let color = if line.out { theme::ACCENT } else { theme::GREEN };
-                                ui.label(RichText::new(format!("{}:", line.call)).strong().color(color));
-                                ui.label(&line.text);
-                            }
-                        });
+                        let mut job = egui::text::LayoutJob::default();
+                        let mut add = |t: RichText| t.append_to(&mut job, &style, egui::FontSelection::Default, Align::Center);
+                        add(RichText::new(format!("{}  ", line.time)).monospace().small().color(theme::MUTED));
+                        if line.system {
+                            add(RichText::new(&line.text).italics().color(theme::MUTED));
+                        } else {
+                            let color = if line.out { theme::ACCENT } else { theme::GREEN };
+                            add(RichText::new(format!("{}: ", line.call)).strong().color(color));
+                            add(RichText::new(&line.text).color(theme::TEXT));
+                        }
+                        ui.add(egui::Label::new(job).wrap());
                     }
                 });
             });
