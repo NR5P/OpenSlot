@@ -572,11 +572,18 @@ impl VaracSession {
                     // VarAC relay notification (captured): UI frame RELAY -> TARGET, info "<SMP>"
                     // ("<SMU>" when some of the waiting mail is urgent)
                     Some(f) if f.pid == 0xF0
-                        && matches!(String::from_utf8_lossy(&f.info).trim(), "<SMP>" | "<SMU>")
+                        && crate::varac::messages::is_relay_notification(&String::from_utf8_lossy(&f.info))
                         && base_call(&f.dest) == base_call(&self.config.callsign) =>
                     {
                         let urgent = String::from_utf8_lossy(&f.info).trim() == "<SMU>";
                         Some(SessionEvent::Message(IncomingMessage::RelayNotification { relay: f.source, urgent }))
+                    }
+                    // Another station's relay notification (VMail parked at RELAY for TARGET):
+                    // only noted, as VarAC does. It isn't a broadcast, so it isn't listed as
+                    // one (it showed as a broadcast reading "<SMP>")
+                    Some(f) if f.pid == 0xF0 && crate::varac::messages::is_relay_notification(&String::from_utf8_lossy(&f.info)) => {
+                        let urgent = if String::from_utf8_lossy(&f.info).trim() == "<SMU>" { "urgent " } else { "" };
+                        Some(SessionEvent::Handshake(format!("Heard a VMail relay notification from {} to {}: {urgent}VMail is waiting there for {}", f.source, f.dest, f.dest)))
                     }
                     // (as in VarAC: our own frame coming back, e.g. through a
                     // digipeater, isn't a broadcast heard)
@@ -3203,6 +3210,43 @@ mod handshake_tests {
         let mut buf = vec![0u8; 512];
         let n = tokio::time::timeout(std::time::Duration::from_secs(3), d.read(&mut buf)).await.unwrap().unwrap();
         String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    /// Relay notifications heard on the KISS port (as captured: K6HN -> JI1BQW "<SMP>"): one
+    /// for us says VMail is waiting; one for another station is only logged, never listed as
+    /// a broadcast; an ordinary broadcast still is.
+    #[tokio::test]
+    async fn relay_notifications_for_others_arent_broadcasts() {
+        use crate::vara::kiss::VARAC_KISS_CMD;
+        use crate::varac::messages::ui_frame;
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let modem = tokio::spawn(async move { (cmd.accept().await.unwrap(), data.accept().await.unwrap()) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let _modem = modem.await.unwrap();
+        let cfg = StationConfig {
+            callsign: "NR5P".into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(ServiceFlags::VMAIL), bbs_dir: None, email_gate: None, bbs_gate: None, policy: Default::default(),
+        };
+        let mut s = VaracSession::new(vara, cfg);
+        async fn heard(s: &mut VaracSession, from: &str, to: &str, text: &str) -> Option<SessionEvent> {
+            let raw = ui_frame(from, to, text).encode(VARAC_KISS_CMD);
+            s.handle_input(SessionInput::Kiss(VARAC_KISS_CMD, raw)).await
+        }
+        // for another station: a note in the log, naming both
+        for text in ["<SMP>", "<SMU>"] {
+            match heard(&mut s, "K6HN", "JI1BQW", text).await {
+                Some(SessionEvent::Handshake(note)) => assert!(note.contains("K6HN") && note.contains("JI1BQW"), "{note}"),
+                other => panic!("{text} for another station: {other:?}"),
+            }
+        }
+        // for us: VMail waiting
+        assert!(matches!(heard(&mut s, "K6HN", "NR5P", "<SMU>").await,
+            Some(SessionEvent::Message(IncomingMessage::RelayNotification { ref relay, urgent: true })) if relay == "K6HN"));
+        // a real broadcast is still one
+        assert!(matches!(heard(&mut s, "K6HN", "ALL", "QRV on 40m").await,
+            Some(SessionEvent::Message(IncomingMessage::Broadcast(ref b))) if b.message == "QRV on 40m"));
     }
 
     /// Captured: original VarAC with its email gateway on answers our call with just its

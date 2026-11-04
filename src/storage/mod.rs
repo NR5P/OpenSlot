@@ -427,12 +427,14 @@ impl Storage {
         Ok(rows.filter_map(Result::ok).filter(|r| r.cqframe_time >= since).collect())
     }
 
-    /// Broadcasts sent by `call` (any SSID), newest first.
+    /// Broadcasts sent by `call` (any SSID), newest first. (Not relay notifications: older
+    /// versions stored other stations' `<SMP>` as broadcasts.)
     pub fn broadcasts_from(&self, call: &str) -> SqlResult<Vec<BroadcastRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT guid, broadcast_time, frequency, from_callsign, to_callsign,
                     via_callsign, broadcast_message, snr, band
-             FROM broadcast WHERE upper(from_callsign) = upper(?1) OR upper(from_callsign) LIKE upper(?1) || '-%'
+             FROM broadcast WHERE (upper(from_callsign) = upper(?1) OR upper(from_callsign) LIKE upper(?1) || '-%')
+               AND trim(broadcast_message) NOT IN ('<SMP>', '<SMU>')
              ORDER BY broadcast_time DESC LIMIT 1000"
         )?;
         let rows = stmt.query_map(params![call], |row| {
@@ -1019,7 +1021,8 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT guid, broadcast_time, frequency, from_callsign, to_callsign,
                     via_callsign, broadcast_message, snr, band
-             FROM broadcast ORDER BY broadcast_time DESC LIMIT ?1"
+             FROM broadcast WHERE trim(broadcast_message) NOT IN ('<SMP>', '<SMU>')
+             ORDER BY broadcast_time DESC LIMIT ?1"
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(BroadcastRecord {
@@ -1996,6 +1999,29 @@ mod tests {
 
         let sent = db.vmails_in_folder(VMailFolder::Sent, 10).unwrap();
         assert_eq!(sent.len(), 1);
+    }
+
+    /// Other stations' relay notifications that older versions stored as broadcasts stay out
+    /// of the broadcast history.
+    #[test]
+    fn stored_relay_notifications_arent_broadcasts() {
+        let db = test_db();
+        for (msg, minutes) in [("<SMP>", 3), ("<SMU> ", 2), ("QRV on 40m", 1)] {
+            db.insert_broadcast(&BroadcastRecord {
+                guid: make_guid(),
+                broadcast_time: Utc::now() - chrono::Duration::minutes(minutes),
+                frequency: 14_105_000,
+                from_callsign: "K6HN".into(),
+                to_callsign: "JI1BQW".into(),
+                via_callsign: None,
+                broadcast_message: msg.into(),
+                snr: Some(4),
+                band: Some("20m".into()),
+            }).unwrap();
+        }
+        let shown = |v: Vec<BroadcastRecord>| v.into_iter().map(|b| b.broadcast_message).collect::<Vec<_>>();
+        assert_eq!(shown(db.broadcasts_from("K6HN").unwrap()), vec!["QRV on 40m"]);
+        assert_eq!(shown(db.recent_broadcasts(10).unwrap()), vec!["QRV on 40m"]);
     }
 
     #[test]

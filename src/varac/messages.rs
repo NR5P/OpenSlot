@@ -176,6 +176,12 @@ pub fn ui_frame(from: &str, to: &str, text: &str) -> crate::vara::kiss::UiFrame 
     }
 }
 
+/// A VMail relay notification's text: `<SMP>` ("VMail is parked for you here"), `<SMU>` when
+/// some of it is urgent. Sent as a UI frame RELAY -> RECIPIENT; it's never a broadcast.
+pub fn is_relay_notification(text: &str) -> bool {
+    matches!(text.trim(), "<SMP>" | "<SMU>")
+}
+
 /// A UI frame with digipeaters (as in VarAC: one or two, "via" given
 /// space-separated; with three or more it goes out without any).
 pub fn ui_frame_via(from: &str, to: &str, via: &[String], text: &str) -> crate::vara::kiss::UiFrame {
