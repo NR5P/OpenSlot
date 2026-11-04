@@ -3841,7 +3841,8 @@ mod handshake_tests {
             s.pump_tx().await.unwrap();
         }
         let mut rest = String::new();
-        while rest.matches(' ').count() < 2 {
+        // (three frames, each "length text": however the reads split them)
+        while rest.matches(' ').count() < 3 {
             let n = tokio::time::timeout(std::time::Duration::from_secs(2), modem_data.read(&mut buf)).await.unwrap().unwrap();
             rest.push_str(&String::from_utf8_lossy(&buf[..n]));
         }

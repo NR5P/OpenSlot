@@ -411,6 +411,21 @@ impl Jitter {
 }
 
 /// The remote side: plays received frames on this computer's default output.
+/// Whether frame `seq` plays after `last`: None for a repeat or one late by under 5 s, else
+/// how many frames of silence fill the gap before it (a short gap only). A frame further back
+/// than that means the station started its count over (it restarted), so it's taken.
+fn frame_order(last: Option<u32>, seq: u32) -> Option<u32> {
+    let Some(last) = last else { return Some(0) };
+    let ahead = seq.wrapping_sub(last);
+    if ahead == 0 {
+        return None;
+    }
+    if ahead > u32::MAX / 2 {
+        return (last.wrapping_sub(seq) >= 250).then_some(0);
+    }
+    Some(if (2..=5).contains(&ahead) { ahead - 1 } else { 0 })
+}
+
 pub struct Player {
     ring: Arc<Mutex<Option<(Resampler, Jitter)>>>,
     stop: Arc<AtomicBool>,
@@ -495,19 +510,19 @@ impl Player {
     /// A frame from the station (gaps of a few frames are filled with silence, so the
     /// buffer fades across them rather than splicing).
     pub fn push(&mut self, seq: u32, samples: &[i16]) {
-        if let Some(last) = self.last_seq {
-            let ahead = seq.wrapping_sub(last);
-            if ahead == 0 || ahead > u32::MAX / 2 {
-                return; // late or repeated
-            }
-            if (2..=5).contains(&ahead) {
-                let gap = vec![0.0f32; AUDIO_FRAME * (ahead as usize - 1)];
-                self.feed(&gap);
-            }
+        let Some(missing) = frame_order(self.last_seq, seq) else { return };
+        if missing > 0 {
+            let gap = vec![0.0f32; AUDIO_FRAME * missing as usize];
+            self.feed(&gap);
         }
         self.last_seq = Some(seq);
         let f: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
         self.feed(&f);
+    }
+
+    /// A new session with the station: its frames may be numbered afresh.
+    pub fn new_session(&mut self) {
+        self.last_seq = None;
     }
 
     fn feed(&mut self, samples: &[f32]) {
@@ -566,6 +581,19 @@ mod tests {
         assert!(v[60] > 0.49, "plays at full level after the fade in");
         assert!(v[399].abs() < 0.01, "fades out when it runs dry");
         assert!(j.dropouts <= 1);
+    }
+
+    /// Frames in order play, a short gap is filled, repeats and late ones are dropped, and
+    /// a station that restarted (its count from 1 again) is heard at once.
+    #[test]
+    fn frames_play_in_order_and_a_restart_is_heard() {
+        assert_eq!(frame_order(None, 1), Some(0));
+        assert_eq!(frame_order(Some(1), 2), Some(0));
+        assert_eq!(frame_order(Some(3), 6), Some(2), "two frames of silence");
+        assert_eq!(frame_order(Some(7), 7), None, "a repeat");
+        assert_eq!(frame_order(Some(7), 5), None, "late");
+        assert_eq!(frame_order(Some(3000), 1), Some(0), "the station restarted");
+        assert_eq!(frame_order(Some(u32::MAX), 0), Some(0), "the count wraps");
     }
 
     /// The desktop remote's player on this computer's output (silence, so nothing is heard):

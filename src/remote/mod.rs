@@ -12,7 +12,8 @@
 //! ```text
 //! S: {"type":"hello","protocol":1,"name":"NR5P","nonce":"…16 hex…","version":"0.1.12"}
 //! C: {"type":"auth","proof":"…hex HMAC-SHA256(password, \"openslot:\" + nonce)…","client":"…"}
-//! S: {"type":"welcome","audio":true} | {"type":"denied","reason":"…"} (and close)
+//! S: {"type":"welcome","audio":true} | {"type":"denied","reason":"…","retry":false} (and close;
+//!    "retry":true when it is only for now)
 //! S: {"type":"status",…} {"type":"chat","lines":[…]} {"type":"stations",…} {"type":"rig",…}
 //!    whenever they change; {"type":"notice","text":…} for a refused command
 //! C: {"type":"cmd","cmd":"chat","text":"…"} (see [`Command`]), {"type":"ping"} every few s
@@ -161,7 +162,9 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Hello { protocol: u32, name: String, nonce: String, version: String },
     Welcome { audio: bool },
-    Denied { reason: String },
+    /// Refused (and closed). `retry`: only for now (too many remotes, a lockout, the station
+    /// restarting remote control), so try again later; false: the password is wrong.
+    Denied { reason: String, #[serde(default)] retry: bool },
     Status(Status),
     Chat { lines: Vec<ChatItem> },
     Stations(Stations),

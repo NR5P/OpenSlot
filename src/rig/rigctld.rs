@@ -52,7 +52,16 @@ impl RigctldClient {
     fn read_line(&mut self) -> RigResult<String> {
         let (_, reader) = self.conn.as_mut().ok_or(RigError::NotConnected)?;
         let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) => {
+                // A reply that didn't come in time may still come, and would then be read as
+                // the answer to the next command, and so on for good: drop the link, so the
+                // worker connects afresh and every answer is its own again.
+                self.conn = None;
+                return Err(RigError::Io(e));
+            }
+        };
         if n == 0 {
             self.conn = None;
             return Err(RigError::Io(std::io::Error::new(
@@ -405,5 +414,46 @@ mod tests {
         assert_eq!(c.steps.get("PREAMP"), Some(&20));
         // still in step with the stream
         assert_eq!(c.get_freq().unwrap(), 14_105_000);
+    }
+
+    /// A reply that comes after the read gave up mustn't be taken as the next command's:
+    /// the link is dropped instead, and a fresh one is in step again.
+    #[test]
+    fn a_late_reply_resets_the_link() {
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let Ok(s) = s else { return };
+                std::thread::spawn(move || {
+                    let mut w = s.try_clone().unwrap();
+                    for line in BufReader::new(s).lines() {
+                        let Ok(line) = line else { return };
+                        let reply = match line.trim() {
+                            "f" => "14105000\n",
+                            "m" => "PKTUSB\n3000\n",
+                            "l RFPOWER" => {
+                                std::thread::sleep(Duration::from_millis(3500));
+                                "0.500000\n"
+                            }
+                            _ => "RPRT 0\n",
+                        };
+                        if w.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut c = RigctldClient::new("127.0.0.1", port);
+        c.connect().unwrap();
+        assert!(c.get_level(Level::RfPower).is_err(), "timed out");
+        assert!(!c.is_connected(), "the link is let go");
+        std::thread::sleep(Duration::from_millis(700));
+        c.connect().unwrap();
+        assert_eq!(c.get_freq().unwrap(), 14_105_000);
+        assert_eq!(c.get_mode().unwrap(), RadioMode::UsbData);
+        assert_eq!(c.get_freq().unwrap(), 14_105_000, "still in step");
     }
 }

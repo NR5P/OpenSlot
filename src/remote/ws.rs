@@ -78,6 +78,9 @@ impl Request {
     }
 }
 
+/// Largest HTTP head read: a browser's is well under 2 kB.
+const MAX_HEAD: usize = 8192;
+
 /// Reads a request head (up to 8 kB), or the status line and headers of a response.
 pub async fn read_head<R: AsyncBufRead + Unpin>(r: &mut R) -> io::Result<Request> {
     let mut req = Request::default();
@@ -85,13 +88,19 @@ pub async fn read_head<R: AsyncBufRead + Unpin>(r: &mut R) -> io::Result<Request
     let mut first = true;
     loop {
         let mut line = String::new();
-        let n = r.read_line(&mut line).await?;
+        // (each line only as long as what's left of the 8 kB: a line that never ends must
+        // not be buffered without limit)
+        let left = (MAX_HEAD - total) as u64 + 1;
+        let n = (&mut *r).take(left).read_line(&mut line).await?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in the HTTP head"));
         }
         total += n;
-        if total > 8192 {
+        if total > MAX_HEAD {
             return Err(bad("HTTP head too long"));
+        }
+        if !line.ends_with('\n') {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in the HTTP head"));
         }
         let line = line.trim_end();
         if first {
@@ -244,6 +253,9 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message
     loop {
         let (fin, op, payload) = read_frame(r).await?;
         match op {
+            // (a ping or pong may come between a message's fragments, RFC 6455 5.4: ours are
+            // JSON pings, so one there is just skipped and the message kept)
+            Opcode::Ping | Opcode::Pong if data.is_some() => continue,
             Opcode::Ping => return Ok(Message::Ping(payload)),
             Opcode::Pong => return Ok(Message::Pong(payload)),
             Opcode::Close => return Ok(Message::Close),
@@ -287,6 +299,35 @@ mod tests {
                 assert_eq!(read_message(&mut r).await.unwrap(), Message::Binary(payload));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_ping_between_fragments_keeps_the_message() {
+        // "Hel", a ping, then "lo"
+        let raw = [0x01u8, 0x03, b'H', b'e', b'l', 0x89, 0x00, 0x80, 0x02, b'l', b'o'];
+        let mut r = raw.as_slice();
+        assert_eq!(read_message(&mut r).await.unwrap(), Message::Text("Hello".into()));
+    }
+
+    #[tokio::test]
+    async fn a_header_line_that_never_ends_is_refused_at_8_kb() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, rx) = tokio::io::duplex(1 << 16);
+        let writer = tokio::spawn(async move {
+            let _ = tx.write_all(b"GET / HTTP/1.1\r\nX: ").await;
+            let chunk = vec![b'A'; 1 << 16];
+            // (far more than the limit: the reader must stop long before this ends)
+            for _ in 0..1024 {
+                if tx.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut r = tokio::io::BufReader::new(rx);
+        let e = read_head(&mut r).await.unwrap_err();
+        assert!(e.to_string().contains("too long"), "{e}");
+        drop(r);
+        let _ = writer.await;
     }
 
     #[tokio::test]

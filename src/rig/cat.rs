@@ -493,6 +493,10 @@ impl RigControl for CatSerial {
 
     /// Yaesu: AC002 (tuner on, start tuning). The Kenwood family's AC differs per radio.
     fn tune_atu(&mut self) -> RigResult<()> {
+        if matches!(self.model, CatModel::Icom(_)) {
+            // CI-V 1C 01: the antenna tuner, 02 = tune now
+            return self.civ(&[0x1C, 0x01, 0x02]).map(|_| ());
+        }
         if !self.yaesu() {
             return Err(RigError::Protocol("this radio's tuner isn't started over Kenwood CAT".into()));
         }

@@ -26,6 +26,16 @@ const MAX_FAILURES: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
 /// A remote that says nothing (it pings every 5 s) for this long is gone.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A remote that takes nothing in for this long (a phone asleep, gone from the Wi-Fi) is
+/// gone too: a write waiting on it would hold the session, and its slot, forever.
+const WRITE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(2) } else { Duration::from_secs(10) };
+
+/// One message to a remote, given up on when it isn't taken in time.
+async fn put<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, m: &Message) -> io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, ws::write_message(w, m, false))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the remote isn't reading"))?
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -69,7 +79,7 @@ impl RemoteServer {
         if config.password.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "set a password first: a remote can transmit"));
         }
-        let std_listener = std::net::TcpListener::bind(("0.0.0.0", config.port))?;
+        let std_listener = bind_port(config.port)?;
         std_listener.set_nonblocking(true)?;
         let port = std_listener.local_addr()?.port();
         let (tx, commands) = std::sync::mpsc::channel();
@@ -216,50 +226,56 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
     ws::accept(&mut w, &req).await?;
     let send = |msg: ServerMsg| Message::Text(json(&msg));
 
+    let full = || ServerMsg::Denied { reason: "too many remotes connected".into(), retry: true };
+    let locked_out = || ServerMsg::Denied { reason: "too many wrong passwords: try again in a minute".into(), retry: true };
     if sh.sessions.load(Ordering::SeqCst) >= MAX_SESSIONS {
-        ws::write_message(&mut w, &send(ServerMsg::Denied { reason: "too many remotes connected".into() }), false).await?;
+        put(&mut w, &send(full())).await?;
         return Ok(());
     }
-    let locked = sh.failures.lock().ok().and_then(|f| f.get(&ip).copied())
-        .is_some_and(|(n, at)| n >= MAX_FAILURES && at.elapsed() < LOCKOUT);
-    if locked {
-        ws::write_message(&mut w, &send(ServerMsg::Denied { reason: "too many wrong passwords: try again in a minute".into() }), false).await?;
+    if locked(&sh, ip) {
+        put(&mut w, &send(locked_out())).await?;
         return Ok(());
     }
 
     // Challenge: the password's proof for a fresh nonce
     let nonce = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
     let hello = ServerMsg::Hello { protocol: PROTOCOL, name: sh.config.name.clone(), nonce: nonce.clone(), version: sh.version.clone() };
-    ws::write_message(&mut w, &send(hello), false).await?;
+    put(&mut w, &send(hello)).await?;
     let first = tokio::time::timeout(Duration::from_secs(20), ws::read_message(&mut r))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no password"))??;
-    let client = match first {
+    let (proof, client) = match first {
         Message::Text(t) => match serde_json::from_str::<ClientMsg>(&t) {
-            Ok(ClientMsg::Auth { proof, client }) if super::proof_ok(&sh.config.password, &nonce, &proof) => client,
+            Ok(ClientMsg::Auth { proof, client }) => (proof, client),
+            // (anything else first isn't a guess at the password: no strike for it)
             _ => {
-                if let Ok(mut f) = sh.failures.lock() {
-                    let e = f.entry(ip).or_insert((0, Instant::now()));
-                    if e.1.elapsed() >= LOCKOUT {
-                        *e = (0, Instant::now());
-                    }
-                    e.0 += 1;
-                    e.1 = Instant::now();
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                ws::write_message(&mut w, &send(ServerMsg::Denied { reason: "wrong password".into() }), false).await?;
+                put(&mut w, &send(ServerMsg::Denied { reason: "log in first".into(), retry: true })).await?;
                 return Ok(());
             }
         },
         _ => return Ok(()),
     };
-    if let Ok(mut f) = sh.failures.lock() {
-        f.remove(&ip);
+    match check_proof(&sh, ip, &nonce, &proof) {
+        Proof::Right => {}
+        Proof::Locked => {
+            put(&mut w, &send(locked_out())).await?;
+            return Ok(());
+        }
+        Proof::Wrong => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            put(&mut w, &send(ServerMsg::Denied { reason: "wrong password".into(), retry: false })).await?;
+            return Ok(());
+        }
     }
     let who = if client.is_empty() { ip.to_string() } else { format!("{client} at {ip}") };
     tracing::info!("remote connected: {who}");
 
-    sh.sessions.fetch_add(1, Ordering::SeqCst);
+    // (a slot taken only now, and only while one is free: many logging in at once can't
+    // all slip past the check before the counter moves)
+    if !take_slot(&sh.sessions) {
+        put(&mut w, &send(full())).await?;
+        return Ok(());
+    }
     struct Leave<'a>(&'a Shared, bool);
     impl Drop for Leave<'_> {
         fn drop(&mut self) {
@@ -271,12 +287,12 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
     }
     let mut leave = Leave(&sh, false);
 
-    ws::write_message(&mut w, &send(ServerMsg::Welcome { audio: sh.audio.available() }), false).await?;
+    put(&mut w, &send(ServerMsg::Welcome { audio: sh.audio.available() })).await?;
     let mut topics = [sh.status.subscribe(), sh.chat.subscribe(), sh.stations.subscribe(), sh.rig.subscribe()];
     for t in topics.iter_mut() {
         let cur = t.borrow_and_update().clone();
         if let Some(text) = cur {
-            ws::write_message(&mut w, &Message::Text(text.to_string()), false).await?;
+            put(&mut w, &Message::Text(text.to_string())).await?;
         }
     }
     let mut notices = sh.notices.subscribe();
@@ -365,17 +381,75 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
                 None
             }
             _ = stop.changed() => {
-                let _ = ws::write_message(&mut w, &send(ServerMsg::Denied { reason: "the station stopped remote control".into() }), false).await;
+                // (only for now: Apply in the Remote control window restarts it at once)
+                let _ = put(&mut w, &send(ServerMsg::Denied { reason: "the station stopped remote control".into(), retry: true })).await;
                 break;
             }
         };
         if let Some(m) = out {
-            ws::write_message(&mut w, &m, false).await?;
+            put(&mut w, &m).await?;
         }
     }
     tracing::info!("remote disconnected: {who}");
-    let _ = ws::write_message(&mut w, &Message::Close, false).await;
+    let _ = put(&mut w, &Message::Close).await;
     Ok(())
+}
+
+/// Binds the port. Just after a stop (Apply restarts the server) the old listener may still
+/// be letting go of it, so a busy port is tried again for a moment before giving up.
+fn bind_port(port: u16) -> io::Result<std::net::TcpListener> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::net::TcpListener::bind(("0.0.0.0", port)) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && port != 0 && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// One more remote, if there's room for it.
+fn take_slot(sessions: &AtomicUsize) -> bool {
+    let mut n = sessions.load(Ordering::SeqCst);
+    while n < MAX_SESSIONS {
+        match sessions.compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
+/// Locked out: too many wrong passwords from this address lately.
+fn locked(sh: &Shared, ip: IpAddr) -> bool {
+    sh.failures.lock().ok().and_then(|f| f.get(&ip).copied()).is_some_and(|(n, at)| n >= MAX_FAILURES && at.elapsed() < LOCKOUT)
+}
+
+enum Proof {
+    Right,
+    Wrong,
+    Locked,
+}
+
+/// Checks a password proof. The lockout is looked at, the proof checked and a wrong one
+/// counted under one lock, so guesses sent on many connections at once are held to
+/// MAX_FAILURES a minute like guesses one after another.
+fn check_proof(sh: &Shared, ip: IpAddr, nonce: &str, proof: &str) -> Proof {
+    let Ok(mut f) = sh.failures.lock() else { return Proof::Wrong };
+    // (old entries go, so the map doesn't keep every address that ever mistyped)
+    f.retain(|_, (_, at)| at.elapsed() < LOCKOUT);
+    if f.get(&ip).is_some_and(|&(n, _)| n >= MAX_FAILURES) {
+        return Proof::Locked;
+    }
+    if super::proof_ok(&sh.config.password, nonce, proof) {
+        f.remove(&ip);
+        return Proof::Right;
+    }
+    let e = f.entry(ip).or_insert((0, Instant::now()));
+    e.0 += 1;
+    e.1 = Instant::now();
+    Proof::Wrong
 }
 
 fn closed() -> io::Error {
@@ -498,10 +572,103 @@ mod tests {
         rt.block_on(async {
             assert!(matches!(raw_login(srv.port, "right").await.0, ServerMsg::Welcome { .. }));
             for _ in 0..MAX_FAILURES {
-                assert_eq!(raw_login(srv.port, "wrong").await.0, ServerMsg::Denied { reason: "wrong password".into() });
+                assert_eq!(raw_login(srv.port, "wrong").await.0, ServerMsg::Denied { reason: "wrong password".into(), retry: false });
             }
-            assert!(matches!(raw_login(srv.port, "right").await.0, ServerMsg::Denied { reason } if reason.contains("too many")));
+            assert!(matches!(raw_login(srv.port, "right").await.0, ServerMsg::Denied { reason, retry: true } if reason.contains("too many")));
         });
+    }
+
+    /// Guesses sent on many connections at once are held to MAX_FAILURES like guesses one
+    /// after another: the rest are refused unchecked, the right password included.
+    #[test]
+    fn parallel_guesses_are_locked_out_too() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = ServerConfig { port: 0, password: "right".into(), name: "NR5P".into(), audio_device: String::new() };
+        let srv = RemoteServer::start(rt.handle(), cfg).unwrap();
+        let port = srv.port;
+        rt.block_on(async {
+            let mut tries = Vec::new();
+            for i in 0..30 {
+                tries.push(tokio::spawn(async move { raw_login(port, if i == 29 { "right" } else { "wrong" }).await.0 }));
+            }
+            let mut checked = 0;
+            for t in tries {
+                match t.await.unwrap() {
+                    ServerMsg::Denied { retry: false, .. } => checked += 1,
+                    ServerMsg::Denied { retry: true, .. } => {}
+                    ServerMsg::Welcome { .. } => {} // (the right one may come before the fifth wrong one)
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(checked, MAX_FAILURES as usize, "wrong passwords checked");
+            assert!(matches!(raw_login(port, "right").await.0, ServerMsg::Denied { retry: true, .. }));
+        });
+    }
+
+    /// Many remotes logging in at once still get no more than MAX_SESSIONS slots.
+    #[test]
+    fn parallel_logins_keep_to_the_limit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = ServerConfig { port: 0, password: "pw".into(), name: "NR5P".into(), audio_device: String::new() };
+        let srv = RemoteServer::start(rt.handle(), cfg).unwrap();
+        let port = srv.port;
+        let held = rt.block_on(async {
+            let tries: Vec<_> = (0..MAX_SESSIONS + 4).map(|_| tokio::spawn(async move { raw_login(port, "pw").await })).collect();
+            let mut held = Vec::new();
+            let mut full = 0;
+            for t in tries {
+                let (m, r, w) = t.await.unwrap();
+                match m {
+                    ServerMsg::Welcome { .. } => held.push((r, w)),
+                    ServerMsg::Denied { retry: true, reason } if reason.contains("too many remotes") => full += 1,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!((held.len(), full), (MAX_SESSIONS, 4));
+            held
+        });
+        assert_eq!(srv.sessions(), MAX_SESSIONS);
+        drop(held);
+    }
+
+    /// A remote that stops taking anything in (a phone asleep) is let go, rather than
+    /// holding its session and slot for good.
+    #[test]
+    fn a_remote_that_stops_reading_is_let_go() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = ServerConfig { port: 0, password: "pw".into(), name: "NR5P".into(), audio_device: String::new() };
+        let srv = RemoteServer::start(rt.handle(), cfg).unwrap();
+        let (m, r, w) = rt.block_on(raw_login(srv.port, "pw"));
+        assert!(matches!(m, ServerMsg::Welcome { .. }));
+        wait_for("the session", || srv.sessions() == 1);
+        // (it keeps pinging, so only the writes can tell it's gone)
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let pinger = rt.spawn(async move {
+            let mut w = w;
+            let ping = Message::Text(serde_json::to_string(&ClientMsg::Ping).unwrap());
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if ws::write_message(&mut w, &ping, true).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let big = "x".repeat(200_000);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut i = 0u64;
+        while srv.sessions() > 0 {
+            assert!(Instant::now() < deadline, "the stalled remote is still held");
+            i += 1;
+            srv.publish_status(&Status { status: format!("{i}{big}"), ..Default::default() });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = stop_tx.send(());
+        let _ = rt.block_on(pinger);
+        drop(r);
     }
 
     /// A remote that loses the station (restarted, Wi-Fi gone) keeps trying and gets back in.
@@ -594,8 +761,14 @@ mod tests {
     #[test]
     fn restarts_on_the_same_port() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let cfg = ServerConfig { port: 0, password: "x".into(), name: "NR5P".into(), audio_device: String::new() };
-        let first = RemoteServer::start(rt.handle(), cfg.clone()).unwrap();
+        // (a port below the system's temporary ones, as in remote_reconnects: other tests'
+        // connections could take a temporary port in the moment it's free)
+        let (first, cfg) = (23_600..23_700)
+            .find_map(|port| {
+                let cfg = ServerConfig { port, password: "x".into(), name: "NR5P".into(), audio_device: String::new() };
+                RemoteServer::start(rt.handle(), cfg.clone()).ok().map(|s| (s, cfg))
+            })
+            .expect("a free port");
         let port = first.port;
         drop(first);
         let again = RemoteServer::start(rt.handle(), ServerConfig { port, ..cfg }).unwrap();

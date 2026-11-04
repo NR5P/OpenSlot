@@ -3212,6 +3212,8 @@ impl VaracApp {
                 freq: self.state.rig_freq,
                 mode: self.state.rig_mode,
                 ptt: self.state.rig_ptt,
+                // (VARA's own transmission, however it keys the radio)
+                station_tx: self.state.ptt,
                 extras: self.state.rig_extras.clone(),
                 may_transmit: !self.state.ptt_disabled,
             };

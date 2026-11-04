@@ -179,6 +179,12 @@ enum Ended {
     Lost(io::Error),
 }
 
+/// A refusal for now (too many remotes, a lockout, the station restarting) is tried again;
+/// a wrong password isn't.
+fn refused(reason: String, retry: bool) -> Ended {
+    if retry { Ended::Lost(io::Error::other(reason)) } else { Ended::Denied(reason) }
+}
+
 impl From<io::Error> for Ended {
     fn from(e: io::Error) -> Self {
         Ended::Lost(e)
@@ -199,7 +205,9 @@ async fn session(
     let _ = stream.set_nodelay(true);
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
-    ws::connect(&mut r, &mut w, &addr, "/ws").await?;
+    tokio::time::timeout(Duration::from_secs(10), ws::connect(&mut r, &mut w, &addr, "/ws"))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{addr} didn't answer as an Openslot station")))??;
     let text = |m: io::Result<Message>| -> Result<ServerMsg, Ended> {
         match m? {
             Message::Text(t) => serde_json::from_str(&t).map_err(|e| Ended::Lost(io::Error::new(io::ErrorKind::InvalidData, e))),
@@ -210,7 +218,7 @@ async fn session(
     let hello = text(tokio::time::timeout(Duration::from_secs(10), ws::read_message(&mut r)).await.map_err(timeout(10))?)?;
     let (name, nonce, version) = match hello {
         ServerMsg::Hello { name, nonce, version, .. } => (name, nonce, version),
-        ServerMsg::Denied { reason } => return Err(Ended::Denied(reason)),
+        ServerMsg::Denied { reason, retry } => return Err(refused(reason, retry)),
         _ => return Err(Ended::Lost(io::Error::new(io::ErrorKind::InvalidData, "not an Openslot station"))),
     };
     let auth = ClientMsg::Auth {
@@ -220,9 +228,15 @@ async fn session(
     ws::write_message(&mut w, &Message::Text(serde_json::to_string(&auth).unwrap_or_default()), true).await?;
     let audio = match text(tokio::time::timeout(Duration::from_secs(10), ws::read_message(&mut r)).await.map_err(timeout(10))?)? {
         ServerMsg::Welcome { audio } => audio,
-        ServerMsg::Denied { reason } => return Err(Ended::Denied(reason)),
+        ServerMsg::Denied { reason, retry } => return Err(refused(reason, retry)),
         _ => return Err(Ended::Lost(io::Error::new(io::ErrorKind::InvalidData, "unexpected answer to the password"))),
     };
+    // (the station may have restarted, numbering its audio afresh)
+    if let Ok(mut p) = player.lock() {
+        if let Some(p) = p.as_mut() {
+            p.new_session();
+        }
+    }
     let listening = {
         let mut v = view.lock().map_err(|_| io::Error::other("view"))?;
         v.phase = Phase::Connected;
@@ -263,7 +277,7 @@ async fn session(
                 match m {
                     Some(Ok(Message::Text(t))) => {
                         let Ok(msg) = serde_json::from_str::<ServerMsg>(&t) else { continue };
-                        if let ServerMsg::Denied { reason } = msg {
+                        if let ServerMsg::Denied { reason, .. } = msg {
                             return Err(Ended::Lost(io::Error::other(reason)));
                         }
                         if let Ok(mut v) = view.lock() {

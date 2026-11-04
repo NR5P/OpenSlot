@@ -28,8 +28,10 @@ button.primary { background: var(--accent); color: #04121b; border-color: var(--
 button.danger { background: color-mix(in srgb, var(--red) 22%, var(--raised)); border-color: var(--red); color: var(--red); font-weight: 600; }
 button.purple { background: color-mix(in srgb, var(--purple) 20%, var(--raised)); border-color: var(--purple); color: var(--purple); font-weight: 600; }
 input[type=text], input[type=password], select { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-  padding: 9px 10px; min-width: 0; }
+  padding: 9px 10px; min-width: 0; font-size: 16px; /* (under 16px, iOS zooms the page in on focus, and stays zoomed) */ }
 input:focus { outline: none; border-color: var(--accent); }
+#app.offline main { opacity: .45; pointer-events: none; }
+#app.offline .freq { opacity: .45; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 .muted { color: var(--muted); }
 .small { font-size: 12.5px; }
@@ -231,7 +233,7 @@ const $ = id => document.getElementById(id);
 const CFS = [[1838000,"160m"],[3595000,"80m"],[5357000,"60m"],[7105000,"40m"],[10133000,"30m"],[14105000,"20m"],
   [18107000,"17m"],[21105000,"15m"],[24927000,"12m"],[28105000,"10m"],[50305000,"6m"]];
 let ws = null, password = "", authed = false, status = {}, rig = null, stations = {cq: [], beacons: []};
-let retry = null, pingTimer = null, denied = false;
+let retry = null, pingTimer = null, denied = false, retryIn = 3000;
 
 const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} } };
@@ -258,18 +260,22 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&
 // ---- connection
 function connect() {
   clearTimeout(retry);
-  denied = false;
+  denied = false; retryIn = 3000;
+  // (one socket at a time: an older one, still opening or closing, is let go and its
+  // events ignored, so its hello can't answer for this one or its close end this one)
+  if (ws) { const old = ws; ws = null; old.onmessage = old.onclose = null; try { old.close(); } catch (e) {} }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
+  const sock = ws = new WebSocket(`${proto}//${location.host}/ws`);
+  sock.binaryType = "arraybuffer";
   setDot("");
-  ws.onmessage = ev => {
+  sock.onmessage = ev => {
+    if (sock !== ws) return;
     if (typeof ev.data !== "string") return audioFrame(ev.data);
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
     switch (m.type) {
       case "hello":
         $("loginInfo").textContent = `${m.name}'s Openslot ${m.version}`;
-        send({type: "auth", proof: hmacHex(password, "openslot:" + m.nonce), client: "Browser (" + (navigator.platform || "phone") + ")"});
+        sock.send(JSON.stringify({type: "auth", proof: hmacHex(password, "openslot:" + m.nonce), client: "Browser (" + (navigator.platform || "phone") + ")"}));
         break;
       case "welcome":
         authed = true;
@@ -277,12 +283,22 @@ function connect() {
         $("login").classList.add("hide"); $("app").classList.remove("hide");
         $("listen").classList.toggle("hide", !m.audio);
         setDot("ok");
+        // (the station numbers its audio afresh after a restart: start the count over)
+        nextAt = 0; lastSeq = -1;
         if (listening) cmd({cmd: "audio", on: true});
         break;
       case "denied":
-        denied = true; authed = false;
-        store.set("openslot.pw", null);
-        showLogin("The station refused: " + m.reason);
+        authed = false;
+        if (m.retry) {
+          // only for now (too many remotes, a lockout, the station restarting): keep the
+          // password and try again, after the minute a lockout lasts
+          retryIn = /wrong passwords/.test(m.reason) ? 61000 : 3000;
+          notice("The station refused: " + m.reason + " (trying again)");
+        } else {
+          denied = true;
+          store.set("openslot.pw", null);
+          showLogin("The station refused: " + m.reason);
+        }
         break;
       case "status": status = m; renderStatus(); break;
       case "chat": renderChat(m.lines); break;
@@ -291,20 +307,30 @@ function connect() {
       case "notice": notice(m.text); break;
     }
   };
-  ws.onclose = () => {
+  sock.onclose = () => {
+    if (sock !== ws) return;
     authed = false; setDot("bad");
     clearInterval(pingTimer);
-    if (!denied && password) retry = setTimeout(connect, 3000);
+    if (!denied && password) retry = setTimeout(connect, retryIn);
   };
   clearInterval(pingTimer);
   pingTimer = setInterval(() => send({type: "ping"}), 5000);
 }
-function setDot(c) { $("dot").className = "dot " + c; }
+function setDot(c) {
+  $("dot").className = "dot " + c;
+  // (off the station, what shows is how it was: dimmed, and nothing to tap until it's back)
+  $("app").classList.toggle("offline", c !== "ok");
+}
 function showLogin(err) {
   $("app").classList.add("hide"); $("login").classList.remove("hide");
   $("loginErr").textContent = err || "";
 }
-$("go").onclick = () => { password = $("pw").value; if (!password) return; $("loginErr").textContent = ""; connect(); };
+$("go").onclick = () => {
+  password = $("pw").value; if (!password) return;
+  // (a second tap while this password is still being tried changes nothing)
+  if (ws && ws.readyState === 0 && !denied) return;
+  $("loginErr").textContent = ""; connect();
+};
 $("pw").onkeydown = e => { if (e.key === "Enter") $("go").click(); };
 document.addEventListener("visibilitychange", () => {
   // (phones drop sockets in the background: back at once on return)
@@ -507,7 +533,12 @@ function audioFrame(buf) {
   const dv = new DataView(buf);
   if (dv.byteLength < 5 || dv.getUint8(0) !== 1) return;
   const seq = dv.getUint32(1, true);
-  if (lastSeq >= 0 && ((seq - lastSeq) >>> 0) > 0x7fffffff) return; // late
+  if (lastSeq >= 0) {
+    const ahead = (seq - lastSeq) >>> 0;
+    // (a repeat, or one late by under 5 s; further back means the station started its
+    // count over, so it's taken)
+    if (ahead === 0 || (ahead > 0x7fffffff && ((lastSeq - seq) >>> 0) < 250)) return;
+  }
   lastSeq = seq;
   const n = (dv.byteLength - 5) >> 1, rate = 24000;
   // (12 kHz doubled: every browser takes a 24 kHz buffer)
@@ -517,7 +548,10 @@ function audioFrame(buf) {
     d[i * 2] = (prev + v) / 2; d[i * 2 + 1] = v; prev = v;
   }
   const now = actx.currentTime;
-  if (nextAt < now + 0.03 || nextAt > now + 0.6) nextAt = now + 0.15;
+  // (behind: start again with a little buffer; too far ahead, after a clump, this frame
+  // is dropped, never played over what's already queued)
+  if (nextAt > now + 0.6) return;
+  if (nextAt < now + 0.03) nextAt = now + 0.15;
   const src = actx.createBufferSource(); src.buffer = b; src.connect(gain); src.start(nextAt);
   nextAt += b.duration;
 }

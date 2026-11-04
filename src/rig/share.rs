@@ -44,7 +44,11 @@ pub struct Snapshot {
     pub connected: bool,
     pub freq: Option<u64>,
     pub mode: Option<RadioMode>,
+    /// The radio is keyed through rig control (CAT)
     pub ptt: bool,
+    /// Openslot itself is transmitting (VARA, however it keys the radio: CAT, VOX or the
+    /// modem's own PTT line). A program never keys over it nor unkeys it.
+    pub station_tx: bool,
     pub extras: RigExtras,
     /// PTT isn't disabled in Openslot
     pub may_transmit: bool,
@@ -194,16 +198,27 @@ struct Session<'a> {
     keyed: bool,
 }
 
+/// A program that keyed the radio and then says nothing for this long is gone (off the
+/// Wi-Fi, asleep: the connection may not end for minutes): the radio is unkeyed. Hamlib
+/// programs ask for the frequency every second or so.
+const KEYED_SILENCE: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(20) };
+
 fn serve(stream: TcpStream, inner: &Inner) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let Ok(mut w) = stream.try_clone() else { return };
     let mut r = BufReader::new(stream);
     let mut s = Session { inner, keyed: false };
     let mut line = String::new();
+    let mut heard = Instant::now();
     while !inner.stop.load(Ordering::Relaxed) {
+        if s.keyed && heard.elapsed() > KEYED_SILENCE {
+            s.unkey();
+            inner.note("Rig sharing: a program went silent with the radio keyed: unkeyed".into());
+        }
         match r.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
+                heard = Instant::now();
                 let cmd = std::mem::take(&mut line);
                 let cmd = cmd.trim_end_matches(['\r', '\n']);
                 if cmd.trim().is_empty() {
@@ -224,7 +239,7 @@ fn serve(stream: TcpStream, inner: &Inner) {
         }
     }
     if s.keyed {
-        inner.send(RigCommand::SetPtt(false));
+        s.unkey();
         inner.note("Rig sharing: a program left with the radio keyed: unkeyed".into());
     }
 }
@@ -378,6 +393,15 @@ impl Session<'_> {
         if self.inner.send(cmd) { Out::Ok } else { Out::Err(ETIMEOUT) }
     }
 
+    /// Lets go of what this program keyed, unless Openslot's own transmission has the
+    /// radio now (VARA keyed over it): that one is never cut.
+    fn unkey(&mut self) -> Out {
+        if !std::mem::take(&mut self.keyed) || self.snap().station_tx {
+            return Out::Ok;
+        }
+        self.change(RigCommand::SetPtt(false))
+    }
+
     fn may_transmit(&self) -> bool {
         self.inner.allow_tx && self.snap().may_transmit
     }
@@ -390,7 +414,8 @@ impl Session<'_> {
 
     fn dispatch(&mut self, name: &str, args: &[&str]) -> Out {
         let s = self.snap();
-        let num = |i: usize| -> Option<f64> { args.get(i).and_then(|a| a.parse::<f64>().ok()) };
+        // (nan and inf parse as numbers, but no setting takes them)
+        let num = |i: usize| -> Option<f64> { args.get(i).and_then(|a| a.parse::<f64>().ok()).filter(|v| v.is_finite()) };
         match name {
             "get_freq" | "get_split_freq" => match (s.connected, s.freq) {
                 (true, Some(f)) => Out::Values(vec![(if name == "get_freq" { "Frequency" } else { "TX Frequency" }, f.to_string())]),
@@ -422,24 +447,17 @@ impl Session<'_> {
                 Some("VFOA" | "MAIN" | "CURRVFO" | "RX" | "TX" | "VFO") => Out::Ok,
                 _ => Out::Err(ERJCTED),
             },
-            "get_ptt" => Out::Values(vec![("PTT", (s.ptt as u8).to_string())]),
+            "get_ptt" => Out::Values(vec![("PTT", ((s.ptt || s.station_tx) as u8).to_string())]),
             "set_ptt" => match args.first() {
-                Some(&"0") => {
-                    // Only what this program keyed: never a VARA transmission
-                    if self.keyed {
-                        self.keyed = false;
-                        self.change(RigCommand::SetPtt(false))
-                    } else {
-                        Out::Ok
-                    }
-                }
+                // Only what this program keyed: never a VARA transmission
+                Some(&"0") => self.unkey(),
                 Some(&("1" | "2" | "3")) => {
                     if !self.may_transmit() {
                         self.inner.note("Rig sharing: a program's PTT was refused (transmitting isn't allowed)".into());
                         return Out::Err(ERJCTED);
                     }
-                    if s.ptt && !self.keyed {
-                        // (Openslot is transmitting: don't take its transmission over)
+                    if s.station_tx || (s.ptt && !self.keyed) {
+                        // (Openslot, or another program, is transmitting: don't take it over)
                         return Out::Err(ERJCTED);
                     }
                     let r = self.change(RigCommand::SetPtt(true));
@@ -660,6 +678,8 @@ mod tests {
         assert!(inner.extras_wanted.lock().unwrap().is_some(), "and now wanted");
         assert_eq!(s.execute("\\unknown_thing").unwrap(), "RPRT -4\n");
         assert_eq!(s.execute("+").unwrap(), "RPRT -1\n", "answered, not hung up on");
+        assert_eq!(s.execute("L RFPOWER nan").unwrap(), "RPRT -1\n", "not a level");
+        assert_eq!(s.execute("F inf").unwrap(), "RPRT -1\n", "not a frequency");
         assert!(s.execute("q").is_none());
     }
 
@@ -684,6 +704,49 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(RigCommand::SetPtt(true))));
         assert_eq!(s.execute("T 0").unwrap(), "RPRT 0\n");
         assert!(matches!(rx.try_recv(), Ok(RigCommand::SetPtt(false))));
+
+        // A logger keys, then VARA starts transmitting (by VOX here, so not through CAT):
+        // the logger's PTT off, or its leaving, must not cut VARA off
+        assert_eq!(s.execute("T 1").unwrap(), "RPRT 0\n");
+        assert!(matches!(rx.try_recv(), Ok(RigCommand::SetPtt(true))));
+        inner.snap.lock().unwrap().station_tx = true;
+        assert_eq!(s.execute("t").unwrap(), "1\n", "VARA's transmission shows");
+        assert_eq!(s.execute("T 0").unwrap(), "RPRT 0\n");
+        assert!(rx.try_recv().is_err(), "VARA's transmission wasn't cut");
+        assert_eq!(s.execute("T 1").unwrap(), "RPRT -9\n", "nor keyed over");
+        inner.snap.lock().unwrap().station_tx = false;
+        assert_eq!(s.execute("T 0").unwrap(), "RPRT 0\n");
+        assert!(rx.try_recv().is_err(), "nothing of the logger's left to unkey");
+    }
+
+    /// A program that keys the radio and then goes silent (gone from the network, its
+    /// connection not closed) is unkeyed, without waiting for the PTT watchdog.
+    #[test]
+    fn a_silent_program_is_unkeyed() {
+        let (tx, rx) = mpsc::channel();
+        let settings = ShareSettings { enabled: true, port: Some(0), lan: false, allow_tx: true };
+        let srv = ShareServer::start(&settings).unwrap();
+        srv.update(Snapshot { connected: true, freq: Some(14_105_000), may_transmit: true, ..Default::default() }, Some(tx));
+        let c = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut w = c.try_clone().unwrap();
+        let mut r = BufReader::new(c);
+        w.write_all(b"T 1\n").unwrap();
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(line, "RPRT 0\n");
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(RigCommand::SetPtt(true))));
+        // (still connected, saying nothing)
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(4)), Ok(RigCommand::SetPtt(false))), "unkeyed");
+        // (the note follows the unkey)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut notes = Vec::new();
+        while !notes.iter().any(|n: &String| n.contains("went silent")) {
+            assert!(Instant::now() < deadline, "no note: {notes:?}");
+            notes.extend(srv.notes());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(w);
     }
 
     /// Over TCP, as a Hamlib program connects (and leaving keyed unkeys).

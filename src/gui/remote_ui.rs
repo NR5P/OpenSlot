@@ -132,7 +132,8 @@ pub fn snapshot(state: &GuiState, server: &crate::remote::server::RemoteServer) 
         connected: state.rig_connected,
         frequency: state.rig_freq,
         mode: state.rig_mode,
-        ptt: state.rig_ptt,
+        // (keyed through CAT, or VARA keying it by VOX or its own PTT line)
+        ptt: state.rig_ptt || state.ptt,
         extras: state.rig_extras.clone(),
         may_transmit: !state.ptt_disabled,
     };

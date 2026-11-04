@@ -157,6 +157,24 @@ impl Item {
     }
 }
 
+impl RigExtras {
+    /// Drops what's known of a control (the radio stopped answering for it).
+    pub fn forget(&mut self, item: Item) {
+        match item {
+            Item::Level(l) => {
+                self.levels.remove(&l);
+            }
+            Item::Switch(s) => {
+                self.switches.remove(&s);
+            }
+            Item::Agc => self.agc = None,
+            Item::Meter(m) => {
+                self.meters.remove(&m);
+            }
+        }
+    }
+}
+
 /// Piecewise-linear lookup, for the radios' meter scales.
 pub fn interpolate(table: &[(f32, f32)], x: f32) -> f32 {
     let Some(first) = table.first() else { return x };

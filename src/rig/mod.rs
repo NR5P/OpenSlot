@@ -130,6 +130,9 @@ pub trait RigControl: Send {
     fn name(&self) -> &str;
 }
 
+/// Failed reads in a row before a control is taken as not offered after all.
+const MAX_MISSES: u8 = 3;
+
 fn unsupported() -> RigError {
     RigError::Protocol("not offered by this rig control".into())
 }
@@ -869,6 +872,9 @@ struct Worker {
     offered: Option<Vec<Item>>,
     /// Still to ask about, and where the round of reads is
     to_probe: Vec<Item>,
+    /// Reads of an offered control that failed in a row (a busy radio answers some with an
+    /// error): only a few in a row mean it's really gone
+    misses: std::collections::HashMap<Item, u8>,
     next_read: usize,
     last_extra: Instant,
     extras_sent: Option<RigExtras>,
@@ -891,6 +897,7 @@ impl Worker {
                 // (another radio may answer now: ask about its controls again)
                 self.offered = None;
                 self.to_probe = Item::all();
+                self.misses.clear();
                 self.extras = RigExtras::default();
                 self.extras_sent = None;
                 self.emit(RigEvent::Connected(self.rig.name().to_string()));
@@ -1046,7 +1053,8 @@ impl Worker {
                 }
             }
             RigCommand::TxHint(on) => self.tx_hint = on,
-            RigCommand::SetLevel(level, v) if self.rig.is_connected() => {
+            // (NaN isn't a level: a program's "L RFPOWER nan" would be 5 W on CAT)
+            RigCommand::SetLevel(level, v) if self.rig.is_connected() && v.is_finite() => {
                 let v = v.clamp(0.0, 1.0);
                 match self.rig.set_level(level, v) {
                     Ok(()) => {
@@ -1144,45 +1152,51 @@ impl Worker {
             (true, false) if self.next_read % 2 == 0 => signal,
             _ => round[(self.next_read / 2) % round.len()],
         };
-        if !self.read_item(item) {
-            // (rejected now: stop asking, as with the mode)
-            if let Some(o) = self.offered.as_mut() {
-                o.retain(|&i| i != item);
+        if self.read_item(item) {
+            self.misses.remove(&item);
+        } else {
+            // (rejected a few times in a row: stop asking, as with the mode; once could be
+            // the radio busy, and its last reading stays meanwhile)
+            let n = self.misses.entry(item).or_insert(0);
+            *n += 1;
+            if *n >= MAX_MISSES {
+                self.misses.remove(&item);
+                if let Some(o) = self.offered.as_mut() {
+                    o.retain(|&i| i != item);
+                }
+                self.extras.forget(item);
             }
         }
         self.send_extras();
     }
 
-    /// Reads `item` into `extras`; false when the radio doesn't offer it. A timeout or I/O
-    /// error counts as not offered too, but never as a lost link: the frequency poll
-    /// decides that.
+    /// Reads `item` into `extras`; false when the radio didn't answer for it (the last
+    /// reading, if any, stays). A timeout or I/O error counts the same, but never as a lost
+    /// link: the frequency poll decides that.
     fn read_item(&mut self, item: Item) -> bool {
         let x = &mut self.extras;
         match item {
             Item::Level(l) => match self.rig.get_level(l) {
-                Ok(v) => {
+                Ok(v) if v.is_finite() => {
                     x.levels.insert(l, v.clamp(0.0, 1.0));
                     true
                 }
-                Err(_) => {
-                    x.levels.remove(&l);
-                    false
-                }
+                _ => false,
             },
             Item::Switch(s) => match self.rig.get_switch(s) {
                 Ok(v) => {
                     x.switches.insert(s, v);
                     true
                 }
-                Err(_) => {
-                    x.switches.remove(&s);
-                    false
-                }
+                Err(_) => false,
             },
-            Item::Agc => {
-                x.agc = self.rig.get_agc().ok();
-                x.agc.is_some()
-            }
+            Item::Agc => match self.rig.get_agc() {
+                Ok(a) => {
+                    x.agc = Some(a);
+                    true
+                }
+                Err(_) => false,
+            },
             Item::Meter(m) => match self.rig.get_meter(m) {
                 Ok(v) if v.is_finite() => {
                     x.meters.insert(m, v);
@@ -1191,10 +1205,7 @@ impl Worker {
                     }
                     true
                 }
-                _ => {
-                    x.meters.remove(&m);
-                    false
-                }
+                _ => false,
             },
         }
     }
@@ -1240,6 +1251,7 @@ fn rig_worker(
         extras: RigExtras::default(),
         offered: None,
         to_probe: Item::all(),
+        misses: std::collections::HashMap::new(),
         next_read: 0,
         last_extra: Instant::now(),
         extras_sent: None,
@@ -1389,6 +1401,63 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(got, Some(14_103_500));
+    }
+
+    /// A radio busy for a moment (Hamlib's RPRT -5 for a couple of reads) keeps the control:
+    /// only a few failures in a row hide it.
+    #[test]
+    fn a_busy_moment_keeps_a_control() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let power_reads = Arc::new(AtomicUsize::new(0));
+        let reads = power_reads.clone();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            for line in BufReader::new(s).lines() {
+                let Ok(line) = line else { return };
+                let reply = match line.trim() {
+                    "f" => "14105000\n".to_string(),
+                    "m" => "PKTUSB\n3000\n".to_string(),
+                    "l RFPOWER" => {
+                        // (the first read is the probe; the 2nd and 3rd find the radio busy)
+                        let n = reads.fetch_add(1, Ordering::SeqCst);
+                        if (1..=2).contains(&n) { "RPRT -5\n".to_string() } else { "0.5\n".to_string() }
+                    }
+                    l if l.starts_with("l ") || l.starts_with("u ") => "RPRT -11\n".to_string(),
+                    _ => "RPRT 0\n".to_string(),
+                };
+                if w.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut mgr = RigBackend::Rigctld { host: "127.0.0.1".into(), port }.into_manager().unwrap();
+        while !mgr.is_connected() {
+            mgr.poll_events();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        mgr.watch_extras(true);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last = None;
+        while power_reads.load(Ordering::SeqCst) < 6 {
+            assert!(Instant::now() < deadline, "power stopped being read after {} reads", power_reads.load(Ordering::SeqCst));
+            for ev in mgr.poll_events() {
+                if let RigEvent::Extras(x) = ev {
+                    last = Some(x);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        for ev in mgr.poll_events() {
+            if let RigEvent::Extras(x) = ev {
+                last = Some(x);
+            }
+        }
+        assert_eq!(last.and_then(|x| x.levels.get(&Level::RfPower).copied()), Some(0.5), "still shown");
     }
 
     /// The extra controls: read only while watched, only those the radio answers to, and a

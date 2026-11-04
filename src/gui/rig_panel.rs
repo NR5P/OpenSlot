@@ -36,7 +36,8 @@ pub fn draw_rig_window(ctx: &egui::Context, state: &mut GuiState) {
             let panel = RigPanel {
                 connected: state.rig_connected,
                 mode: state.rig_mode,
-                ptt: state.rig_ptt,
+                // (keyed through CAT, or VARA keying it by VOX or its own PTT line)
+                ptt: state.rig_ptt || state.ptt,
                 extras: &state.rig_extras,
                 may_transmit: !state.ptt_disabled,
                 backend: state.rig_backend.to_string(),
