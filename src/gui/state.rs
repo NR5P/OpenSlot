@@ -839,6 +839,9 @@ pub struct GuiState {
     /// The broadcasts' share of the space they split with the chat in the main window
     /// (the drag bar between them); None = the default height
     pub broadcasts_share: Option<f32>,
+    /// The chat grows over the broadcasts and the top cards while the mouse rests on it
+    /// (off with the chat's 📌 button: it stays in its place)
+    pub chat_grow_on_hover: bool,
 
     // CQ filter
     pub cq_filter: String,
@@ -1361,6 +1364,7 @@ impl GuiState {
             chat_window_open: false,
             broadcasts_window_open: false,
             broadcasts_share: None,
+            chat_grow_on_hover: true,
             cq_filter: String::new(),
             connect_started: None,
             connect_timeout_secs: 30,

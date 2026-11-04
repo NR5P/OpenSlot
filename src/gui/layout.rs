@@ -206,7 +206,8 @@ const CHAT_EXPAND_DELAY_S: f64 = 0.35;
 
 /// The chat in its place, grown over the broadcasts and the top section (`expand_over`)
 /// while the mouse is over it, to read back the whole QSO; it shrinks back when the mouse
-/// leaves. Pop out still gives it a window of its own.
+/// leaves. Pop out still gives it a window of its own. Off (`chat_grow_on_hover`, the
+/// chat's 📌 button), it stays in its place.
 fn draw_chat_expandable(ui: &mut egui::Ui, state: &mut GuiState, expand_over: egui::Rect) {
     let expand_top = if expand_over.is_positive() { expand_over.top() + 8.0 } else { ui.cursor().top() };
     let ctx = ui.ctx().clone();
@@ -225,7 +226,10 @@ fn draw_chat_expandable(ui: &mut egui::Ui, state: &mut GuiState, expand_over: eg
         r.contains(p) && ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background || l.id == area_id)
     });
     let mut since = None;
-    if open {
+    if !state.chat_grow_on_hover {
+        // (pinned with the chat's 📌: it stays in its place, and shrinks back if grown)
+        open = false;
+    } else if open {
         // (kept open while a chat line's menu is up or a drag that started in it goes on)
         open = on_chat(rect) || ctx.is_context_menu_open() || (ctx.is_using_pointer() && pointer.is_some_and(|p| rect.contains(p)));
     } else if on_chat(home) && !ctx.input(|i| i.pointer.any_down()) {
