@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::audio::{decode_frame, Player};
 use super::ws::{self, Message};
+use super::screen::{ScreenInput, SCREEN};
 use super::{ChatItem, ClientMsg, Command, RigView, ServerMsg, Stations, Status};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,12 +49,24 @@ pub struct View {
     pub audio_offered: bool,
     pub listening: bool,
     pub audio_error: Option<String>,
+    /// The station draws its screen for us (older stations don't: the console instead)
+    pub screen_offered: bool,
+    /// Counts logins: a new one is a fresh screen at the station (its pictures sent again)
+    pub logins: u64,
 }
+
+/// Frames of the station's screen not yet painted (newest last). Each is kept until the GUI
+/// takes it: a frame dropped would lose the pictures it brought.
+type Frames = Arc<Mutex<VecDeque<Vec<u8>>>>;
+/// Frames held for a GUI that isn't drawing (a minimized window): past this, the oldest go
+/// (and the screen is asked for afresh).
+const MAX_FRAMES: usize = 30;
 
 pub struct RemoteClient {
     pub config: ClientConfig,
     view: Arc<Mutex<View>>,
-    tx: mpsc::UnboundedSender<Command>,
+    frames: Frames,
+    tx: mpsc::UnboundedSender<ClientMsg>,
     stop: watch::Sender<bool>,
     player: Arc<Mutex<Option<Player>>>,
     rt: tokio::runtime::Handle,
@@ -63,12 +76,33 @@ pub struct RemoteClient {
 impl RemoteClient {
     pub fn connect(rt: &tokio::runtime::Handle, config: ClientConfig, repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         let view = Arc::new(Mutex::new(View::default()));
+        let frames: Frames = Arc::default();
         let (tx, rx) = mpsc::unbounded_channel();
         let (stop, stop_rx) = watch::channel(false);
         let player: Arc<Mutex<Option<Player>>> = Arc::new(Mutex::new(None));
-        let (v, p, r, cfg) = (view.clone(), player.clone(), repaint.clone(), config.clone());
-        rt.spawn(run(cfg, v, p, rx, stop_rx, r));
-        Self { config, view, tx, stop, player, rt: rt.clone(), repaint }
+        let (v, f, p, r, cfg) = (view.clone(), frames.clone(), player.clone(), repaint.clone(), config.clone());
+        rt.spawn(run(cfg, v, f, p, rx, stop_rx, r));
+        Self { config, view, frames, tx, stop, player, rt: rt.clone(), repaint }
+    }
+
+    /// The station sends its screen (the console is for older stations).
+    pub fn screen_offered(&self) -> bool {
+        self.view.lock().is_ok_and(|v| v.screen_offered)
+    }
+
+    /// Counts logins (each one a fresh screen at the station).
+    pub fn logins(&self) -> u64 {
+        self.view.lock().map(|v| v.logins).unwrap_or(0)
+    }
+
+    /// The screen frames that came since the last call (oldest first).
+    pub fn take_frames(&self) -> Vec<Vec<u8>> {
+        self.frames.lock().map(|mut f| f.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// Our size and input for the station's screen.
+    pub fn send_screen(&self, input: ScreenInput) {
+        let _ = self.tx.send(ClientMsg::Screen(input));
     }
 
     pub fn view(&self) -> View {
@@ -76,7 +110,7 @@ impl RemoteClient {
     }
 
     pub fn send(&self, cmd: Command) {
-        let _ = self.tx.send(cmd);
+        let _ = self.tx.send(ClientMsg::Cmd(cmd));
     }
 
     /// Listen to the station's receive audio here (or stop).
@@ -100,7 +134,7 @@ impl RemoteClient {
                     if let Ok(mut slot) = player.lock() {
                         *slot = Some(p);
                     }
-                    let _ = tx.send(Command::Audio { on: true });
+                    let _ = tx.send(ClientMsg::Cmd(Command::Audio { on: true }));
                 }
                 Err(e) => {
                     if let Ok(mut v) = view.lock() {
@@ -133,8 +167,9 @@ impl Drop for RemoteClient {
 async fn run(
     cfg: ClientConfig,
     view: Arc<Mutex<View>>,
+    frames: Frames,
     player: Arc<Mutex<Option<Player>>>,
-    mut rx: mpsc::UnboundedReceiver<Command>,
+    mut rx: mpsc::UnboundedReceiver<ClientMsg>,
     mut stop: watch::Receiver<bool>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -151,7 +186,7 @@ async fn run(
             }
         });
         let r = tokio::select! {
-            r = session(&cfg, &view, &player, &mut rx, &repaint) => r,
+            r = session(&cfg, &view, &frames, &player, &mut rx, &repaint) => r,
             _ = stop.changed() => return,
         };
         match r {
@@ -194,8 +229,9 @@ impl From<io::Error> for Ended {
 async fn session(
     cfg: &ClientConfig,
     view: &Arc<Mutex<View>>,
+    frames: &Frames,
     player: &Arc<Mutex<Option<Player>>>,
-    rx: &mut mpsc::UnboundedReceiver<Command>,
+    rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), Ended> {
     let addr = format!("{}:{}", cfg.host.trim(), cfg.port);
@@ -226,8 +262,8 @@ async fn session(
         client: format!("Openslot {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
     };
     ws::write_message(&mut w, &Message::Text(serde_json::to_string(&auth).unwrap_or_default()), true).await?;
-    let audio = match text(tokio::time::timeout(Duration::from_secs(10), ws::read_message(&mut r)).await.map_err(timeout(10))?)? {
-        ServerMsg::Welcome { audio } => audio,
+    let (audio, screen) = match text(tokio::time::timeout(Duration::from_secs(10), ws::read_message(&mut r)).await.map_err(timeout(10))?)? {
+        ServerMsg::Welcome { audio, screen } => (audio, screen),
         ServerMsg::Denied { reason, retry } => return Err(refused(reason, retry)),
         _ => return Err(Ended::Lost(io::Error::new(io::ErrorKind::InvalidData, "unexpected answer to the password"))),
     };
@@ -243,8 +279,13 @@ async fn session(
         v.name = name;
         v.version = version;
         v.audio_offered = audio;
+        v.screen_offered = screen;
+        v.logins += 1;
         v.listening
     };
+    if let Ok(mut f) = frames.lock() {
+        f.clear();
+    }
     repaint();
     if listening {
         ws::write_message(&mut w, &Message::Text(serde_json::to_string(&ClientMsg::Cmd(Command::Audio { on: true })).unwrap_or_default()), true).await?;
@@ -253,7 +294,7 @@ async fn session(
     let (in_tx, mut incoming) = mpsc::channel::<io::Result<Message>>(64);
     let reader = tokio::spawn(async move {
         loop {
-            let m = ws::read_message(&mut r).await;
+            let m = ws::read_message_max(&mut r, ws::MAX_FROM_STATION).await;
             let end = m.is_err() || matches!(m, Ok(Message::Close));
             if in_tx.send(m).await.is_err() || end {
                 break;
@@ -297,6 +338,23 @@ async fn session(
                         }
                         repaint();
                     }
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&SCREEN) => {
+                        let full = frames.lock().is_ok_and(|mut f| {
+                            f.push_back(b);
+                            f.len() > MAX_FRAMES
+                        });
+                        if full {
+                            // (the GUI isn't drawing: start the screen afresh when it does)
+                            if let Ok(mut f) = frames.lock() {
+                                f.clear();
+                            }
+                            if let Ok(mut v) = view.lock() {
+                                v.logins += 1;
+                            }
+                            ws::write_message(&mut w, &Message::Text(serde_json::to_string(&ClientMsg::ScreenOff).unwrap_or_default()), true).await?;
+                        }
+                        repaint();
+                    }
                     Some(Ok(Message::Binary(b))) => {
                         if let Some((seq, samples)) = decode_frame(&b) {
                             if let Ok(mut p) = player.lock() {
@@ -314,7 +372,7 @@ async fn session(
             }
             c = rx.recv() => {
                 let Some(c) = c else { return Ok(()) };
-                ws::write_message(&mut w, &Message::Text(serde_json::to_string(&ClientMsg::Cmd(c)).unwrap_or_default()), true).await?;
+                ws::write_message(&mut w, &Message::Text(serde_json::to_string(&c).unwrap_or_default()), true).await?;
             }
             _ = ping.tick() => {
                 if last_heard.elapsed() > Duration::from_secs(20) {

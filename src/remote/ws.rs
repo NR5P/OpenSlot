@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 
 /// Largest message accepted (commands and state are a few kB; nothing legitimate is near).
 pub const MAX_MESSAGE: usize = 1 << 20;
+/// What a remote accepts from its station: frames of the station's screen, with its
+/// pictures, are bigger.
+pub const MAX_FROM_STATION: usize = 64 << 20;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +214,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message, mask
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(bool, Opcode, Vec<u8>)> {
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result<(bool, Opcode, Vec<u8>)> {
     let mut h = [0u8; 2];
     r.read_exact(&mut h).await?;
     let fin = h[0] & 0x80 != 0;
@@ -230,7 +233,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(bool, Opcode
         }
         n => n as usize,
     };
-    if len > MAX_MESSAGE {
+    if len > max {
         return Err(bad("WebSocket message too big"));
     }
     let mut key = [0u8; 4];
@@ -249,9 +252,14 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(bool, Opcode
 
 /// Reads the next whole message, joining fragments.
 pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message> {
+    read_message_max(r, MAX_MESSAGE).await
+}
+
+/// [`read_message`], up to `max` bytes.
+pub async fn read_message_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result<Message> {
     let mut data: Option<(Opcode, Vec<u8>)> = None;
     loop {
-        let (fin, op, payload) = read_frame(r).await?;
+        let (fin, op, payload) = read_frame(r, max).await?;
         match op {
             // (a ping or pong may come between a message's fragments, RFC 6455 5.4: ours are
             // JSON pings, so one there is just skipped and the message kept)
@@ -262,7 +270,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message
             Opcode::Continuation => {
                 let (_, buf) = data.as_mut().ok_or_else(|| bad("WebSocket continuation without a start"))?;
                 buf.extend_from_slice(&payload);
-                if buf.len() > MAX_MESSAGE {
+                if buf.len() > max {
                     return Err(bad("WebSocket message too big"));
                 }
             }

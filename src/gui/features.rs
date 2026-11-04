@@ -928,7 +928,7 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
                 if ui.button("Save compressed…").clicked() {
                     if let Some(Ok((jpg, _, _))) = &sh.result {
                         let stem = sh.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image".into());
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{stem}_resized.jpg")).save_file() {
+                        if let Some(p) = super::dialog::FileDialog::new().set_file_name(format!("{stem}_resized.jpg")).save_file() {
                             let _ = std::fs::write(p, jpg);
                         }
                     }
@@ -1070,7 +1070,7 @@ pub fn draw_qsl(ctx: &egui::Context, state: &mut GuiState) {
                     q.dirty = true;
                 }
                 if ui.small_button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Image file (JPG/PNG)", &["jpg", "jpeg", "png"]).pick_file() {
+                    if let Some(p) = super::dialog::FileDialog::new().add_filter("Image file (JPG/PNG)", &["jpg", "jpeg", "png"]).pick_file() {
                         q.background = p.display().to_string();
                         q.dirty = true;
                     }
@@ -1084,7 +1084,7 @@ pub fn draw_qsl(ctx: &egui::Context, state: &mut GuiState) {
                     let bg = (!q.background.trim().is_empty()).then(|| std::fs::read(q.background.trim()).ok()).flatten();
                     match crate::varac::images::render_qsl(&q.card, bg.as_deref(), q.fade).and_then(|i| crate::varac::images::to_jpeg(&i, 90)) {
                         Ok(jpg) => {
-                            if let Some(p) = rfd::FileDialog::new().set_file_name(crate::varac::images::qsl_file_name(&q.card)).save_file() {
+                            if let Some(p) = super::dialog::FileDialog::new().set_file_name(crate::varac::images::qsl_file_name(&q.card)).save_file() {
                                 match std::fs::write(&p, jpg) {
                                     Ok(()) => state.status_msg = format!("QSL card saved: {}", p.display()),
                                     Err(e) => q.error = Some(e.to_string()),

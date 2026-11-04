@@ -3,7 +3,7 @@
 //! remotes ask as its own buttons would), and the console a remote shows in place of the
 //! main window while it controls a station.
 
-use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, Frame, Layout, Margin, RichText, Vec2};
 
 use super::rig_panel::{draw_rig_controls, RigPanel};
 use super::state::GuiState;
@@ -391,16 +391,11 @@ fn phase_label(ui: &mut egui::Ui, phase: &Phase) {
 
 // ---------------------------------------------------------------- the remote console
 
-/// The main window while controlling a station: its essentials, driven over the network.
-pub fn draw_console(ctx: &egui::Context, state: &mut GuiState, client: &RemoteClient) {
-    let v = client.view();
-    let f = &mut state.remote;
-    let mut cmds: Vec<Command> = Vec::new();
+/// The strip over a station being controlled: who it is, the link, its audio, and the way
+/// back to this computer's own Openslot.
+pub fn draw_banner(ctx: &egui::Context, f: &mut RemoteForm, client: &RemoteClient, v: &crate::remote::client::View) {
     let connected = v.phase == Phase::Connected;
     let st = v.status.clone().unwrap_or_default();
-    let in_qso = matches!(st.link.as_str(), "connected" | "disconnecting");
-
-    // Who we're controlling, and the audio
     egui::TopBottomPanel::top("remote_banner")
         .frame(Frame::none().fill(theme::tint(theme::ACCENT, 28)).inner_margin(Margin::symmetric(12.0, 8.0)))
         .show(ctx, |ui| {
@@ -435,6 +430,55 @@ pub fn draw_console(ctx: &egui::Context, state: &mut GuiState, client: &RemoteCl
                 });
             });
         });
+
+}
+
+/// Controlling a station that sends its screen: its screen as it looks there, under the strip.
+pub fn draw_station_screen(ctx: &egui::Context, state: &mut GuiState, client: &RemoteClient, viewer: &mut crate::remote::screen::Viewer) {
+    let v = client.view();
+    draw_banner(ctx, &mut state.remote, client, &v);
+    egui::CentralPanel::default().frame(Frame::none().fill(ctx.style().visuals.panel_fill)).show(ctx, |ui| {
+        let area = ui.max_rect();
+        ui.allocate_rect(area, egui::Sense::hover());
+        if viewer.has_frame() {
+            viewer.paint(ui.painter(), area.min);
+            if ui.rect_contains_pointer(area) {
+                ctx.set_cursor_icon(viewer.cursor);
+            }
+        }
+        let waiting = match &v.phase {
+            Phase::Connected if !viewer.has_frame() => Some(format!("Waiting for {}'s screen…", if v.name.is_empty() { "the station" } else { &v.name })),
+            Phase::Connected => None,
+            Phase::Connecting => Some("Connecting…".into()),
+            Phase::Retrying(why) => Some(format!("Reconnecting ({why})")),
+            Phase::Denied(why) => Some(format!("Refused: {why}")),
+        };
+        // (connected: our size, which also asks for the first frame, and our input)
+        if v.phase == Phase::Connected {
+            if let Some(input) = viewer.input(ctx, area) {
+                client.send_screen(input);
+            }
+        }
+        if let Some(text) = waiting {
+            if viewer.has_frame() {
+                // (the last screen, dimmed, while the link is down)
+                ui.painter().rect_filled(area, 0.0, Color32::from_black_alpha(150));
+            }
+            ui.painter().text(area.center(), Align2::CENTER_CENTER, text, egui::FontId::proportional(18.0), theme::YELLOW);
+        }
+    });
+}
+
+/// The main window while controlling a station: its essentials, driven over the network.
+pub fn draw_console(ctx: &egui::Context, state: &mut GuiState, client: &RemoteClient) {
+    let v = client.view();
+    let f = &mut state.remote;
+    let mut cmds: Vec<Command> = Vec::new();
+    let connected = v.phase == Phase::Connected;
+    let st = v.status.clone().unwrap_or_default();
+    let in_qso = matches!(st.link.as_str(), "connected" | "disconnecting");
+
+    draw_banner(ctx, f, client, &v);
 
     // Status line: the station's own, or its last notice
     egui::TopBottomPanel::bottom("remote_status")

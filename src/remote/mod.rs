@@ -12,7 +12,7 @@
 //! ```text
 //! S: {"type":"hello","protocol":1,"name":"NR5P","nonce":"…16 hex…","version":"0.1.12"}
 //! C: {"type":"auth","proof":"…hex HMAC-SHA256(password, \"openslot:\" + nonce)…","client":"…"}
-//! S: {"type":"welcome","audio":true} | {"type":"denied","reason":"…","retry":false} (and close;
+//! S: {"type":"welcome","audio":true,"screen":true} | {"type":"denied","reason":"…","retry":false} (and close;
 //!    "retry":true when it is only for now)
 //! S: {"type":"status",…} {"type":"chat","lines":[…]} {"type":"stations",…} {"type":"rig",…}
 //!    whenever they change; {"type":"notice","text":…} for a refused command
@@ -28,10 +28,15 @@
 //! a minute. There is no encryption: it's for the home LAN (or a VPN into it), not the
 //! open internet.
 //!
+//! A desktop remote shows the station's own screen: it sends {"type":"screen",…} with its
+//! size and input, and the station answers with binary frames, byte 0 = 2 (see screen.rs).
+//! The phone page, and older remotes, use the messages above.
+//!
 //! Stations are found on the LAN by a UDP probe on [`DISCOVERY_PORT`] (see discovery()).
 
 pub mod audio;
 pub mod client;
+pub mod screen;
 pub mod server;
 pub mod ws;
 
@@ -154,6 +159,9 @@ pub enum ClientMsg {
     Auth { proof: String, #[serde(default)] client: String },
     Cmd(Command),
     Ping,
+    /// Show me the station's screen, at this size, with this input (see screen.rs)
+    Screen(screen::ScreenInput),
+    ScreenOff,
 }
 
 /// Station → client messages.
@@ -161,7 +169,8 @@ pub enum ClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
     Hello { protocol: u32, name: String, nonce: String, version: String },
-    Welcome { audio: bool },
+    /// `screen`: the station draws its screen for remotes (older stations don't)
+    Welcome { audio: bool, #[serde(default)] screen: bool },
     /// Refused (and closed). `retry`: only for now (too many remotes, a lockout, the station
     /// restarting remote control), so try again later; false: the password is wrong.
     Denied { reason: String, #[serde(default)] retry: bool },

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
 
 use super::audio::AudioHub;
+use super::screen::ScreenInput;
 use super::ws::{self, Message};
 use super::{ChatItem, ClientMsg, Command, RigView, ServerMsg, Stations, Status, PROTOCOL};
 
@@ -61,7 +62,21 @@ struct Shared {
     audio: AudioHub,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     stop: AtomicBool,
+    /// Remotes watching the station's screen: their input, and where their frames go
+    screens: Mutex<HashMap<u64, ScreenSlot>>,
+    next_session: AtomicU64,
 }
+
+struct ScreenSlot {
+    /// The session it's for (a remote that starts its screen again gets a new slot)
+    owner: u64,
+    input: Vec<ScreenInput>,
+    frames: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+/// Input a remote may queue between two of the station's passes (a stalled station
+/// can't be made to hold an endless backlog).
+const MAX_QUEUED_INPUT: usize = 64;
 
 /// A running station server; stops when dropped.
 pub struct RemoteServer {
@@ -98,6 +113,8 @@ impl RemoteServer {
             sessions: AtomicUsize::new(0),
             failures: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
+            screens: Mutex::new(HashMap::new()),
+            next_session: AtomicU64::new(1),
         });
         let listener = {
             let _guard = rt.enter();
@@ -171,6 +188,19 @@ impl RemoteServer {
 
     pub fn publish_rig(&self, r: &RigView) {
         publish(&self.shared.rig, &ServerMsg::Rig(r.clone()));
+    }
+
+    /// The remotes watching the station's screen, with the input each sent since the last call.
+    pub fn screens(&self) -> Vec<(u64, Vec<ScreenInput>)> {
+        let Ok(mut s) = self.shared.screens.lock() else { return Vec::new() };
+        s.iter_mut().map(|(id, slot)| (*id, std::mem::take(&mut slot.input))).collect()
+    }
+
+    /// A frame of the screen for one remote. False when it hasn't taken the last ones yet
+    /// (or is gone): the frame isn't sent.
+    pub fn send_screen(&self, id: u64, frame: Vec<u8>) -> bool {
+        let Ok(s) = self.shared.screens.lock() else { return false };
+        s.get(&id).is_some_and(|slot| slot.frames.try_send(frame).is_ok())
     }
 
     /// A message for every remote ("Modem not connected", a refused command…).
@@ -276,18 +306,25 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
         put(&mut w, &send(full())).await?;
         return Ok(());
     }
-    struct Leave<'a>(&'a Shared, bool);
+    let session = sh.next_session.fetch_add(1, Ordering::SeqCst);
+    struct Leave<'a>(&'a Shared, bool, u64);
     impl Drop for Leave<'_> {
         fn drop(&mut self) {
             self.0.sessions.fetch_sub(1, Ordering::SeqCst);
             if self.1 {
                 self.0.audio.unsubscribe();
             }
+            if let Ok(mut s) = self.0.screens.lock() {
+                s.retain(|_, slot| slot.owner != self.2);
+            }
         }
     }
-    let mut leave = Leave(&sh, false);
+    let mut leave = Leave(&sh, false, session);
+    // Frames of the screen, once this remote asks for it
+    let mut screen: Option<tokio::sync::mpsc::Receiver<Vec<u8>>> = None;
+    let mut screen_key: Option<u64> = None;
 
-    put(&mut w, &send(ServerMsg::Welcome { audio: sh.audio.available() })).await?;
+    put(&mut w, &send(ServerMsg::Welcome { audio: sh.audio.available(), screen: true })).await?;
     let mut topics = [sh.status.subscribe(), sh.chat.subscribe(), sh.stations.subscribe(), sh.rig.subscribe()];
     for t in topics.iter_mut() {
         let cur = t.borrow_and_update().clone();
@@ -348,6 +385,28 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
                             let _ = sh.commands.send((who.clone(), cmd));
                             None
                         }
+                        Ok(ClientMsg::Screen(input)) => {
+                            if let Ok(mut s) = sh.screens.lock() {
+                                match screen_key.and_then(|k| s.get_mut(&k)) {
+                                    Some(slot) if slot.input.len() < MAX_QUEUED_INPUT => slot.input.push(input),
+                                    Some(_) => {}
+                                    None => {
+                                        let (tx, rx) = tokio::sync::mpsc::channel(2);
+                                        let key = sh.next_session.fetch_add(1, Ordering::SeqCst);
+                                        s.insert(key, ScreenSlot { owner: session, input: vec![input], frames: tx });
+                                        (screen, screen_key) = (Some(rx), Some(key));
+                                    }
+                                }
+                            }
+                            None
+                        }
+                        Ok(ClientMsg::ScreenOff) => {
+                            if let (Ok(mut s), Some(k)) = (sh.screens.lock(), screen_key.take()) {
+                                s.remove(&k);
+                            }
+                            screen = None;
+                            None
+                        }
                         Ok(ClientMsg::Auth { .. }) => None,
                         Err(e) => Some(send(ServerMsg::Notice { text: format!("not understood: {e}") })),
                     },
@@ -364,6 +423,13 @@ async fn serve(stream: TcpStream, ip: IpAddr, sh: Arc<Shared>, mut stop: watch::
                 Ok(t) => Some(Message::Text(t.to_string())),
                 Err(broadcast::error::RecvError::Lagged(_)) => None,
                 Err(_) => break,
+            },
+            f = async { match screen.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => match f {
+                Some(frame) => Some(Message::Binary(frame)),
+                None => {
+                    screen = None;
+                    None
+                }
             },
             f = async { match audio.as_mut() { Some(a) => a.recv().await, None => std::future::pending().await } } => match f {
                 Ok(frame) => Some(Message::Binary(frame.to_vec())),
@@ -726,7 +792,7 @@ mod tests {
         assert!(srv.audio_available());
         rt.block_on(async {
             let (welcome, mut r, mut w) = raw_login(srv.port, "pw").await;
-            assert_eq!(welcome, ServerMsg::Welcome { audio: true });
+            assert_eq!(welcome, ServerMsg::Welcome { audio: true, screen: true });
             let on = ClientMsg::Cmd(Command::Audio { on: true });
             ws::write_message(&mut w, &Message::Text(serde_json::to_string(&on).unwrap()), true).await.unwrap();
             let mut frames = Vec::new();

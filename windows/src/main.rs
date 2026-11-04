@@ -164,14 +164,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // (shared: the station's screen for remotes has the modem's bar too)
+    let xara = std::sync::Arc::new(std::sync::Mutex::new(xara));
     let result = if use_tui {
         tui::run(session, station_config, db, callsign, modem_config).await
     } else {
         let rt = tokio::runtime::Handle::current();
-        run_gui(session, station_config, db, callsign, modem_config, rt, &mut xara)
+        run_gui(session, station_config, db, callsign, modem_config, rt, xara.clone())
     };
     // Releases PTT before the process exits.
-    xara.stop_blocking();
+    if let Ok(mut x) = xara.lock() {
+        x.stop_blocking();
+    }
     result
 }
 
@@ -195,7 +199,7 @@ fn run_gui(
     callsign: String,
     modem_config: tui::ModemConfig,
     rt: tokio::runtime::Handle,
-    xara: &mut modem::BuiltInModem,
+    xara: std::sync::Arc<std::sync::Mutex<modem::BuiltInModem>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (session_tx, session_rx) = mpsc::channel::<SessionMsg>();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<GuiCommand>();
@@ -245,26 +249,37 @@ fn run_gui(
             );
             // (keeps working while the window is hidden, as the root app does)
             let inner = gui::GuiShell::start(inner, &cc.egui_ctx);
+            // The modem's bar (and its tab) on remotes' screens too, as on this one
+            let (x, tx) = (xara.clone(), cmd_tx.clone());
+            inner.set_screen_extra(Box::new(move |ctx| x.lock().map(|mut x| x.ui(ctx, &tx)).unwrap_or(true)));
             Ok(Box::new(WinApp { inner, xara, cmd_tx }))
         }),
     )?;
     Ok(())
 }
 
-struct WinApp<'a> {
+struct WinApp {
     inner: gui::GuiShell,
-    xara: &'a mut modem::BuiltInModem,
+    xara: std::sync::Arc<std::sync::Mutex<modem::BuiltInModem>>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<GuiCommand>,
 }
 
-impl eframe::App for WinApp<'_> {
+impl eframe::App for WinApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // First, so the tab bar sits above the GUI's menu bar. On the Modem tab the GUI isn't
         // drawn; GuiShell's tick keeps the station working meanwhile.
-        if self.xara.ui(ctx, &self.cmd_tx) {
+        // (controlling another station: its screen, with its own modem bar, in place of ours)
+        let remote = self.inner.showing_remote_screen();
+        let show = remote || self.xara.lock().map(|mut x| x.ui(ctx, &self.cmd_tx)).unwrap_or(true);
+        if show {
             eframe::App::update(&mut self.inner, ctx, frame);
         }
-        self.xara.follow_drive_level(self.inner.drive_level());
+        // (the app's lock never taken while holding the modem's: the tick thread takes them
+        // the other way round)
+        let level = self.inner.drive_level();
+        if let Ok(mut x) = self.xara.lock() {
+            x.follow_drive_level(level);
+        }
     }
 }
 

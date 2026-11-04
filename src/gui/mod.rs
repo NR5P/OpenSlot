@@ -5,6 +5,7 @@ mod features;
 mod help;
 mod rig_panel;
 mod remote_ui;
+mod dialog;
 pub mod sound;
 
 use std::collections::VecDeque;
@@ -146,6 +147,13 @@ pub struct VaracApp {
     /// Remote mode: serving this station to remotes, or controlling another station
     remote_server: Option<crate::remote::server::RemoteServer>,
     remote_client: Option<crate::remote::client::RemoteClient>,
+    /// The station's screen for each remote watching it
+    remote_screens: std::collections::HashMap<u64, crate::remote::screen::Renderer>,
+    /// Controlling another station: its screen as shown here (and the login it's from)
+    remote_viewer: crate::remote::screen::Viewer,
+    remote_viewer_login: u64,
+    /// The platform app's part of the screen, for remotes' screens (GuiShell::set_screen_extra)
+    screen_extra: Option<ScreenExtra>,
     /// Other programs sharing the radio (Settings → RIG)
     rig_share: Option<crate::rig::share::ShareServer>,
     egui_ctx: egui::Context,
@@ -164,15 +172,7 @@ impl VaracApp {
         rt: tokio::runtime::Handle,
         ptt_router: crate::rig::PttRouter,
     ) -> Self {
-        // pictures in the gallery and the QSL card preview
-        egui_extras::install_image_loaders(&_cc.egui_ctx);
-        // The proportional font has no arrows, triangles or bar blocks (→ ▲ ▼ ▁…█): they
-        // showed as boxes. Hack, the monospace font egui ships, has them: fall back to it.
-        let mut fonts = egui::FontDefinitions::default();
-        if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            prop.push("Hack".to_owned());
-        }
-        _cc.egui_ctx.set_fonts(fonts);
+        setup_context(&_cc.egui_ctx);
         let mut state = GuiState::new(callsign, modem_connected, cmd_tx);
         // Our profile from the start (tags, the typed-CQ locator check, the status bar), not
         // only once Settings has been opened
@@ -472,6 +472,10 @@ impl VaracApp {
             psk_freq: 0,
             remote_server: None,
             remote_client: None,
+            remote_screens: Default::default(),
+            remote_viewer: Default::default(),
+            remote_viewer_login: 0,
+            screen_extra: None,
             rig_share: None,
             egui_ctx: _cc.egui_ctx.clone(),
         };
@@ -3260,6 +3264,7 @@ impl VaracApp {
         } else {
             self.state.remote.serving = None;
         }
+        self.serve_screens();
 
         if std::mem::take(&mut self.state.remote.disconnect_requested) {
             self.remote_client = None;
@@ -3293,6 +3298,23 @@ impl VaracApp {
     }
 }
 
+/// What every context the app draws in needs: the window's, and each remote's screen (a
+/// remote lays the station's text out again with these same fonts).
+pub fn setup_context(ctx: &egui::Context) {
+    // pictures in the gallery and the QSL card preview
+    egui_extras::install_image_loaders(ctx);
+    // The proportional font has no arrows, triangles or bar blocks (→ ▲ ▼ ▁…█): they
+    // showed as boxes. Hack, the monospace font egui ships, has them: fall back to it.
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        prop.push("Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// See [`GuiShell::set_screen_extra`].
+pub type ScreenExtra = Box<dyn FnMut(&egui::Context) -> bool + Send>;
+
 /// The app as eframe runs it, shared with the background tick thread.
 pub struct GuiShell(std::sync::Arc<std::sync::Mutex<VaracApp>>);
 
@@ -3321,6 +3343,21 @@ impl GuiShell {
     #[allow(dead_code)] // the Linux app's built-in modem keeps it in xara.toml
     pub fn drive_level(&self) -> Option<i32> {
         self.0.lock().ok().and_then(|app| app.state.drive_level)
+    }
+
+    /// Showing another station's screen (this one's own window isn't drawn meanwhile).
+    #[allow(dead_code)] // (the desktop apps' modem bar; the plain build has none)
+    pub fn showing_remote_screen(&self) -> bool {
+        self.0.lock().is_ok_and(|app| app.remote_client.as_ref().is_some_and(|c| c.screen_offered()))
+    }
+
+    /// What the platform app draws above the GUI (the built-in modem's bar), drawn on remotes'
+    /// screens too. It returns whether the GUI is to be drawn under it (not on the Modem tab).
+    #[allow(dead_code)] // (as showing_remote_screen)
+    pub fn set_screen_extra(&self, f: ScreenExtra) {
+        if let Ok(mut app) = self.0.lock() {
+            app.screen_extra = Some(f);
+        }
     }
 }
 
@@ -3428,6 +3465,20 @@ impl eframe::App for VaracApp {
             self.window_title = title;
         }
 
+        // The screen: this station's own, or the screen of the station this one controls
+        if self.remote_client.as_ref().is_some_and(|c| c.screen_offered()) {
+            self.draw_remote_screen(ctx);
+        } else {
+            let band_changed = self.draw_screen(ctx);
+            self.after_draw(band_changed);
+        }
+    }
+}
+
+impl VaracApp {
+    /// The station's screen: its window, and the same for each remote watching it (drawn
+    /// in that remote's own context). True when the band changed.
+    fn draw_screen(&mut self, ctx: &egui::Context) -> bool {
         // Keyboard shortcuts
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
@@ -3500,35 +3551,6 @@ impl eframe::App for VaracApp {
             }
             None => layout::draw_main_window(ctx, &mut self.state, &self.db, &self.current_qso_guid),
         };
-        let confirmed = std::mem::take(&mut self.state.confirm_qso_yes);
-        if std::mem::take(&mut self.state.log_qso_requested) || confirmed {
-            // VarAC's LOG: the ADIF log and loggers (and our QSO history)
-            if self.log_qso(true, confirmed) {
-                self.state.unlogged_qso = None;
-                // after the link: its row takes the edited fields (during it, the row is
-                // written from them at the end)
-                if let (None, Some(guid)) = (&self.state.connected_to, self.state.qso_row_written.clone()) {
-                    let f = &self.state.qso_log;
-                    let num = |v: &str| v.trim().trim_start_matches('+').parse::<i32>().ok();
-                    let end = chrono::NaiveDateTime::parse_from_str(f.end.trim(), "%Y-%m-%d %H:%M:%S").ok().map(|t| t.and_utc());
-                    let _ = self.db.update_qso_from_log(&guid, &f.call.trim().to_uppercase(), f.band.trim(), f.name.trim(), f.qth.trim(),
-                        &f.locator.trim().to_uppercase(), f.power.trim(), num(&f.snr_sent), num(&f.snr_rcvd), end.as_ref());
-                }
-                if self.state.connected_to.is_none() {
-                    self.state.qso_log = state::QsoLogFields::default();
-                }
-            }
-        }
-        self.apply_tune_to();
-        if band_changed {
-            if let Some(ref rig) = self.rig {
-                rig.set_mode(self.state.rig_usb_mode());
-                rig.set_freq(self.state.current_frequency);
-                self.rig_freq_set_at = Some(Utc::now());
-                self.freq_check = Some(((self.state.current_frequency) as u64, 0));
-                self.rig_poll_at = Some(Utc::now() + chrono::Duration::seconds(3));
-            }
-        }
 
         // Modal windows
         draw_settings_window(ctx, &mut self.state, &self.station_config, &self.modem_config);
@@ -3586,15 +3608,114 @@ impl eframe::App for VaracApp {
         features::draw_map(ctx, &mut self.state, &self.db);
         features::draw_profiles(ctx, &mut self.state);
         features::draw_snr_chart(ctx, &mut self.state, &self.db);
+        band_changed
+    }
+
+    /// Controlling a station that sends its screen: that screen, as it looks there.
+    fn draw_remote_screen(&mut self, ctx: &egui::Context) {
+        let Some(client) = self.remote_client.as_ref() else { return };
+        let login = client.logins();
+        if login != self.remote_viewer_login {
+            // (a fresh screen at the station: its pictures come again)
+            self.remote_viewer.reset();
+            self.remote_viewer_login = login;
+        }
+        for f in client.take_frames() {
+            match crate::remote::screen::decode(&f) {
+                Some(frame) => self.remote_viewer.apply(ctx, frame),
+                None => tracing::warn!(target: "gui", "a frame of the station's screen didn't decode ({} bytes)", f.len()),
+            }
+        }
+        remote_ui::draw_station_screen(ctx, &mut self.state, client, &mut self.remote_viewer);
+    }
+
+    /// Draws the station's screen for each remote watching it, as it is in this window but
+    /// at that remote's size, with its input; sends what changed.
+    fn serve_screens(&mut self) {
+        let viewers = match self.remote_server.as_ref() {
+            Some(srv) => srv.screens(),
+            None => {
+                self.remote_screens.clear();
+                return;
+            }
+        };
+        self.remote_screens.retain(|k, _| viewers.iter().any(|(v, _)| v == k));
+        let now = std::time::Instant::now();
+        for (key, input) in viewers {
+            let mut r = self.remote_screens.remove(&key).unwrap_or_else(|| crate::remote::screen::Renderer::new(setup_context));
+            if r.take_input(input, now) {
+                let theme_key = (self.state.dark_mode, self.state.font_size.clamp(10.0, 24.0), self.state.scifi_theme);
+                if r.theme != Some(theme_key) {
+                    theme::apply_with(&r.ctx, theme_key.0, theme_key.1, theme_key.2);
+                    r.theme = Some(theme_key);
+                }
+                let mut band_changed = false;
+                let mut extra = self.screen_extra.take();
+                let frame = dialog::for_remote(|| {
+                    r.pass(|ctx| {
+                        if extra.as_mut().is_none_or(|f| f(ctx)) {
+                            band_changed = self.draw_screen(ctx);
+                        }
+                    })
+                });
+                self.screen_extra = extra;
+                self.after_draw(band_changed);
+                if dialog::take_refused() {
+                    self.state.status_msg = "Files can only be chosen at the station".into();
+                }
+                if let Some(f) = frame {
+                    if self.remote_server.as_ref().is_some_and(|s| s.send_screen(key, f)) {
+                        r.sent();
+                    }
+                }
+            }
+            self.remote_screens.insert(key, r);
+        }
+    }
+
+    /// What the screen's buttons asked for that's done after drawing it.
+    fn after_draw(&mut self, band_changed: bool) {
+        let confirmed = std::mem::take(&mut self.state.confirm_qso_yes);
+        if std::mem::take(&mut self.state.log_qso_requested) || confirmed {
+            // VarAC's LOG: the ADIF log and loggers (and our QSO history)
+            if self.log_qso(true, confirmed) {
+                self.state.unlogged_qso = None;
+                // after the link: its row takes the edited fields (during it, the row is
+                // written from them at the end)
+                if let (None, Some(guid)) = (&self.state.connected_to, self.state.qso_row_written.clone()) {
+                    let f = &self.state.qso_log;
+                    let num = |v: &str| v.trim().trim_start_matches('+').parse::<i32>().ok();
+                    let end = chrono::NaiveDateTime::parse_from_str(f.end.trim(), "%Y-%m-%d %H:%M:%S").ok().map(|t| t.and_utc());
+                    let _ = self.db.update_qso_from_log(&guid, &f.call.trim().to_uppercase(), f.band.trim(), f.name.trim(), f.qth.trim(),
+                        &f.locator.trim().to_uppercase(), f.power.trim(), num(&f.snr_sent), num(&f.snr_rcvd), end.as_ref());
+                }
+                if self.state.connected_to.is_none() {
+                    self.state.qso_log = state::QsoLogFields::default();
+                }
+            }
+        }
+        self.apply_tune_to();
+        if band_changed {
+            if let Some(ref rig) = self.rig {
+                rig.set_mode(self.state.rig_usb_mode());
+                rig.set_freq(self.state.current_frequency);
+                self.rig_freq_set_at = Some(Utc::now());
+                self.freq_check = Some(((self.state.current_frequency) as u64, 0));
+                self.rig_poll_at = Some(Utc::now() + chrono::Duration::seconds(3));
+            }
+        }
+
     }
 }
 
 /// `OPENSLOT_SCREENSHOT=/path/out.ppm` saves one screenshot of the window ~3s after start
-/// (for checking UI changes without a desktop screenshot tool).
+/// (`OPENSLOT_SCREENSHOT_AFTER=10` for later; for checking UI changes without a desktop
+/// screenshot tool).
 fn debug_screenshot(ctx: &egui::Context) {
     let Ok(path) = std::env::var("OPENSLOT_SCREENSHOT").or_else(|_| std::env::var("VARAC_SCREENSHOT")) else { return };
+    let after = std::env::var("OPENSLOT_SCREENSHOT_AFTER").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(3.0);
     let requested = ctx.data_mut(|d| *d.get_temp_mut_or_default::<bool>(egui::Id::new("dbg_shot_req")));
-    if !requested && ctx.input(|i| i.time) > 3.0 {
+    if !requested && ctx.input(|i| i.time) > after {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("dbg_shot_req"), true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
     }
@@ -4798,7 +4919,7 @@ fn draw_compose_window(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) {
             // Attachments: VarAC zips them and sends them during a QSO with the addressee
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Attach file…").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    if let Some(paths) = dialog::FileDialog::new().pick_files() {
                         state.compose_attachments.extend(paths);
                     }
                 }
@@ -5670,7 +5791,7 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
                         .hint_text("Full path of the file, or Browse..."),
                 );
                 if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    if let Some(path) = dialog::FileDialog::new().pick_file() {
                         state.file_path_input = path.display().to_string();
                     }
                 }
@@ -6472,7 +6593,7 @@ fn draw_settings_window(
                                     .desired_width(200.0)
                                     .hint_text("/path/to/bbs/files"));
                                 if ui.button("Browse...").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    if let Some(path) = dialog::FileDialog::new().pick_folder() {
                                         state.settings_form.bbs_directory = path.display().to_string();
                                     }
                                 }
@@ -6522,7 +6643,7 @@ fn draw_settings_window(
                                 ui.horizontal(|ui| {
                                     ui.add(TextEdit::singleline(&mut state.settings_form.vara_path).desired_width(260.0).hint_text("C:\\VARA\\VARA.exe"));
                                     if ui.small_button("Browse…").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        if let Some(p) = dialog::FileDialog::new().pick_file() {
                                             state.settings_form.vara_path = p.display().to_string();
                                         }
                                     }
@@ -6663,7 +6784,7 @@ fn draw_settings_window(
                             ui.label("Incoming files folder:");
                             ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_dir).desired_width(260.0).hint_text("Downloads"));
                             if ui.small_button("Browse…").clicked() {
-                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                if let Some(d) = dialog::FileDialog::new().pick_folder() {
                                     state.settings_form.incoming_files_dir = d.display().to_string();
                                 }
                             }
@@ -7589,7 +7710,7 @@ fn export_chat_log(state: &mut GuiState) {
     }
 
     let filename = format!("varac-chat-{}.txt", Utc::now().format("%Y%m%d-%H%M%S"));
-    if let Some(path) = rfd::FileDialog::new()
+    if let Some(path) = dialog::FileDialog::new()
         .set_file_name(&filename)
         .add_filter("Text files", &["txt"])
         .save_file()
@@ -7624,7 +7745,7 @@ fn export_contacts_csv(state: &mut GuiState, db: &Storage) {
                 ));
             }
             let filename = format!("varac-contacts-{}.csv", Utc::now().format("%Y%m%d-%H%M%S"));
-            if let Some(path) = rfd::FileDialog::new()
+            if let Some(path) = dialog::FileDialog::new()
                 .set_file_name(&filename)
                 .add_filter("CSV files", &["csv"])
                 .save_file()
@@ -7646,7 +7767,7 @@ fn export_contacts_csv(state: &mut GuiState, db: &Storage) {
 }
 
 fn import_contacts_csv(state: &mut GuiState, db: &Storage) {
-    let path = match rfd::FileDialog::new()
+    let path = match dialog::FileDialog::new()
         .add_filter("CSV files", &["csv"])
         .add_filter("All files", &["*"])
         .pick_file()
@@ -7703,7 +7824,7 @@ fn parse_csv_line(line: &str) -> Vec<&str> {
 }
 
 fn import_contacts_from_adif(state: &mut GuiState, db: &Storage) {
-    let path = match rfd::FileDialog::new()
+    let path = match dialog::FileDialog::new()
         .add_filter("ADIF files", &["adi", "adif"])
         .add_filter("All files", &["*"])
         .pick_file()
@@ -7791,7 +7912,7 @@ fn draw_qso_log_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage) 
             ui.horizontal(|ui| {
                 if ui.add(theme::accent_button("Export ADIF", GREEN)).clicked() {
                     if let Ok(adif) = db.export_adif() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = dialog::FileDialog::new()
                             .set_file_name("openslot-qso.adi")
                             .add_filter("ADIF files", &["adi", "adif"])
                             .save_file()
@@ -7808,7 +7929,7 @@ fn draw_qso_log_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage) 
                     }
                 }
                 if ui.button("Import ADIF").on_hover_text("Import QSOs from an ADIF file").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                    if let Some(path) = dialog::FileDialog::new()
                         .add_filter("ADIF files", &["adi", "adif"])
                         .add_filter("All files", &["*"])
                         .pick_file()
@@ -8041,7 +8162,7 @@ fn draw_heard_stations_window(ctx: &egui::Context, state: &mut GuiState, db: &St
             ui.horizontal(|ui| {
                 if ui.button("Export CSV").clicked() {
                     if let Ok(stations) = db.heard_stations(10000) {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(path) = dialog::FileDialog::new()
                             .set_file_name("heard-stations.csv")
                             .add_filter("CSV files", &["csv"])
                             .save_file()
@@ -8425,7 +8546,7 @@ fn draw_bookmarks_window(ctx: &egui::Context, state: &mut GuiState) {
                             state.bookmarked_messages.clear();
                         }
                         if ui.small_button("Export").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                            if let Some(path) = dialog::FileDialog::new()
                                 .set_file_name("bookmarks.txt")
                                 .add_filter("Text", &["txt"])
                                 .save_file()
