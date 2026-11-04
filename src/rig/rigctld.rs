@@ -131,6 +131,15 @@ impl RigControl for RigctldClient {
         Self::check_rprt(&reply)
     }
 
+    /// Hamlib's ALC level (0…1)
+    fn get_alc(&mut self) -> RigResult<f32> {
+        let reply = self.send_cmd("l ALC")?;
+        if reply.starts_with("RPRT") {
+            return Err(RigError::Protocol(reply));
+        }
+        reply.trim().parse::<f32>().map_err(|e| RigError::Protocol(format!("bad ALC level {reply:?}: {e}")))
+    }
+
     fn name(&self) -> &str {
         "rigctld"
     }
@@ -204,6 +213,8 @@ mod tests {
                         if m.ends_with(" -1") { "RPRT 0\n".into() } else { "RPRT -1\n".into() }
                     } else if line.starts_with('T') {
                         "RPRT 0\n".into()
+                    } else if line == "l ALC" {
+                        "0.250000\n".into()
                     } else {
                         "RPRT -11\n".into()
                     };
@@ -225,6 +236,7 @@ mod tests {
         assert_eq!(c.get_mode().unwrap(), RadioMode::UsbData);
         assert_eq!(c.get_freq().unwrap(), 7_105_000);
         c.set_ptt(true).unwrap();
+        assert_eq!(c.get_alc().unwrap(), 0.25);
         c.set_ptt(false).unwrap();
     }
 

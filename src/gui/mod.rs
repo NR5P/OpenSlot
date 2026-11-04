@@ -1428,6 +1428,96 @@ impl VaracApp {
 
     /// VarAC's frequency scheduler (every 20 s, at a rule's exact minute) and scanner
     /// (every second, paused while anything else happens).
+    /// The Tune window's ALC: read live while the carrier is on, and AUTO's search for the
+    /// drive level that keeps it barely moving.
+    fn tune_meter_tick(&mut self) {
+        use state::{AutoTune, AutoTuneStep};
+        let now = std::time::Instant::now();
+        let usable = self.state.rig_alc && self.state.rig_connected;
+        let Some(rig) = self.rig.as_ref().filter(|_| usable) else {
+            if self.state.auto_tune.take().is_some() {
+                self.state.auto_tune_note = Some(("AUTO stopped: the radio's ALC meter can't be read".into(), false));
+                self.state.send_cmd(GuiCommand::TuneStop);
+            }
+            return;
+        };
+        let Some(a) = self.state.auto_tune.as_mut() else {
+            // Just the meter, while tuning by hand
+            let due = self.state.alc_polled.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(400));
+            if self.state.tune_window && self.state.ptt && due {
+                self.state.alc_polled = Some(now);
+                rig.send(crate::rig::RigCommand::ReadAlc);
+            }
+            return;
+        };
+        let fail = |state: &mut GuiState, why: String| {
+            state.auto_tune = None;
+            state.auto_tune_note = Some((why, false));
+            state.send_cmd(GuiCommand::TuneStop);
+        };
+        if a.started.elapsed() > std::time::Duration::from_secs(60) {
+            return fail(&mut self.state, "AUTO gave up after a minute: set the level by hand".into());
+        }
+        // The carrier: on before reading, and back on if the modem ends it early
+        if !a.keyed {
+            if self.state.ptt {
+                a.keyed = true;
+                a.settle_until = now + AutoTune::SETTLE;
+            } else if a.keyed_wait.elapsed() > std::time::Duration::from_secs(6) {
+                return fail(&mut self.state, "AUTO stopped: the tune carrier didn't start".into());
+            }
+            return;
+        }
+        if !self.state.ptt {
+            if a.rekeys >= 3 {
+                return fail(&mut self.state, "AUTO stopped: the tune carrier keeps ending".into());
+            }
+            a.rekeys += 1;
+            a.keyed = false;
+            a.keyed_wait = now;
+            a.readings.clear();
+            a.asked = None;
+            self.state.send_cmd(GuiCommand::Tune);
+            return;
+        }
+        if now < a.settle_until {
+            return;
+        }
+        if a.readings.len() < AutoTune::READS {
+            match a.asked {
+                Some(t) if t.elapsed() > std::time::Duration::from_secs(3) => {
+                    return fail(&mut self.state, "AUTO stopped: the radio didn't answer for its ALC meter".into());
+                }
+                Some(_) => {}
+                None => {
+                    a.asked = Some(now);
+                    rig.send(crate::rig::RigCommand::ReadAlc);
+                }
+            }
+            return;
+        }
+        let alc = a.readings.drain(..).fold(0.0_f32, f32::max);
+        match a.step(alc) {
+            AutoTuneStep::Level(db) => {
+                a.settle_until = now + AutoTune::SETTLE;
+                self.state.drive_level = Some(db);
+                self.state.send_cmd(GuiCommand::DriveLevel(db));
+            }
+            AutoTuneStep::Done(db) => {
+                self.state.auto_tune = None;
+                self.state.drive_level = Some(db);
+                self.state.send_cmd(GuiCommand::DriveLevel(db));
+                self.state.send_cmd(GuiCommand::TuneStop);
+                self.state.auto_tune_note = Some((format!("AUTO set the drive to {db} dB: the ALC barely moves there"), true));
+                self.state.add_log(format!("Tune AUTO: drive level {db} dB"));
+            }
+            AutoTuneStep::TooHot => fail(
+                &mut self.state,
+                format!("The ALC still reads {:.0} % at -30 dB: turn down the radio's USB/data input level, then try AUTO again", alc * 100.0),
+            ),
+        }
+    }
+
     fn freq_schedule_tick(&mut self) {
         use crate::varac::scheduler::{self as sch, Mode, ScanAction};
         if std::mem::take(&mut self.state.fsr_dirty) {
@@ -2610,6 +2700,7 @@ impl VaracApp {
                     }
                     crate::rig::RigEvent::Disconnected => {
                         self.state.rig_connected = false;
+                        self.state.rig_alc = false;
                         self.state.rig_freq = None;
                         self.state.rig_mode = None;
                         self.state.add_log("Rig disconnected".into());
@@ -2672,6 +2763,16 @@ impl VaracApp {
                     crate::rig::RigEvent::PttUpdate(on) => {
                         self.state.rig_ptt = on;
                     }
+                    crate::rig::RigEvent::AlcSupported(on) => {
+                        self.state.rig_alc = on;
+                    }
+                    crate::rig::RigEvent::Alc(v) => {
+                        self.state.alc_reading = Some((v, std::time::Instant::now()));
+                        if let Some(a) = self.state.auto_tune.as_mut().filter(|a| a.asked.is_some()) {
+                            a.asked = None;
+                            a.readings.push(v);
+                        }
+                    }
                     crate::rig::RigEvent::Error(e) => {
                         self.state.add_log(format!("Rig error: {e}"));
                         self.state.rig_error = Some(e);
@@ -2685,6 +2786,7 @@ impl VaracApp {
             }
 
         }
+        self.tune_meter_tick();
 
         // PTT test buttons in Settings → RIG
         if let Some(on) = self.state.rig_test_ptt.take() {
@@ -3441,7 +3543,7 @@ fn draw_menu_bar(ctx: &egui::Context, state: &mut GuiState) {
                     ui.close_menu();
                 }
                 if ui.button("STOP TUNE").clicked() {
-                    state.send_cmd(GuiCommand::TuneStop);
+                    state.stop_tune();
                     ui.close_menu();
                 }
             });

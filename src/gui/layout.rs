@@ -625,14 +625,20 @@ fn draw_control_column(ui: &mut egui::Ui, state: &mut GuiState, db: &Storage) ->
         }
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 6.0) / 2.0;
-            if ui.add_sized([w, 26.0], egui::Button::new("TUNE")).on_hover_text("Send a tuning carrier (opens the drive level control)").clicked()
+            // While the tune carrier is on TUNE is its STOP, right under the pointer
+            let tuning = state.tune_window && (state.ptt || state.auto_tune.is_some());
+            if tuning {
+                if ui.add_sized([w, 26.0], theme::accent_button("STOP", theme::RED)).on_hover_text("Stop the tuning carrier").clicked() {
+                    state.stop_tune();
+                }
+            } else if ui.add_sized([w, 26.0], egui::Button::new("TUNE")).on_hover_text("Send a tuning carrier (opens the drive level control)").clicked()
                 && state.modem_connected
             {
                 state.send_cmd(GuiCommand::Tune);
                 state.tune_window = true;
             }
             if ui.add_sized([w, 26.0], egui::Button::new("STOP")).clicked() {
-                state.send_cmd(GuiCommand::TuneStop);
+                state.stop_tune();
             }
         });
         let w = full_width(ui).x;
@@ -846,9 +852,13 @@ fn draw_slot_row(ui: &mut egui::Ui, state: &mut GuiState) {
 
 /// TUNE's window: the modem's TX drive level, changed live while the carrier is on (VarAC's
 /// tune slider: DRIVELEVEL -30…0 dB), so the radio's ALC can be set; STOP ends the carrier.
+/// With a radio whose ALC meter can be read, the meter shows here and AUTO sets the level.
 pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
     if !state.tune_window {
         return;
+    }
+    if state.ptt || state.auto_tune.is_some() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
     let mut open = true;
     egui::Window::new("Tune")
@@ -878,7 +888,8 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
             theme::caption(ui, "Modem drive level");
             let mut db = state.drive_level.unwrap_or(-5);
             let before = db;
-            ui.horizontal(|ui| {
+            let auto = state.auto_tune.is_some();
+            ui.add_enabled_ui(!auto, |ui| ui.horizontal(|ui| {
                 if ui.add_enabled(db > -30, egui::Button::new(RichText::new(" - ").strong())).on_hover_text("1 dB down").clicked() {
                     db -= 1;
                 }
@@ -886,21 +897,38 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
                 if ui.add_enabled(db < 0, egui::Button::new(RichText::new(" + ").strong())).on_hover_text("1 dB up").clicked() {
                     db += 1;
                 }
-            });
-            if db != before {
+            }));
+            if db != before && !auto {
                 state.drive_level = Some(db);
                 state.send_cmd(GuiCommand::DriveLevel(db));
             }
             if state.drive_level.is_none() {
                 ui.label(RichText::new("(the modem hasn't said its level yet: moving it sets it)").small().italics().color(theme::MUTED));
             }
+            if state.rig_alc && state.rig_connected {
+                ui.add_space(4.0);
+                let alc = state.alc_reading.filter(|(_, t)| on_air && t.elapsed().as_secs_f32() < 2.0).map(|(v, _)| v);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("ALC").small().strong());
+                    let v = alc.unwrap_or(0.0);
+                    let color = if v <= crate::gui::state::AUTO_TUNE_ALC { theme::GREEN } else if v <= 0.3 { theme::YELLOW } else { theme::RED };
+                    let text = alc.map_or_else(|| "—".to_string(), |v| format!("{:.0} %", v * 100.0));
+                    ui.add(egui::ProgressBar::new(v).fill(color).text(text).desired_height(14.0));
+                });
+            }
+            if let Some(a) = &state.auto_tune {
+                let what = if a.keyed { format!("AUTO: trying {} dB…", a.level) } else { "AUTO: starting the carrier…".to_string() };
+                ui.label(RichText::new(what).small().strong().color(theme::ACCENT));
+            } else if let Some((note, ok)) = &state.auto_tune_note {
+                ui.label(RichText::new(note).small().color(if *ok { theme::GREEN } else { theme::YELLOW }));
+            }
             ui.label(RichText::new("Watch the radio's ALC: lower the level until the ALC barely moves. \
                 Set the output power on the radio. Use a clear frequency or a dummy load.").small().color(theme::MUTED));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if on_air {
+                if on_air || auto {
                     if ui.add(theme::accent_button("STOP", theme::RED)).clicked() {
-                        state.send_cmd(GuiCommand::TuneStop);
+                        state.stop_tune();
                     }
                 } else if state.tune_busy {
                     if ui.add_enabled(state.modem_connected, theme::accent_button("TUNE ANYWAY", theme::RED)).clicked() {
@@ -910,15 +938,39 @@ pub fn draw_tune_window(ctx: &egui::Context, state: &mut GuiState) {
                 } else if ui.add_enabled(state.modem_connected, theme::accent_button("TUNE AGAIN", theme::PURPLE)).clicked() {
                     state.send_cmd(GuiCommand::Tune);
                 }
+                let alc = state.rig_alc && state.rig_connected;
+                let can_auto = alc && state.modem_connected && !state.tune_busy && !state.ptt_disabled;
+                if auto {
+                    if ui.add(theme::accent_button("STOP AUTO", theme::YELLOW)).on_hover_text("Stop AUTO and the carrier").clicked() {
+                        state.stop_tune();
+                    }
+                } else if ui.add_enabled(can_auto, theme::accent_button("AUTO", theme::ACCENT))
+                    .on_hover_text("Key the tune carrier and step the drive level until the radio's ALC barely moves")
+                    .on_disabled_hover_text(if alc {
+                        "AUTO needs the modem connected and a clear frequency"
+                    } else {
+                        "AUTO needs a radio whose ALC meter can be read over rig control (Yaesu, Icom or Kenwood CAT, or rigctld)"
+                    })
+                    .clicked()
+                {
+                    let a = crate::gui::state::AutoTune::new(state.drive_level.unwrap_or(-5));
+                    state.drive_level = Some(a.level);
+                    state.send_cmd(GuiCommand::DriveLevel(a.level));
+                    if !on_air {
+                        state.send_cmd(GuiCommand::Tune);
+                    }
+                    state.auto_tune = Some(a);
+                    state.auto_tune_note = None;
+                }
                 if ui.button("Close").clicked() {
-                    state.send_cmd(GuiCommand::TuneStop);
+                    state.stop_tune();
                     state.tune_window = false;
                     state.tune_busy = false;
                 }
             });
         });
     if !open {
-        state.send_cmd(GuiCommand::TuneStop);
+        state.stop_tune();
         state.tune_window = false;
         state.tune_busy = false;
     }
@@ -2178,7 +2230,7 @@ fn set_ptt_disabled(state: &mut GuiState, on: bool) {
     if on {
         state.cq_active = false;
         state.cq_seq = None;
-        state.send_cmd(GuiCommand::TuneStop);
+        state.stop_tune();
     }
     state.status_msg = if on { "PTT disabled: listening only".into() } else { "PTT enabled".into() };
 }

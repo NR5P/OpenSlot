@@ -715,6 +715,14 @@ pub struct GuiState {
     /// TUNE was held because the frequency is busy: the Tune window asks, no popup.
     pub tune_busy: bool,
     pub drive_level: Option<i32>,
+    /// The radio's ALC meter can be read (the Tune window's AUTO), and its last reading
+    pub rig_alc: bool,
+    pub alc_reading: Option<(f32, std::time::Instant)>,
+    pub alc_polled: Option<std::time::Instant>,
+    /// AUTO in the Tune window: setting the drive level from the ALC meter
+    pub auto_tune: Option<AutoTune>,
+    /// How the last AUTO ended (and whether it worked)
+    pub auto_tune_note: Option<(String, bool)>,
     /// VarAC's "Bandwidth not allowed!" box is open
     pub bw_refused: bool,
     /// LOG clicked: write the waiting QSO
@@ -1145,6 +1153,11 @@ impl GuiState {
             tune_window: false,
             tune_busy: false,
             drive_level: None,
+            rig_alc: false,
+            alc_reading: None,
+            alc_polled: None,
+            auto_tune: None,
+            auto_tune_note: None,
             bw_refused: false,
             help_open: false,
             help_section: 0,
@@ -1485,6 +1498,14 @@ impl GuiState {
             reply_to: None,
             ..Default::default()
         });
+    }
+
+    /// Stop the tune carrier (and an AUTO run with it).
+    pub fn stop_tune(&mut self) {
+        if self.auto_tune.take().is_some() {
+            self.auto_tune_note = Some(("AUTO stopped".into(), false));
+        }
+        self.send_cmd(GuiCommand::TuneStop);
     }
 
     pub fn send_cmd(&self, cmd: GuiCommand) {
@@ -2340,5 +2361,111 @@ impl GuiState {
                 self.cq_over();
             }
         }
+    }
+}
+
+/// ALC at or under this (of the meter's full scale) counts as "barely moving".
+pub const AUTO_TUNE_ALC: f32 = 0.10;
+
+/// AUTO's search for the highest drive level that keeps the ALC under [`AUTO_TUNE_ALC`]:
+/// down from the start while the ALC shows, then up 1 dB at a time until it would.
+pub struct AutoTune {
+    pub level: i32,
+    /// The highest level seen with the ALC clear, and the lowest seen over it
+    pub best: Option<i32>,
+    pub ceiling: Option<i32>,
+    pub started: std::time::Instant,
+    /// The carrier has been seen on air (since `keyed_wait` it's been asked for)
+    pub keyed: bool,
+    pub keyed_wait: std::time::Instant,
+    pub rekeys: u8,
+    /// No reading before this (the level just changed)
+    pub settle_until: std::time::Instant,
+    /// Readings for this level, and when the one being waited for was asked
+    pub readings: Vec<f32>,
+    pub asked: Option<std::time::Instant>,
+}
+
+/// What a step of AUTO decided.
+#[derive(Debug, PartialEq)]
+pub enum AutoTuneStep {
+    /// Try this level next
+    Level(i32),
+    /// Done: this level keeps the ALC clear
+    Done(i32),
+    /// Even the lowest drive shows ALC
+    TooHot,
+}
+
+impl AutoTune {
+    pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+    /// Readings per level (the worst of them counts)
+    pub const READS: usize = 2;
+
+    pub fn new(level: i32) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            level: level.clamp(-30, 0),
+            best: None,
+            ceiling: None,
+            started: now,
+            keyed: false,
+            keyed_wait: now,
+            rekeys: 0,
+            settle_until: now,
+            readings: Vec::new(),
+            asked: None,
+        }
+    }
+
+    /// The next move from the ALC at the current level.
+    pub fn step(&mut self, alc: f32) -> AutoTuneStep {
+        if alc <= AUTO_TUNE_ALC {
+            self.best = Some(self.level);
+            if self.level >= 0 || self.ceiling.is_some_and(|c| self.level + 1 >= c) {
+                return AutoTuneStep::Done(self.level);
+            }
+            self.level += 1;
+        } else {
+            self.ceiling = Some(self.level);
+            if let Some(b) = self.best.filter(|&b| b < self.level) {
+                return AutoTuneStep::Done(b);
+            }
+            if self.level <= -30 {
+                return AutoTuneStep::TooHot;
+            }
+            // Big steps while the ALC is well up, then 1 dB (and back up to the edge)
+            let down = if alc > 0.5 { 3 } else if alc > 0.25 { 2 } else { 1 };
+            self.level = (self.level - down).max(-30);
+        }
+        AutoTuneStep::Level(self.level)
+    }
+}
+
+#[cfg(test)]
+mod auto_tune_tests {
+    use super::*;
+
+    /// A radio whose ALC starts at `edge` dB and rises 10 % per dB above it.
+    fn run(start: i32, edge: i32) -> AutoTuneStep {
+        let mut a = AutoTune::new(start);
+        for _ in 0..64 {
+            let alc = ((a.level - edge) as f32 * 0.1).max(0.0);
+            match a.step(alc) {
+                AutoTuneStep::Level(_) => {}
+                done => return done,
+            }
+        }
+        panic!("AUTO didn't finish");
+    }
+
+    #[test]
+    fn finds_the_alc_edge() {
+        // (the ALC reads 10 % one dB over the edge: still "barely moving")
+        assert_eq!(run(-5, -12), AutoTuneStep::Done(-11));
+        assert_eq!(run(-20, -12), AutoTuneStep::Done(-11));
+        assert_eq!(run(0, -3), AutoTuneStep::Done(-2));
+        assert_eq!(run(-10, 5), AutoTuneStep::Done(0));
+        assert_eq!(run(-5, -40), AutoTuneStep::TooHot);
     }
 }

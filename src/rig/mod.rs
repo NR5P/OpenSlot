@@ -88,6 +88,10 @@ pub trait RigControl: Send {
     fn tune_atu(&mut self) -> RigResult<()> {
         Err(RigError::Protocol("this rig control can't start the tuner".into()))
     }
+    /// The radio's ALC meter, 0.0 (no ALC action) … 1.0 (full scale); not every rig can.
+    fn get_alc(&mut self) -> RigResult<f32> {
+        Err(RigError::Protocol("this rig control can't read the ALC meter".into()))
+    }
     fn name(&self) -> &str;
 }
 
@@ -538,6 +542,8 @@ pub enum RigCommand {
     PollFreq,
     /// Start the antenna tuner
     TuneAtu,
+    /// Read the ALC meter once (answered with [`RigEvent::Alc`]), also while transmitting
+    ReadAlc,
     /// Unkey and stop the worker thread.
     Shutdown,
 }
@@ -548,6 +554,10 @@ pub enum RigEvent {
     FreqUpdate(u64),
     ModeUpdate(RadioMode),
     PttUpdate(bool),
+    /// Whether this radio's ALC meter can be read (asked once per connect)
+    AlcSupported(bool),
+    /// An ALC reading, 0.0 … 1.0
+    Alc(f32),
     Error(String),
 }
 
@@ -716,7 +726,7 @@ impl RigManager {
                 RigEvent::Disconnected => self.connected = false,
                 RigEvent::FreqUpdate(f) => self.last_freq = Some(*f),
                 RigEvent::ModeUpdate(m) => self.last_mode = Some(*m),
-                RigEvent::PttUpdate(_) | RigEvent::Error(_) => {}
+                RigEvent::PttUpdate(_) | RigEvent::AlcSupported(_) | RigEvent::Alc(_) | RigEvent::Error(_) => {}
             }
             events.push(ev);
         }
@@ -763,6 +773,8 @@ struct Worker {
     ptt_since: Option<Instant>,
     /// Cleared if the radio/server rejects mode reads, so we stop asking.
     mode_readable: bool,
+    /// The ALC meter answered at connect
+    alc_readable: bool,
 }
 
 impl Worker {
@@ -779,6 +791,9 @@ impl Worker {
                 self.mode_readable = true;
                 self.emit(RigEvent::Connected(self.rig.name().to_string()));
                 self.poll(true);
+                // (a refusal or no answer here only means no ALC: it doesn't count against the link)
+                self.alc_readable = self.rig.is_connected() && self.rig.get_alc().is_ok();
+                self.emit(RigEvent::AlcSupported(self.alc_readable));
             }
             Err(e) => {
                 self.rig.disconnect();
@@ -904,6 +919,17 @@ impl Worker {
                     }
                 }
             }
+            RigCommand::ReadAlc if self.rig.is_connected() && self.alc_readable => match self.rig.get_alc() {
+                Ok(v) => self.emit(RigEvent::Alc(v.clamp(0.0, 1.0))),
+                Err(e) if !e.is_link_failure() => {
+                    self.alc_readable = false;
+                    self.emit(RigEvent::AlcSupported(false));
+                    self.emit(RigEvent::Error(format!("ALC meter: {e}")));
+                }
+                Err(e) => {
+                    self.check::<()>("ALC meter", Err(e));
+                }
+            },
             RigCommand::PollFreq if self.rig.is_connected() && self.ptt_since.is_none() => {
                 self.poll(false);
             }
@@ -964,6 +990,7 @@ fn rig_worker(
         poll_suppress_until: None,
         ptt_since: None,
         mode_readable: true,
+        alc_readable: false,
     };
 
     loop {
