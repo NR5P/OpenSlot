@@ -2503,4 +2503,54 @@ mod auto_tune_tests {
         assert_eq!(run(-10, 5), AutoTuneStep::Done(0));
         assert_eq!(run(-5, -40), AutoTuneStep::TooHot);
     }
+
+    /// Every start and edge across the slider: AUTO finishes within a few steps, on the
+    /// highest level whose ALC is clear (the edge itself, or one over it at exactly 10 %),
+    /// and never outside -30…0.
+    #[test]
+    fn auto_tune_always_lands_on_the_edge() {
+        for start in -35..=5 {
+            for edge in -40..=8 {
+                let mut a = AutoTune::new(start);
+                let mut steps = 0;
+                let alc_at = |l: i32| ((l - edge) as f32 * 0.1).max(0.0);
+                let end = loop {
+                    assert!((-30..=0).contains(&a.level), "start {start} edge {edge}: level {}", a.level);
+                    steps += 1;
+                    assert!(steps < 40, "start {start} edge {edge}: no end");
+                    match a.step(alc_at(a.level)) {
+                        AutoTuneStep::Level(_) => {}
+                        done => break done,
+                    }
+                };
+                match end {
+                    AutoTuneStep::Done(l) => {
+                        assert!(alc_at(l) <= AUTO_TUNE_ALC, "start {start} edge {edge}: {l} dB isn't clear");
+                        assert!(l == 0 || alc_at(l + 1) > AUTO_TUNE_ALC, "start {start} edge {edge}: {l} dB isn't the highest clear");
+                    }
+                    AutoTuneStep::TooHot => assert!(alc_at(-30) > AUTO_TUNE_ALC, "start {start} edge {edge}: TooHot with -30 clear"),
+                    AutoTuneStep::Level(_) => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// The download card's speed: over the last minute of deliveries, none before a second.
+    #[test]
+    fn rx_file_speed() {
+        let t0 = std::time::Instant::now();
+        let s = |secs: u64, n: usize| (t0 + std::time::Duration::from_secs(secs), n);
+        let mut f = RxFile {
+            name: "f".into(), from: None, file_bytes: 0, total: 10_000, received: 0,
+            started: t0, samples: vec![s(0, 0)], done: None,
+        };
+        assert_eq!(f.bps(), None, "one sample: no speed yet");
+        f.samples.push(s(10, 1000));
+        assert_eq!(f.bps(), Some(800.0));
+        // (an old slow start falls out of the minute)
+        f.samples = vec![s(0, 0), s(100, 100), s(110, 1100)];
+        assert_eq!(f.bps(), Some(800.0));
+        f.samples = vec![s(0, 500), s(5, 500)];
+        assert_eq!(f.bps(), None, "nothing new: no speed");
+    }
 }

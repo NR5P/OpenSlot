@@ -599,6 +599,18 @@ mod tests {
         assert_eq!(civ_alc(&[0x15, 0x13, 0x00, 0x60]).unwrap(), 0.5);
         assert_eq!(civ_alc(&[0x15, 0x13, 0x02, 0x55]).unwrap(), 1.0);
         assert!(civ_alc(&[0xFB]).is_err());
+        // (a reply with no digits, a short one, or over full scale)
+        assert!(parse_yaesu_alc("RM4;").is_err());
+        assert!(parse_yaesu_alc("RM40;").is_err());
+        assert!(parse_yaesu_alc("RM1100;").is_err());
+        assert_eq!(parse_yaesu_alc(" RM4128; ").unwrap(), 128.0 / 255.0);
+        assert!(parse_kenwood_alc("RM3;").is_err());
+        assert!(parse_kenwood_alc("RM30x15;").is_err());
+        assert_eq!(parse_kenwood_alc("RM30040;").unwrap(), 1.0, "capped at full scale");
+        assert_eq!(civ_alc(&[0x15, 0x13, 0x01, 0x20]).unwrap(), 1.0);
+        assert_eq!(civ_alc(&[0x15, 0x13, 0x00, 0x00]).unwrap(), 0.0);
+        assert!(civ_alc(&[0x15, 0x13, 0x00]).is_err());
+        assert!(civ_alc(&[0x15, 0x02, 0x00, 0x60]).is_err(), "another meter's reply");
     }
 
     #[test]

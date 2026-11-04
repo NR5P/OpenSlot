@@ -3887,6 +3887,54 @@ mod handshake_tests {
         assert_eq!(&buf[..n], b"6 second");
     }
 
+    /// A file coming in over the modem in pieces: each piece reports how much of the
+    /// `<SFB>` frame is here, the last one delivers the file, and nothing reports after it.
+    #[tokio::test]
+    async fn incoming_file_reports_progress_then_arrives() {
+        use tokio::io::AsyncWriteExt;
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap(), data.accept().await.unwrap()) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (_c, (mut modem_data, _)) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: "W5TST".into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(ServiceFlags::VMAIL), bbs_dir: None, email_gate: None, bbs_gate: None,
+            policy: Default::default(),
+        };
+        let mut s = VaracSession::new(vara, cfg);
+        s.state = SessionState::Connected;
+        s.send_file_ready().await.unwrap();
+        s.pending.clear();
+
+        let body = format!("<SFB>{}", "QUJD".repeat(25)); // 105 bytes
+        let frame = format!("{} {body}", body.len());
+        let (a, rest) = frame.split_at(30);
+        let (b, c) = rest.split_at(40);
+        let mut events = Vec::new();
+        for piece in [a, b, c] {
+            modem_data.write_all(piece.as_bytes()).await.unwrap();
+            let input = tokio::time::timeout(std::time::Duration::from_millis(500), s.next_input()).await.unwrap().unwrap();
+            if let Some(ev) = s.handle_input(input).await {
+                events.push(ev);
+            }
+            while let Some(ev) = s.pending.pop_front() {
+                events.push(ev);
+            }
+        }
+        let progress: Vec<_> = events.iter().filter_map(|e| match e {
+            SessionEvent::RxProgress { received, total } => Some((*received, *total)),
+            _ => None,
+        }).collect();
+        assert_eq!(progress, vec![(26, 105), (66, 105)], "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::BbsFilePayload(d)) if d.len() == 100)),
+            "the file arrived: {events:?}"
+        );
+        assert!(!s.file_incoming, "no more progress once the file is here");
+    }
+
     #[tokio::test]
     async fn email_vmail_is_not_parked() {
         let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();

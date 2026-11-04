@@ -850,6 +850,17 @@ mod callsign_tests {
         }
     }
 
+    /// The stored locator: trimmed, upper case, nothing else changed; empty is none.
+    #[test]
+    fn normalizes_our_locator() {
+        assert_eq!(normalize_locator(" em12kp\n").as_deref(), Some("EM12KP"));
+        assert_eq!(normalize_locator("Em12"), Some("EM12".into()), "4 characters are kept");
+        assert_eq!(normalize_locator("em12kp34"), Some("EM12KP34".into()), "not cut: Settings warns instead");
+        assert_eq!(normalize_locator("   "), None);
+        assert_eq!(normalize_locator(""), None);
+        assert!(is_grid_locator(&normalize_locator("fn42ab").unwrap()));
+    }
+
     #[test]
     fn locator_distance() {
         // FN42AA to FN42XX: corner to corner of one square (2° × 1° at 42°N), ~118 mi

@@ -548,6 +548,7 @@ pub enum RigCommand {
     Shutdown,
 }
 
+#[derive(Debug)]
 pub enum RigEvent {
     Connected(String),
     Disconnected,
@@ -1149,5 +1150,83 @@ mod tests {
         r.set_enabled(true);
         r.key(true);
         assert!(matches!(rx.try_recv(), Ok(RigCommand::SetPtt(true))));
+    }
+
+    /// A rigctld that answers the frequency and mode, and the ALC level only if `alc`.
+    fn fake_rigctld(alc: Option<&'static str>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let (mut buf, mut pending) = ([0u8; 256], String::new());
+            loop {
+                let n = match s.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(i) = pending.find('\n') {
+                    let line: String = pending.drain(..=i).collect();
+                    let reply = match line.trim() {
+                        "f" => "14105000\n".to_string(),
+                        "m" => "PKTUSB\n3000\n".to_string(),
+                        "l ALC" => alc.map_or("RPRT -11\n".to_string(), |v| format!("{v}\n")),
+                        _ => "RPRT 0\n".to_string(),
+                    };
+                    if s.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    /// Events from the worker until `until` matches one (or 3 s pass).
+    fn events_until(m: &mut RigManager, until: impl Fn(&RigEvent) -> bool) -> Vec<RigEvent> {
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut seen = Vec::new();
+        while Instant::now() < end {
+            for ev in m.poll_events() {
+                let hit = until(&ev);
+                seen.push(ev);
+                if hit {
+                    return seen;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no matching rig event in {seen:?}");
+    }
+
+    /// A radio whose ALC can be read says so at connect, and ReadAlc answers with it.
+    #[test]
+    fn worker_reads_the_alc_meter() {
+        let mut m = RigManager::new(RigBackend::Rigctld { host: "127.0.0.1".into(), port: fake_rigctld(Some("0.400000")) });
+        m.connect();
+        let ev = events_until(&mut m, |e| matches!(e, RigEvent::AlcSupported(_)));
+        assert!(ev.iter().any(|e| matches!(e, RigEvent::Connected(_))), "{ev:?}");
+        assert!(matches!(ev.last(), Some(RigEvent::AlcSupported(true))), "{ev:?}");
+        m.send(RigCommand::ReadAlc);
+        let ev = events_until(&mut m, |e| matches!(e, RigEvent::Alc(_)));
+        assert!(matches!(ev.last(), Some(RigEvent::Alc(v)) if (*v - 0.4).abs() < 1e-6), "{ev:?}");
+        m.send(RigCommand::Shutdown);
+    }
+
+    /// A radio without an ALC reading stays connected: no ALC, and ReadAlc asks nothing.
+    #[test]
+    fn worker_without_alc_stays_connected() {
+        let mut m = RigManager::new(RigBackend::Rigctld { host: "127.0.0.1".into(), port: fake_rigctld(None) });
+        m.connect();
+        let ev = events_until(&mut m, |e| matches!(e, RigEvent::AlcSupported(_)));
+        assert!(matches!(ev.last(), Some(RigEvent::AlcSupported(false))), "{ev:?}");
+        m.send(RigCommand::ReadAlc);
+        m.send(RigCommand::PollFreq);
+        std::thread::sleep(Duration::from_millis(300));
+        let ev = m.poll_events();
+        assert!(!ev.iter().any(|e| matches!(e, RigEvent::Alc(_) | RigEvent::Disconnected | RigEvent::Error(_))), "{ev:?}");
+        assert!(m.connected);
+        m.send(RigCommand::Shutdown);
     }
 }

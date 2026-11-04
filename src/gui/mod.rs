@@ -10926,7 +10926,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let ptt = crate::rig::PttRouter::default();
         let mut g = TxGuard { unattended: true, ..Default::default() };
-        let mut run = |cmd, g: &mut TxGuard, busy| guard_tx(cmd, g, busy, &ptt, &tx);
+        let run = |cmd, g: &mut TxGuard, busy| guard_tx(cmd, g, busy, &ptt, &tx);
         let last = || rx.try_iter().last();
 
         // Busy: connect waits (no question), ping is refused, tune asks, "yes" sends it
