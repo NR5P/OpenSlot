@@ -45,10 +45,11 @@ pub(super) fn draw_main_window(
     // them off), and, dragged or remembered taller, never more than leaves the right-hand
     // column below the room it needs in its compact form (both measured last frame).
     let data = |id: &str, or: f32| ctx.data(|d| d.get_temp::<f32>(egui::Id::new(id))).unwrap_or(or);
-    // (below it: the column, and beside it the message box with a chat no lower than its least)
+    // (below it: the column, and beside it the message box, the broadcasts' header and a chat
+    // no lower than its least)
     let top_min = data(TOP_NEED_H, 200.0).max(200.0);
     let composer_h = egui::containers::panel::PanelState::load(ctx, egui::Id::new("composer")).map_or(0.0, |p| p.rect.height());
-    let below = (data(SIDE_NEED_COMPACT, 0.0) + SIDE_PANEL_MARGIN_Y).max(composer_h + SPLIT_BAR_H + CHAT_MIN_H + 8.0);
+    let below = (data(SIDE_NEED_COMPACT, 0.0) + SIDE_PANEL_MARGIN_Y).max(composer_h + BC_MIN_H + SPLIT_BAR_H + CHAT_MIN_H + 8.0);
     let top_max = (ctx.available_rect().height() - below).max(top_min);
     egui::TopBottomPanel::top("top_section")
         .frame(Frame::none().fill(theme::BG).inner_margin(Margin { left: 10.0, right: 10.0, top: 8.0, bottom: 4.0 }))
@@ -141,51 +142,36 @@ pub(super) fn draw_main_window(
 // ---------------------------------------------------------------- broadcasts | chat split
 
 const SPLIT_BAR_H: f32 = 10.0;
-/// Below this the broadcasts are hidden and the chat has the whole space.
-const BC_HIDE_H: f32 = 40.0;
+/// The least the broadcasts get: their header row (count, Pop out). They never vanish: a
+/// share saved in a taller window would otherwise hide them in a shorter one.
+const BC_MIN_H: f32 = 30.0;
 const CHAT_MIN_H: f32 = 120.0;
 
 /// The broadcasts and the chat, one above the other, with a bar between them to drag
-/// (up: a bigger chat, to the top: no broadcasts) or double-click (big chat / back).
+/// (up: a bigger chat, to the top: just the broadcasts' header) or double-click (big chat / back).
 fn draw_chat_split(ui: &mut egui::Ui, state: &mut GuiState, default_bc: f32, expand_over: egui::Rect) {
     let total = ui.available_height();
     let w = ui.available_width();
-    let max_bc = (total - SPLIT_BAR_H - CHAT_MIN_H).max(0.0);
-    let mut bc_h = state.broadcasts_share.map_or(default_bc, |s| s * total).clamp(0.0, max_bc);
-    if bc_h < BC_HIDE_H {
-        bc_h = 0.0;
-    } else {
-        ui.allocate_ui(Vec2::new(w, bc_h), |ui| draw_broadcasts_card(ui, state));
-    }
+    let max_bc = (total - SPLIT_BAR_H - CHAT_MIN_H).max(BC_MIN_H);
+    let bc_h = state.broadcasts_share.map_or(default_bc, |s| s * total).clamp(BC_MIN_H, max_bc);
+    let at_min = bc_h <= BC_MIN_H + 1.0;
+    ui.allocate_ui(Vec2::new(w, bc_h), |ui| draw_broadcasts_card(ui, state));
 
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, SPLIT_BAR_H), egui::Sense::click_and_drag());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(
-        if bc_h == 0.0 {
-            format!("Drag down to show the broadcasts ({}) · double-click: normal size", state.broadcasts.len())
-        } else {
-            "Drag to resize the chat · double-click: big chat".to_string()
-        },
-    );
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(if at_min {
+        "Drag down to show more broadcasts · double-click: normal size"
+    } else {
+        "Drag to resize the chat · double-click: big chat"
+    });
     let active = resp.hovered() || resp.dragged();
     let grip = egui::Rect::from_center_size(rect.center(), Vec2::new(48.0, 4.0));
     ui.painter().rect_filled(grip, 2.0, if active { theme::ACCENT } else { theme::tint(theme::MUTED, 120) });
-    if bc_h == 0.0 && !state.broadcasts.is_empty() {
-        ui.painter().text(
-            rect.left_center() + Vec2::new(2.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            format!("BROADCASTS {}", state.broadcasts.len()),
-            egui::FontId::proportional(10.0),
-            theme::YELLOW,
-        );
-    }
     let mut changed = None;
     if resp.dragged() {
-        // (from the hidden end, the drag starts at the hiding height)
-        let from = if bc_h == 0.0 { BC_HIDE_H - 1.0 } else { bc_h };
-        changed = Some((from + resp.drag_delta().y).clamp(0.0, max_bc));
+        changed = Some((bc_h + resp.drag_delta().y).clamp(BC_MIN_H, max_bc));
     }
     if resp.double_clicked() {
-        changed = Some(if bc_h == 0.0 { default_bc } else { 0.0 });
+        changed = Some(if at_min { default_bc } else { BC_MIN_H });
     }
     if let Some(h) = changed {
         if total > 0.0 {
@@ -1466,6 +1452,10 @@ fn draw_broadcasts_card(ui: &mut egui::Ui, state: &mut GuiState) {
                 }
             });
         });
+        // (squeezed to its header by the split: no room for the list)
+        if ui.available_height() < 12.0 {
+            return;
+        }
         let filter = state.broadcast_search.trim().to_lowercase();
         let filter = (state.broadcast_search_active && !filter.is_empty()).then_some(filter);
         ScrollArea::vertical()
