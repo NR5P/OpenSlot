@@ -5856,8 +5856,37 @@ fn draw_settings_window(
                                 ui.end_row();
 
                                 ui.label("Locator:");
-                                ui.add(TextEdit::singleline(&mut state.settings_form.locator).desired_width(100.0).hint_text("e.g. FN42"));
+                                // (6 characters: distances and bearings need them; over 6 can't go in a beacon or CQ)
+                                if ui.add(TextEdit::singleline(&mut state.settings_form.locator).desired_width(100.0).hint_text("e.g. EM12KP"))
+                                    .on_hover_text("Your 6-character Maidenhead grid locator. Advanced beacons, typed CQs and your station info carry it; maps place you by it.")
+                                    .changed()
+                                {
+                                    // (distances and the map read upper case only)
+                                    state.settings_form.locator = state.settings_form.locator.to_uppercase();
+                                }
                                 ui.end_row();
+                                if let Some(advice) = crate::varac::messages::locator_advice(&state.settings_form.locator) {
+                                    use crate::varac::messages::LocatorAdvice;
+                                    ui.label("");
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.set_max_width(360.0);
+                                        match advice {
+                                            LocatorAdvice::Coarse => {
+                                                ui.colored_label(YELLOW, RichText::new("Use all 6 characters (e.g. EM12KP). With 4 there's no distance or bearing, and maps can only put you in the middle of a square about 110 × 185 km.").small());
+                                            }
+                                            LocatorAdvice::TooLong(six) => {
+                                                ui.colored_label(RED, RichText::new("Over 6 characters: advanced beacons and typed CQs can't carry it and are skipped.").small());
+                                                if ui.small_button(format!("Use {six}")).clicked() {
+                                                    state.settings_form.locator = six;
+                                                }
+                                            }
+                                            LocatorAdvice::Invalid => {
+                                                ui.colored_label(RED, RichText::new("Not a grid locator: 2 letters A–R, 2 digits, 2 letters A–X (e.g. EM12KP).").small());
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
 
                                 ui.label("Email:");
                                 ui.add(TextEdit::singleline(&mut state.settings_form.email).desired_width(200.0))
@@ -6755,7 +6784,7 @@ fn save_config_file(state: &GuiState) {
         callsign: if form.callsign.is_empty() { None } else { Some(form.callsign.clone()) },
         name: if form.name.is_empty() { None } else { Some(form.name.clone()) },
         qth: if form.qth.is_empty() { None } else { Some(form.qth.clone()) },
-        locator: if form.locator.is_empty() { None } else { Some(form.locator.clone()) },
+        locator: messages::normalize_locator(&form.locator),
         host: if form.modem_host.is_empty() { None } else { Some(form.modem_host.clone()) },
         cmd_port: form.cmd_port.parse().ok(),
         data_port: form.data_port.parse().ok(),
@@ -10684,6 +10713,27 @@ mod tests {
         let (lat, lon) = maidenhead_to_latlon("FN42").unwrap();
         assert!((lat - 42.5).abs() < 1.0);
         assert!((lon - (-71.0)).abs() < 1.0);
+    }
+
+    /// Storing our locator upper case and trimmed leaves every locator that already worked
+    /// on Openslot's map, in distances and bearings exactly where it was; lower case, which
+    /// Openslot placed nowhere, now lands in the same spot as upper case.
+    #[test]
+    fn normalizing_the_locator_keeps_grid_and_map_positions() {
+        let n = |l: &str| messages::normalize_locator(l).unwrap();
+        for loc in ["EM12KP", "FN42AA", "JO01MM", "EM12", "FN42", "AA00AA", "RR99XX"] {
+            assert_eq!(n(loc), loc, "an upper-case locator is unchanged");
+            assert_eq!(maidenhead_to_latlon(&n(loc)), maidenhead_to_latlon(loc), "{loc}");
+        }
+        for (lower, upper) in [("em12kp", "EM12KP"), (" fn42aa ", "FN42AA"), ("Em12Kp", "EM12KP"), ("fn42", "FN42")] {
+            assert_eq!(n(lower), upper);
+            assert_eq!(maidenhead_to_latlon(&n(lower)), maidenhead_to_latlon(upper));
+            assert!(maidenhead_to_latlon(&n(lower)).is_some(), "{lower} now has a map position");
+        }
+        assert!(maidenhead_to_latlon("em12kp").is_none(), "(lower case never placed anything)");
+        assert_eq!(messages::loc_distance(&n("em12kp"), "FN42AA"), messages::loc_distance("EM12KP", "FN42AA"));
+        assert_eq!(messages::loc_distance(&n("FN42AA"), "JO01MM"), messages::loc_distance("FN42AA", "JO01MM"));
+        assert_eq!(messages::normalize_locator("   "), None);
     }
 
     #[test]

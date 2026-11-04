@@ -53,7 +53,7 @@ Open **Settings** from the menu bar. The tabs are in the same order as in VarAC:
 
 - **Callsign** is your plain callsign (no prefix or suffix).
 - **Complex callsign** is for a prefix/suffix form such as `4X/W1ABC/P`. It is sent in your opening as `<FC:...>` and used in your log and PSKReporter spots. VARA itself links with the plain callsign.
-- **Name, QTH, Locator** are sent to the stations you work. Use a 6-character locator (for example `EM10ab`); distances and the map need it.
+- **Name, QTH, Locator** are sent to the stations you work. Use a 6-character locator (for example `EM10AB`); distances and the map need it.
 - **Email** is shared only when a station asks for your INFO. Leave it empty to keep it private.
 - **VMail** and **BBS File Transfer** turn those services on. For the BBS, pick the folder whose files you offer, and optionally limit it to some callsigns.
 

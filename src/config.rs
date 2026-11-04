@@ -454,7 +454,9 @@ impl AppConfig {
             callsign,
             name: cli.name.or(file_cfg.name),
             qth: cli.qth.or(file_cfg.qth),
-            locator: cli.locator.or(file_cfg.locator),
+            // (trimmed, upper case: distances and the map read upper case only; a stray space made
+            // it too long for beacons and typed CQs)
+            locator: cli.locator.or(file_cfg.locator).and_then(|l| crate::varac::messages::normalize_locator(&l)),
             host,
             cmd_port,
             data_port,

@@ -742,6 +742,41 @@ pub fn parse_frequency_input(text: &str) -> Option<u64> {
     (100_000..=1_300_000_000).contains(&hz).then_some(hz)
 }
 
+/// Our locator as stored and sent: trimmed and upper case (Openslot's distances and map
+/// read upper case only; upper case is the form every receiver accepts), None when empty.
+/// Nothing else changes.
+pub fn normalize_locator(l: &str) -> Option<String> {
+    Some(l.trim().to_uppercase()).filter(|l| !l.is_empty())
+}
+
+/// What's wrong with our own locator as Settings has it, for a hint under the field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocatorAdvice {
+    /// 4 characters (EM12): no distance or bearing (they need 6), and a square is ~110 × 185 km
+    Coarse,
+    /// Longer than 6 (EM12KP34): advanced beacons and typed CQs are skipped; the first 6
+    TooLong(String),
+    /// Not a Maidenhead locator at all
+    Invalid,
+}
+
+/// Our locator as it works best: 6 characters (`EM12KP`), checked without regard to case
+/// (Settings stores it upper case). None when it's fine, or empty (leaving it out is allowed:
+/// VarAC answers "NO LOCATOR").
+pub fn locator_advice(l: &str) -> Option<LocatorAdvice> {
+    let u = l.trim().to_uppercase();
+    let b = u.as_bytes();
+    let field = |i: usize| b.len() > i + 1 && b[i..i + 2].iter().all(|c| (b'A'..=b'R').contains(c));
+    let square = |i: usize| b.len() > i + 1 && b[i..i + 2].iter().all(u8::is_ascii_digit);
+    match b.len() {
+        0 => None,
+        6 if is_grid_locator(&u) => None,
+        4 if field(0) && square(2) => Some(LocatorAdvice::Coarse),
+        n if n > 6 && u.get(..6).is_some_and(is_grid_locator) => Some(LocatorAdvice::TooLong(u[..6].to_string())),
+        _ => Some(LocatorAdvice::Invalid),
+    }
+}
+
 /// Grid locator check as in VarAC: `^[A-R][A-R][0-9][0-9][A-X][A-X]$` (6 characters only).
 pub fn is_grid_locator(l: &str) -> bool {
     let b = l.as_bytes();
@@ -797,6 +832,22 @@ mod callsign_tests {
         assert!(is_valid_callsign("NR5P-1"));
         assert!(is_valid_callsign("W1ABC-9"));
         assert!(is_valid_callsign("JA1XYZ"));
+    }
+
+    /// Settings warns about a locator that can't be used fully: 4 characters, over 6
+    /// (beacons and typed CQs skipped), not a locator. Case doesn't matter.
+    #[test]
+    fn locator_advice_for_our_own() {
+        use LocatorAdvice::*;
+        assert_eq!(locator_advice("EM12KP"), None);
+        assert_eq!(locator_advice(" em12kp "), None, "lower case is stored upper case");
+        assert_eq!(locator_advice(""), None, "no locator is allowed: no warning");
+        assert_eq!(locator_advice("EM12"), Some(Coarse));
+        assert_eq!(locator_advice("em12kp34"), Some(TooLong("EM12KP".into())));
+        assert_eq!(locator_advice("EM12KP3"), Some(TooLong("EM12KP".into())));
+        for bad in ["EM1", "EM12K", "ZZ12KP", "EM12ZZ", "12EMKP", "30.26,-97.74", "EMÉ2KP34"] {
+            assert_eq!(locator_advice(bad), Some(Invalid), "{bad}");
+        }
     }
 
     #[test]
