@@ -970,7 +970,17 @@ impl Worker {
 
     fn set_ptt(&mut self, on: bool) {
         if !self.rig.is_connected() {
-            return;
+            // Never key a link that's gone. But an unkey must get through: the link can go
+            // between keying and unkeying (rigctld drops it when a reply comes too late), and
+            // the radio may still be keyed. Reconnect at once and unkey, rather than leave it
+            // to the watchdog minutes later.
+            if on || !self.want_connected {
+                return;
+            }
+            self.try_connect();
+            if !self.rig.is_connected() {
+                return;
+            }
         }
         let r = self.rig.set_ptt(on);
         if self.check("PTT", r).is_some() {
@@ -1401,6 +1411,66 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(got, Some(14_103_500));
+    }
+
+    /// rigctld answering "T 1" too late drops the link (so the late reply can't be read as
+    /// the next command's): the unkey after it still reaches the radio, on a new link, at once.
+    #[test]
+    fn an_unkey_gets_through_after_a_late_reply_dropped_the_link() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, heard) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let Ok(s) = s else { return };
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut w = s.try_clone().unwrap();
+                    for line in BufReader::new(s).lines() {
+                        let Ok(line) = line else { return };
+                        let _ = tx.send(line.trim().to_string());
+                        let reply = match line.trim() {
+                            "f" => "14105000\n".to_string(),
+                            "m" => "PKTUSB\n500\n".to_string(),
+                            "T 1" => {
+                                // (keys the radio, but answers after the client stopped waiting)
+                                std::thread::sleep(Duration::from_secs(4));
+                                "RPRT 0\n".to_string()
+                            }
+                            _ => "RPRT 0\n".to_string(),
+                        };
+                        if w.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut mgr = RigBackend::Rigctld { host: "127.0.0.1".into(), port }.into_manager().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.is_connected() && Instant::now() < deadline {
+            mgr.poll_events();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(mgr.is_connected());
+        mgr.set_ptt(true);
+        // (the worker gives up on the reply after 3 s)
+        let wait = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < wait && heard.try_recv().ok().as_deref() != Some("T 1") {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(3500));
+        mgr.set_ptt(false);
+        let unkey_by = Instant::now() + Duration::from_secs(5);
+        let mut unkeyed = false;
+        while Instant::now() < unkey_by && !unkeyed {
+            match heard.recv_timeout(Duration::from_millis(100)) {
+                Ok(l) => unkeyed = l == "T 0",
+                Err(_) => mgr.poll_events().clear(),
+            }
+        }
+        assert!(unkeyed, "the unkey never reached the radio");
     }
 
     /// A radio busy for a moment (Hamlib's RPRT -5 for a couple of reads) keeps the control:

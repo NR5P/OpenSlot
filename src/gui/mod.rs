@@ -199,7 +199,8 @@ impl VaracApp {
             state.scifi_theme = cfg.ui_theme.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("SCIFI"));
             if let Some(v) = cfg.qso_alert_minutes { state.qso_alert_minutes = v; }
             if let Some(v) = cfg.dx_alert_enabled { state.dx_alert_enabled = v; }
-            if let Some(v) = cfg.connect_timeout_secs { state.connect_timeout_secs = v; }
+            // (as the Settings field takes it: a hand-edited 0 would end every call at once)
+            if let Some(v) = cfg.connect_timeout_secs { state.connect_timeout_secs = v.clamp(10, 120); }
             if let Some(v) = cfg.auto_cq_interval_secs { state.auto_cq_interval_secs = v; }
             // (VarAC: AllowAutoQSY defaults to on; the <Q> offer itself needs rig control)
             state.auto_qsy_enabled = cfg.auto_qsy_enabled.unwrap_or(true);
@@ -778,6 +779,11 @@ impl VaracApp {
                         }
                     }
                     self.state.ptt = on;
+                    // (the modem keying up while calling: the call is alive, the connect
+                    // timeout counts from here)
+                    if on && self.state.session_state == SessionState::Connecting {
+                        self.state.connect_last_try = Some(Utc::now());
+                    }
                     // A CQ transmission ended: VarAC's wait, then its second CQ / the slot
                     if !on {
                         self.state.cq_tx_done();
@@ -3173,7 +3179,11 @@ impl VaracApp {
     fn rig_share_tick(&mut self) {
         if std::mem::take(&mut self.state.rig_share_apply) {
             let set = self.state.rig_share.clone();
-            crate::config::save_rig_share_settings(&set);
+            // (only a change is saved: this also runs at every start, and rewriting the config
+            // file then could lose it to a read that failed for a moment, e.g. OneDrive)
+            if crate::config::rig_share_settings() != set {
+                crate::config::save_rig_share_settings(&set);
+            }
             // (the old one first: it holds the port)
             self.rig_share = None;
             self.state.rig_share_status = None;
@@ -3224,7 +3234,10 @@ impl VaracApp {
         use crate::remote::{client, server};
         if std::mem::take(&mut self.state.remote.apply_server) {
             let f = &mut self.state.remote;
-            crate::config::save_remote_settings(&f.settings);
+            // (only a change is saved: this runs at start too, see rig_share_tick)
+            if crate::config::remote_settings() != f.settings {
+                crate::config::save_remote_settings(&f.settings);
+            }
             // (the old one first: it holds the port)
             self.remote_server = None;
             f.serve_error = None;
@@ -3272,7 +3285,10 @@ impl VaracApp {
         }
         if std::mem::take(&mut self.state.remote.connect_requested) {
             let f = &mut self.state.remote;
-            crate::config::save_remote_settings(&f.settings);
+            // (only a change is saved: this runs at start too, see rig_share_tick)
+            if crate::config::remote_settings() != f.settings {
+                crate::config::save_remote_settings(&f.settings);
+            }
             let cfg = client::ClientConfig {
                 host: f.settings.connect_host.trim().to_string(),
                 port: f.settings.connect_port.unwrap_or(crate::remote::DEFAULT_PORT),

@@ -891,6 +891,8 @@ pub struct GuiState {
 
     // Connection timeout tracking
     pub connect_started: Option<chrono::DateTime<Utc>>,
+    /// The modem last keyed up to call (the connect timeout counts from it)
+    pub connect_last_try: Option<chrono::DateTime<Utc>>,
     pub connect_timeout_secs: u32,
 
     // Font size
@@ -1429,6 +1431,7 @@ impl GuiState {
             chat_grow_on_hover: true,
             cq_filter: String::new(),
             connect_started: None,
+            connect_last_try: None,
             connect_timeout_secs: 30,
             font_size: 14.0,
             freq_ref_open: false,
@@ -2250,21 +2253,32 @@ impl GuiState {
         if self.session_state == SessionState::Idle {
             self.session_state = SessionState::Connecting;
             self.connect_started = Some(Utc::now());
+            self.connect_last_try = self.connect_started;
         }
     }
 
-    /// The connect timeout: a call still unanswered after connect_timeout_secs is aborted
-    /// and the station is idle again (the modem's DISCONNECTED, if it comes, changes nothing).
+    /// The connect timeout: a call the modem has stopped trying, still unanswered and not
+    /// ended by the modem after connect_timeout_secs, is aborted and the station is idle
+    /// again (the modem's DISCONNECTED, if it comes, changes nothing). The clock runs from
+    /// the modem's last attempt, not from the dialing: while it keys up to call, the call is
+    /// alive and the modem's own retries decide how long it lasts, as in VarAC (VARA HF's
+    /// 15 retries run well past the 30 s default, and cutting them lost weak-signal calls).
     pub fn check_connect_timeout(&mut self, now: chrono::DateTime<Utc>) {
-        let Some(start) = self.connect_started else { return };
+        let Some(_) = self.connect_started else { return };
         if self.session_state != SessionState::Connecting {
             // (answered, or not dialing yet: SessionMsg::Dialing starts the clock again)
             self.connect_started = None;
+            self.connect_last_try = None;
             return;
         }
-        let timeout = self.connect_timeout_secs as i64;
-        if (now - start).num_seconds() >= timeout {
+        if self.ptt {
+            self.connect_last_try = Some(now);
+        }
+        let last = self.connect_last_try.unwrap_or(now);
+        let timeout = self.connect_timeout_secs.clamp(10, 120) as i64;
+        if (now - last).num_seconds() >= timeout {
             self.connect_started = None;
+            self.connect_last_try = None;
             self.session_state = SessionState::Idle;
             self.status_msg = "Connection timed out — aborting".into();
             self.add_log(format!("Connection timeout after {timeout}s — sending abort"));
@@ -2653,6 +2667,32 @@ mod connect_state_tests {
         assert_eq!((st.session_state, st.connect_started), (SessionState::Idle, None));
         assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
         assert!(st.status_msg.contains("timed out"));
+    }
+
+    /// While the modem keeps keying up to call (VARA HF's retries run past a minute), the
+    /// call is left to it; the timeout only ends a call it has stopped trying.
+    #[test]
+    fn the_modem_retrying_keeps_the_call() {
+        let (mut st, mut rx) = station();
+        st.connect_timeout_secs = 30;
+        st.dialing();
+        let start = st.connect_started.unwrap();
+        // a connect request every 5 s for 70 s
+        for s in (0..=70).step_by(5) {
+            st.ptt = true;
+            st.check_connect_timeout(start + chrono::Duration::seconds(s));
+            st.ptt = false;
+            st.check_connect_timeout(start + chrono::Duration::seconds(s + 2));
+        }
+        assert_eq!(st.session_state, SessionState::Connecting, "still the modem's call");
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(st.connect_started, Some(start), "the CONNECTING counter runs on");
+        // then silence: 30 s after its last try, it's aborted
+        st.check_connect_timeout(start + chrono::Duration::seconds(99));
+        assert_eq!(st.session_state, SessionState::Connecting);
+        st.check_connect_timeout(start + chrono::Duration::seconds(100));
+        assert_eq!(st.session_state, SessionState::Idle);
+        assert!(matches!(sent(&mut rx).as_slice(), [GuiCommand::Abort]));
     }
 
     /// The queued-broadcast status line gives way once it's sent, and only that line.
