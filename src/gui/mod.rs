@@ -730,6 +730,9 @@ impl VaracApp {
                         }
                     }
                     self.state.tx_speed = None;
+                    if let Some(f) = self.state.rx_file.as_mut().filter(|f| f.done.is_none()) {
+                        f.done = Some((std::time::Instant::now(), false));
+                    }
                     self.state.reset_snr_tracking();
                     self.state.connection_start = None;
                     self.state.partner_name = None;
@@ -777,6 +780,32 @@ impl VaracApp {
                             tx: Some(state::TxStage::OnAir { total: bytes as u32, since: now }),
                             ..Default::default()
                         });
+                    }
+                }
+                SessionMsg::RxProgress { received, total } => {
+                    let now = std::time::Instant::now();
+                    let fresh = !matches!(&self.state.rx_file, Some(f) if f.done.is_none() && f.total == total);
+                    if fresh {
+                        let offer = self.state.pending_file_offer.as_ref();
+                        let name = match offer {
+                            _ if self.state.pending_vmail_attachment => "VMail attachment".to_string(),
+                            Some(o) => bbs::strip_gzip_suffix(&o.name).to_string(),
+                            None => "File".to_string(),
+                        };
+                        self.state.rx_file = Some(state::RxFile {
+                            name,
+                            from: self.state.connected_to.clone(),
+                            file_bytes: offer.map_or(total * 3 / 4, |o| o.compressed_size),
+                            total,
+                            received: 0,
+                            started: now,
+                            samples: vec![(now, 0)],
+                            done: None,
+                        });
+                    }
+                    if let Some(f) = self.state.rx_file.as_mut() {
+                        f.received = received;
+                        f.samples.push((now, received));
                     }
                 }
                 SessionMsg::Busy(on) => {
@@ -1840,6 +1869,20 @@ impl VaracApp {
     }
 
     fn handle_incoming_message(&mut self, msg: &IncomingMessage) {
+        // The download card: the file is all here, or it stopped
+        let ended = match msg {
+            IncomingMessage::BbsFilePayload(_) => Some(true),
+            IncomingMessage::BbsFileAborted | IncomingMessage::BbsFileFailed => Some(false),
+            _ => None,
+        };
+        if let (Some(ok), Some(f)) = (ended, self.state.rx_file.as_mut()) {
+            if f.done.is_none() {
+                if ok {
+                    f.received = f.total;
+                }
+                f.done = Some((std::time::Instant::now(), ok));
+            }
+        }
         let ts = self.state.format_time();
         let partner = self.state.connected_to.clone().unwrap_or_else(|| "?".into());
 
@@ -3886,6 +3929,212 @@ fn draw_tx_progress(ui: &mut egui::Ui, stage: state::TxStage, state: &GuiState) 
     }
 }
 
+/// Bytes as people read them: 812 B, 34.2 kB, 1.25 MB.
+fn fmt_size(n: f32) -> String {
+    match n {
+        n if n < 1000.0 => format!("{n:.0} B"),
+        n if n < 1_000_000.0 => format!("{:.1} kB", n / 1000.0),
+        n => format!("{:.2} MB", n / 1_000_000.0),
+    }
+}
+
+/// A time span: 42 s, 1m 12s, 1h 03m.
+fn fmt_span(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    match s {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// The download card above the chat while a file comes in: a ring filling around a bobbing
+/// arrow, and a glowing bar with packets streaming into its head, which flashes as each lot
+/// lands from the modem and runs on at the measured speed between them (never past the next
+/// lot); then size, speed and time left. When it ends it turns green with a check (red with
+/// a cross if it stopped) and fades away. Returns false once it is gone or dismissed.
+fn draw_rx_file_card(ui: &mut egui::Ui, state: &GuiState) -> bool {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let Some(f) = state.rx_file.as_ref() else { return false };
+    let now = std::time::Instant::now();
+    let t = ui.input(|i| i.time) as f32;
+    let total = f.total.max(1) as f32;
+    let bps = f.bps();
+    let last_at = f.samples.last().map_or(f.started, |s| s.0);
+    let since_last = (now - last_at).as_secs_f32();
+    let step = f.samples.windows(2).last().map_or(0, |w| w[1].1.saturating_sub(w[0].1)) as f32;
+    let shown = match (f.done, bps) {
+        (None, Some(b)) => (f.received as f32 + since_last * b / 8.0)
+            .min(f.received as f32 + step)
+            .min(total * 0.995),
+        _ => f.received as f32,
+    };
+    let frac = (shown / total).clamp(0.0, 1.0);
+    let (color, fade) = match f.done {
+        None => (theme::ACCENT, 1.0),
+        Some((at, ok)) => {
+            let hold = if ok { 6.0 } else { 10.0 };
+            let age = (now - at).as_secs_f32();
+            if age > hold + 1.0 {
+                return false;
+            }
+            (if ok { theme::GREEN } else { theme::RED }, (hold + 1.0 - age).clamp(0.0, 1.0))
+        }
+    };
+    // a chat squeezed short (a small window): one row, then the bar
+    let compact = ui.available_height() < 130.0;
+    let mut keep = true;
+    ui.scope(|ui| {
+        ui.multiply_opacity(fade);
+        Frame::none()
+            .fill(theme::tint(color, 14))
+            .stroke(Stroke::new(1.0_f32, theme::tint(color, 80)))
+            .rounding(egui::Rounding::same(theme::RADIUS))
+            .inner_margin(Margin::symmetric(10.0, if compact { 5.0 } else { 8.0 }))
+            .show(ui, |ui| {
+                let have = frac * f.file_bytes as f32;
+                let caption = match (f.done, bps) {
+                    (None, Some(b)) => format!(
+                        "{} of {} · {b:.0} bps · ~{} left",
+                        fmt_size(have),
+                        fmt_size(f.file_bytes as f32),
+                        fmt_span((total - shown) * 8.0 / b),
+                    ),
+                    (None, None) => format!("{} of {} · measuring speed…", fmt_size(have), fmt_size(f.file_bytes as f32)),
+                    (Some((at, true)), _) => {
+                        let secs = (at - f.started).as_secs_f32();
+                        let avg = if secs >= 1.0 { format!(" · avg {:.0} bps", total * 8.0 / secs) } else { String::new() };
+                        format!("{} in {}{avg}", fmt_size(f.file_bytes as f32), fmt_span(secs))
+                    }
+                    (Some((_, false)), _) => format!("stopped · {} of {} arrived", fmt_size(have), fmt_size(f.file_bytes as f32)),
+                };
+                let caption_color = if f.done.is_none() { theme::TEXT } else { color };
+                ui.horizontal(|ui| {
+                    // The badge: a ring that fills with the file, the arrow bobbing inside
+                    let size = if compact { 22.0 } else { 34.0 };
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+                    let p = ui.painter();
+                    let c = r.center();
+                    let rad = size / 2.0 - 3.0;
+                    let k = rad / 14.0;
+                    p.circle_filled(c, rad, theme::tint(color, 30));
+                    p.circle_stroke(c, rad, Stroke::new(2.5_f32, theme::tint(color, 45)));
+                    let n = (72.0 * frac).ceil() as usize;
+                    if n > 0 {
+                        let pts = (0..=n)
+                            .map(|i| {
+                                let a = -FRAC_PI_2 + TAU * frac * i as f32 / n as f32;
+                                c + Vec2::new(a.cos(), a.sin()) * rad
+                            })
+                            .collect();
+                        p.add(egui::Shape::line(pts, Stroke::new(2.5_f32, color)));
+                    }
+                    let stroke = Stroke::new(2.0_f32, color);
+                    match f.done {
+                        None => {
+                            let dy = (t * 3.2).sin() * 2.0 * k;
+                            let (top, tip) = (egui::pos2(c.x, c.y + (dy - 6.5) * 1.0_f32.min(k * 1.2)), egui::pos2(c.x, c.y + (5.5 + dy) * k));
+                            p.line_segment([top, tip], stroke);
+                            p.add(egui::Shape::line(vec![tip + Vec2::new(-4.5, -4.5) * k, tip, tip + Vec2::new(4.5, -4.5) * k], stroke));
+                        }
+                        Some((_, true)) => {
+                            p.add(egui::Shape::line(
+                                vec![c + Vec2::new(-6.0, 0.0) * k, c + Vec2::new(-1.5, 4.5) * k, c + Vec2::new(6.5, -5.0) * k],
+                                Stroke::new(2.4_f32, color),
+                            ));
+                        }
+                        Some((_, false)) => {
+                            p.line_segment([c + Vec2::splat(-5.0 * k), c + Vec2::splat(5.0 * k)], stroke);
+                            p.line_segment([c + Vec2::new(-5.0, 5.0) * k, c + Vec2::new(5.0, -5.0) * k], stroke);
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if f.done.is_some() {
+                                    // (drawn: the UI font has no ✕)
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
+                                    let col = if resp.hovered() { theme::TEXT } else { theme::MUTED };
+                                    let (c, d) = (r.center(), 3.5);
+                                    ui.painter().line_segment([c + Vec2::splat(-d), c + Vec2::splat(d)], Stroke::new(1.5_f32, col));
+                                    ui.painter().line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], Stroke::new(1.5_f32, col));
+                                    if resp.on_hover_text("Close").clicked() {
+                                        keep = false;
+                                    }
+                                }
+                                let pct = RichText::new(format!("{:.0}%", frac * 100.0)).size(if compact { 15.0 } else { 18.0 }).strong().color(color);
+                                ui.label(pct);
+                                if compact {
+                                    ui.label(RichText::new(&caption).size(11.0).color(caption_color));
+                                }
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    ui.add(egui::Label::new(RichText::new(&f.name).strong().color(theme::TEXT)).truncate());
+                                });
+                            });
+                        });
+                        if !compact {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if let Some(call) = &f.from {
+                                    ui.label(RichText::new(format!("from {call} · ")).size(11.0).color(theme::MUTED));
+                                }
+                                ui.label(RichText::new(&caption).size(11.0).color(caption_color));
+                            });
+                        }
+                    });
+                });
+                ui.add_space(if compact { 3.0 } else { 5.0 });
+
+                // The bar
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(120.0), if compact { 6.0 } else { 8.0 }), egui::Sense::hover());
+                let p = ui.painter_at(rect.expand(10.0));
+                let round = egui::Rounding::same(4.0);
+                p.rect_filled(rect, round, theme::tint(theme::MUTED, 30));
+                let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * frac.max(0.015), rect.bottom()));
+                let head = egui::pos2(fill.right(), fill.center().y);
+                if f.done.is_none() {
+                    // packets drifting in from the far end, brightening as they reach the head
+                    let gap = rect.right() - head.x;
+                    if gap > 12.0 {
+                        for k in 0..7 {
+                            let ph = (t * 0.55 + k as f32 / 7.0).fract();
+                            let x = rect.right() - ph * gap;
+                            let wob = ((t * 5.0) + k as f32 * 1.7).sin() * 1.2;
+                            p.circle_filled(egui::pos2(x, head.y + wob), 1.4 + ph, theme::tint(theme::ACCENT, (40.0 + ph * 170.0) as u8));
+                        }
+                    }
+                }
+                p.rect_filled(fill.expand(2.5), egui::Rounding::same(6.0), theme::tint(color, 45));
+                let (c0, c1) = if f.done.is_none() { (theme::ACCENT, theme::PURPLE) } else { (color, color) };
+                let mut m = egui::Mesh::default();
+                m.colored_vertex(fill.left_top(), c0);
+                m.colored_vertex(fill.right_top(), c1);
+                m.colored_vertex(fill.right_bottom(), c1);
+                m.colored_vertex(fill.left_bottom(), c0);
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(0, 2, 3);
+                p.add(egui::Shape::mesh(m));
+                if f.done.is_none() {
+                    let sweep_x = fill.left() + (t * 0.8).fract() * fill.width();
+                    let sweep = egui::Rect::from_center_size(egui::pos2(sweep_x, fill.center().y), Vec2::new(18.0, fill.height()));
+                    p.rect_filled(sweep.intersect(fill), round, Color32::from_white_alpha(60));
+                    // the head: a pulsing spark, and a ring bursting out when a lot lands
+                    let pulse = 0.5 + 0.5 * (t * 6.0).sin();
+                    p.circle_filled(head, 3.0 + pulse, Color32::from_white_alpha((150.0 + pulse * 80.0) as u8));
+                    let burst = since_last / 0.9;
+                    if f.samples.len() > 1 && burst < 1.0 {
+                        p.circle_stroke(head, 3.0 + burst * 9.0, Stroke::new(2.0_f32, theme::tint(Color32::WHITE, ((1.0 - burst) * 200.0) as u8)));
+                    }
+                }
+            });
+    });
+    ui.add_space(6.0);
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+    keep
+}
+
 fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
     let frame = theme::card().inner_margin(Margin::same(10.0));
 
@@ -3991,6 +4240,9 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
             });
         });
         ui.separator();
+        if state.rx_file.is_some() && !draw_rx_file_card(ui, state) {
+            state.rx_file = None;
+        }
 
         let search_lower = state.chat_search.to_lowercase();
 
@@ -9189,6 +9441,7 @@ pub fn spawn_session_bridge(
                             crate::varac::session::SessionEvent::TypedCq(cq) => SessionMsg::TypedCq(cq, last_snr),
                             crate::varac::session::SessionEvent::FrameId { outgoing, id, text } => SessionMsg::FrameId { outgoing, id, text },
                             crate::varac::session::SessionEvent::TxStarted { text, bytes } => SessionMsg::TxStarted { text, bytes },
+                            crate::varac::session::SessionEvent::RxProgress { received, total } => SessionMsg::RxProgress { received, total },
                             crate::varac::session::SessionEvent::HandshakeComplete => {
                                 link_open = true;
                                 for (_, tag) in held_tags.drain(..) {

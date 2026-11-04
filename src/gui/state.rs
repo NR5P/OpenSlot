@@ -77,6 +77,8 @@ pub enum SessionMsg {
     FrameId { outgoing: bool, id: u32, text: String },
     /// A frame of ours went to the modem (text, bytes)
     TxStarted { text: String, bytes: usize },
+    /// Part of an incoming file frame is here (bytes so far, frame length)
+    RxProgress { received: usize, total: usize },
     /// VARA's BITRATE line: speed level, bps, transmitting?
     Bitrate { level: u8, bps: u32, tx: bool },
     ModemConnected,
@@ -173,6 +175,32 @@ pub enum GuiCommand {
     QsyAbsoluteRequest { freq_hz: u64 },
     QsyAccept,
     QsyReject,
+}
+
+/// A file coming in from the partner (the download card above the chat).
+#[derive(Debug, Clone)]
+pub struct RxFile {
+    pub name: String,
+    pub from: Option<String>,
+    /// The file's gzip size (from the offer) and the frame's length on the air (base64)
+    pub file_bytes: usize,
+    pub total: usize,
+    pub received: usize,
+    pub started: std::time::Instant,
+    /// (when, bytes so far) at each delivery from the modem, for the speed
+    pub samples: Vec<(std::time::Instant, usize)>,
+    /// Ended: when, and whether all of it arrived
+    pub done: Option<(std::time::Instant, bool)>,
+}
+
+impl RxFile {
+    /// On-air speed in bits per second over the last minute of deliveries.
+    pub fn bps(&self) -> Option<f32> {
+        let last = *self.samples.last()?;
+        let first = *self.samples.iter().find(|(t, _)| (last.0 - *t).as_secs_f32() <= 60.0)?;
+        let secs = (last.0 - first.0).as_secs_f32();
+        (secs >= 1.0 && last.1 > first.1).then(|| (last.1 - first.1) as f32 * 8.0 / secs)
+    }
 }
 
 /// Where one of our lines is on its way out (the send progress under it).
@@ -536,6 +564,8 @@ pub struct GuiState {
     pub pending_vmail_attachment: bool,
     /// ACCEPT FILE was clicked for the pending offer.
     pub file_accepted: bool,
+    /// The file coming in now (or just finished), for the download card.
+    pub rx_file: Option<RxFile>,
     /// Files attached in the VMail compose window.
     pub compose_attachments: Vec<std::path::PathBuf>,
     /// Where the last VMail attachment zip was unpacked (noted on the VMail).
@@ -1044,6 +1074,7 @@ impl GuiState {
             pending_file_offer: None,
             pending_vmail_attachment: false,
             file_accepted: false,
+            rx_file: None,
             compose_attachments: Vec::new(),
             last_attachment_dir: None,
             compose_open: false,
