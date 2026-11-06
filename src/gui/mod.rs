@@ -4220,23 +4220,39 @@ fn our_lines_in_frame(lines: &std::collections::VecDeque<ChatLine>, text: &str, 
 
 /// Openslot's encryption and signing switches, our key and the stations' keys.
 fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
+    // (what a box does, under it in small type)
+    let explain = |ui: &mut egui::Ui, text: &str| {
+        ui.indent(text, |ui| ui.label(RichText::new(text).small().color(theme::MUTED)));
+    };
     ui.heading("Encryption and signing");
-    ui.label(RichText::new("All are off unless you turn them on, and work only between Openslot stations. With all off, Openslot works exactly as before.")
-        .small().color(theme::MUTED));
+    ui.label(RichText::new("Three separate options, all off unless you turn them on. They work only between Openslot stations. \
+        With all three off, Openslot works exactly as before.").small().color(theme::MUTED));
+    ui.label(RichText::new("⚠ Encryption (the first and third options) is not allowed on amateur radio frequencies \
+        (FCC §97.113(a)(4), and most countries' rules). Use it only where it's permitted, such as MARS, SHARES or other \
+        licensed services. Signing hides nothing and is not encryption.").small().color(theme::YELLOW));
     ui.add_space(6.0);
-    ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations")
-        .on_hover_text("When the station you link with has this on too, everything on the link is encrypted. \
-            Otherwise the link stays in the clear, and the chat says so.");
-    ui.label(RichText::new("⚠ Encryption is not allowed on amateur radio frequencies (FCC §97.113(a)(4), and most countries' rules). \
-        Use it only where it's permitted, such as MARS, SHARES or other licensed services.").small().color(theme::YELLOW));
+    ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations");
+    explain(ui, "Scrambles everything on the link (chat, VMail and files) so only the station you're linked with can read it. \
+        It works only when that station is Openslot and has this on too. Keys are made and swapped by themselves at the start \
+        of the link; until the other station's key arrives, what you type waits, so nothing private goes out in the clear. \
+        Encrypted lines show 🔒 beside the time. If the other station isn't Openslot, or has this off, the chat says \
+        \"🔓 this link is NOT encrypted\" and everything goes out as normal. Your station ID (de CALL) always goes in the clear.");
     ui.add_space(4.0);
-    ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail")
-        .on_hover_text("Adds a signature to what you type and to your VMail, so other Openslot stations can check it's really from you. \
-            The text stays readable.");
+    ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail");
+    explain(ui, "Adds a digital signature to what you type and to your VMail (not VMail with attachments), so other Openslot \
+        stations can check it really came from you and wasn't changed. The text stays readable to everyone. On their side, \
+        a green ✔ means it's from your key; ⚠ means it isn't the key they saved for you, or the text was changed. On an \
+        encrypted link no separate signature is sent: the encryption already proves who's talking.");
+    ui.label(RichText::new("With either option above on, VarAC stations see Openslot's key and signature tags (<OSK:…>, <OSG:…>) \
+        as text, so leave them off when you work VarAC stations.").small().color(theme::MUTED));
     ui.add_space(4.0);
-    ui.checkbox(&mut form.use_shared_keys, "Use shared keys")
-        .on_hover_text("For the stations below: links are encrypted from the start with a key you both typed in beforehand. \\
-            No key of any kind is readable on the air. Works whether or not the box above is on.");
+    ui.checkbox(&mut form.use_shared_keys, "Use shared keys");
+    explain(ui, "Encryption with a key you and the other operator arranged beforehand, for the stations listed below. With \
+        the same key on both sides, the link is encrypted from the very first frame, and nothing about either station's key \
+        can be read on the air. A fresh link key is made every time, so even if a shared key leaks later, recordings of \
+        earlier links can't be read with it alone. If the other station has no key for you, or a different one, the chat \
+        says \"🔓 this link is NOT encrypted\", and what you typed goes out in the clear. Works on its own, whether or not \
+        the first option is on.");
     if form.use_shared_keys {
         draw_shared_keys(ui, form, secure);
     }
@@ -4283,8 +4299,8 @@ fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, sec
 /// The shared keys typed in beforehand (kept in keys.json), and a row to add one.
 fn draw_shared_keys(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
     ui.indent("shared_keys", |ui| {
-        ui.label(RichText::new("Give the other operator the same key some other way (in person, by phone or email), never over the radio. \\
-            A key for * is used with any station that has no key of its own here.").small().color(theme::MUTED));
+        ui.label(RichText::new("Give the other operator the same key some other way (in person, by phone or email), never over the radio. \
+            Letter case, spaces and dashes don't matter when it's typed in. A key for * is used with any station that has no key of its own here.").small().color(theme::MUTED));
         let keys = secure.shared_keys();
         if !keys.is_empty() {
             egui::Grid::new("shared_key_list").num_columns(4).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
