@@ -1,0 +1,622 @@
+//! Two real sessions talking over a pretend VARA link: every combination of encryption,
+//! signing, AES and shared keys (and all of them off), both ways, with and without delay
+//! on the air. What the stations see is checked against what went over the air.
+
+use super::*;
+use crate::vara::commands::VaraCommand;
+use crate::varac::secure::{self, KeyTrust, SecureNote, SecurePolicy, SigCheck};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::{TcpListener, TcpStream};
+
+type Writer = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
+
+/// One side's modem, as the air holds it.
+struct Side {
+    data_w: Writer,
+}
+
+/// The pretend air: CONNECT / DISCONNECT on either modem link both, what one sends reaches
+/// the other (after `delay`), then the sender's modem reports its buffer empty.
+struct Air {
+    heard: Arc<Mutex<Vec<String>>>,
+    a: Side,
+    b: Side,
+}
+
+impl Air {
+    fn heard(&self) -> Vec<String> {
+        self.heard.lock().unwrap().clone()
+    }
+
+    /// A frame put on the air as if the other station sent it.
+    async fn inject_to(&self, to_a: bool, text: &str) {
+        let side = if to_a { &self.a } else { &self.b };
+        side.data_w.lock().await.write_all(&framing::encode_frame(text)).await.unwrap();
+    }
+}
+
+async fn modem() -> (VaraConnection, TcpStream, TcpStream) {
+    let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+    let accept = tokio::spawn(async move { (cmd.accept().await.unwrap().0, data.accept().await.unwrap().0) });
+    let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+    let (c, d) = accept.await.unwrap();
+    (vara, c, d)
+}
+
+fn config(call: &str, name: &str) -> StationConfig {
+    let cfg = StationConfig {
+        callsign: call.into(),
+        name: Some(name.into()),
+        qth: Some("Testville, TX".into()),
+        locator: Some("EM12kp".into()),
+        services: ServiceFlags(ServiceFlags::VMAIL),
+        bbs_dir: None,
+        email_gate: None,
+        bbs_gate: None,
+        policy: Default::default(),
+    };
+    cfg.policy.on_calling_frequency.store(false, std::sync::atomic::Ordering::Relaxed);
+    // (take offered files without asking, as the operator would)
+    cfg.policy.auto_file.store(true, std::sync::atomic::Ordering::Relaxed);
+    cfg
+}
+
+/// Two stations, N0AAA and N0BBB, on one air. `delay_ab` / `delay_ba`: how long a frame
+/// takes each way.
+async fn two_stations(
+    sa: impl FnOnce(&SecurePolicy),
+    sb: impl FnOnce(&SecurePolicy),
+    delay_ab: Duration,
+    delay_ba: Duration,
+) -> (VaracSession, VaracSession, Air) {
+    let (va, ac, ad) = modem().await;
+    let (vb, bc, bd) = modem().await;
+    let (ca, cb) = (config("N0AAA", "Alice"), config("N0BBB", "Bob"));
+    sa(&ca.policy.secure);
+    sb(&cb.policy.secure);
+    let (a, b) = (VaracSession::new(va, ca), VaracSession::new(vb, cb));
+
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let (acr, acw) = ac.into_split();
+    let (bcr, bcw) = bc.into_split();
+    let (adr, adw) = ad.into_split();
+    let (bdr, bdw) = bd.into_split();
+    let (acw, bcw, adw, bdw): (Writer, Writer, Writer, Writer) = (
+        Arc::new(tokio::sync::Mutex::new(acw)),
+        Arc::new(tokio::sync::Mutex::new(bcw)),
+        Arc::new(tokio::sync::Mutex::new(adw)),
+        Arc::new(tokio::sync::Mutex::new(bdw)),
+    );
+    // commands
+    for mut r in [acr, bcr] {
+        let (acw, bcw) = (acw.clone(), bcw.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut line = String::new();
+            while let Ok(n @ 1..) = r.read(&mut buf).await {
+                line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(i) = line.find('\r') {
+                    let cmd: String = line.drain(..=i).collect();
+                    let cmd = cmd.trim();
+                    let reply = if let Some(rest) = cmd.strip_prefix("CONNECT ") {
+                        Some(format!("CONNECTED {rest} 500\rSN 12.0\r"))
+                    } else if cmd == "DISCONNECT" || cmd == "ABORT" {
+                        Some("DISCONNECTED\r".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(reply) = reply {
+                        for w in [&acw, &bcw] {
+                            let _ = w.lock().await.write_all(reply.as_bytes()).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // data, each way in order, after the delay
+    for (label, mut from, to, sender_cmd, delay) in [("A>", adr, bdw.clone(), acw.clone(), delay_ab), ("B>", bdr, adw.clone(), bcw.clone(), delay_ba)] {
+        let h = heard.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n @ 1..) = from.read(&mut buf).await {
+                h.lock().unwrap().push(format!("{label}{}", String::from_utf8_lossy(&buf[..n])));
+                let _ = tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
+            }
+        });
+        tokio::spawn(async move {
+            while let Some((at, bytes)) = rx.recv().await {
+                tokio::time::sleep_until(at).await;
+                if to.lock().await.write_all(&bytes).await.is_err() || sender_cmd.lock().await.write_all(b"BUFFER 0\r").await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let air = Air { heard, a: Side { data_w: adw }, b: Side { data_w: bdw } };
+    (a, b, air)
+}
+
+/// What the app does on its own: accept a QSY countdown, take an offered file, confirm it.
+async fn react(s: &mut VaracSession, ev: &SessionEvent) {
+    crate::varac::session::accept_qsy_for_test(s, ev).await;
+    if let SessionEvent::Message(IncomingMessage::BbsFilePayload(_)) = ev {
+        let _ = s.send_file_ok().await;
+    }
+}
+
+/// Both sessions for `ms`, every input handled to the end.
+async fn run2(a: &mut VaracSession, b: &mut VaracSession, ms: u64) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
+    let (mut ea, mut eb) = (Vec::new(), Vec::new());
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        enum Got {
+            A(Option<SessionInput>),
+            B(Option<SessionInput>),
+            Done,
+        }
+        let got = tokio::select! {
+            i = a.next_input() => Got::A(i),
+            i = b.next_input() => Got::B(i),
+            _ = tokio::time::sleep_until(deadline) => Got::Done,
+        };
+        match got {
+            Got::A(Some(i)) => {
+                if let Some(ev) = a.handle_input(i).await {
+                    react(a, &ev).await;
+                    ea.push(ev);
+                }
+            }
+            Got::B(Some(i)) => {
+                if let Some(ev) = b.handle_input(i).await {
+                    react(b, &ev).await;
+                    eb.push(ev);
+                }
+            }
+            Got::A(None) | Got::B(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Got::Done => break,
+        }
+    }
+    (ea, eb)
+}
+
+/// Run both until each has finished its handshake (or `ms` passed).
+async fn until_handshakes(a: &mut VaracSession, b: &mut VaracSession, ms: u64) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
+    let (mut ea, mut eb) = (Vec::new(), Vec::new());
+    let done = |e: &[SessionEvent]| e.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete));
+    let start = tokio::time::Instant::now();
+    while (!done(&ea) || !done(&eb)) && start.elapsed() < Duration::from_millis(ms) {
+        let (x, y) = run2(a, b, 100).await;
+        ea.extend(x);
+        eb.extend(y);
+    }
+    (ea, eb)
+}
+
+fn texts(events: &[SessionEvent]) -> Vec<String> {
+    events.iter().filter_map(|e| match e {
+        SessionEvent::Message(IncomingMessage::RawText(t)) => Some(t.clone()),
+        _ => None,
+    }).collect()
+}
+
+fn vmails(events: &[SessionEvent]) -> Vec<VMail> {
+    events.iter().filter_map(|e| match e {
+        SessionEvent::Message(IncomingMessage::VMail(v)) => Some(v.clone()),
+        _ => None,
+    }).collect()
+}
+
+fn notes(events: &[SessionEvent]) -> Vec<SecureNote> {
+    events.iter().filter_map(|e| match e {
+        SessionEvent::Secure(n) => Some(n.clone()),
+        _ => None,
+    }).collect()
+}
+
+fn vmail(subject: &str, body: &str) -> VMail {
+    VMail {
+        guid: "t".into(), from: String::new(), to: String::new(), subject: subject.into(), body: body.into(),
+        compose_time: String::new(), timestamp: Utc::now(), urgent: false, is_parked: false,
+        has_attachment: false, reply_to: None, raw: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Off,
+    Sign,
+    Enc,
+    EncSign,
+    EncAes,
+    /// Shared key: 0 and 1 are different keys
+    Shared(u8),
+    SharedAes(u8),
+}
+
+const KEYS: [&str; 2] = ["ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345", "ZZZZ-YYYY-XXXX-WWWW-VVVV-UUUU-TTTT"];
+
+impl Mode {
+    fn apply(self, p: &SecurePolicy) {
+        match self {
+            Mode::Off => {}
+            Mode::Sign => p.set(false, true),
+            Mode::Enc => p.set(true, false),
+            Mode::EncSign => p.set(true, true),
+            Mode::EncAes => {
+                p.set(true, false);
+                p.set_aes(true);
+            }
+            Mode::Shared(k) | Mode::SharedAes(k) => {
+                p.set_shared(true);
+                p.set_aes(matches!(self, Mode::SharedAes(_)));
+                p.add_shared(secure::SharedKey::new("net", "*", KEYS[k as usize]).unwrap());
+            }
+        }
+    }
+
+    fn encrypts(self) -> bool {
+        matches!(self, Mode::Enc | Mode::EncSign | Mode::EncAes)
+    }
+
+    fn signs(self) -> bool {
+        matches!(self, Mode::Sign | Mode::EncSign)
+    }
+
+    fn shared(self) -> Option<u8> {
+        match self {
+            Mode::Shared(k) | Mode::SharedAes(k) => Some(k),
+            _ => None,
+        }
+    }
+}
+
+/// Should a link between these two be encrypted?
+fn expect_encrypted(a: Mode, b: Mode) -> bool {
+    (a.encrypts() && b.encrypts()) || matches!((a.shared(), b.shared()), (Some(x), Some(y)) if x == y)
+}
+
+/// A whole QSO between `ma` (the caller) and `mb`: chat both ways (some typed before the
+/// keys can have crossed), a multi-line message, a VMail each way. Everything must arrive
+/// once and as sent, the link must be what both settings say, nothing secret may be heard
+/// on the air when it's encrypted, and no false warnings.
+async fn qso(ma: Mode, mb: Mode, delay_ab: u64, delay_ba: u64) {
+    let tag = format!("{ma:?} -> {mb:?} (delay {delay_ab}/{delay_ba} ms)");
+    let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::from_millis(delay_ab), Duration::from_millis(delay_ba)).await;
+    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+    // (typed as soon as the link is up, before anything came from the other side)
+    let (mut ea, mut eb) = (Vec::new(), Vec::new());
+    while a.state != SessionState::Connected || b.state != SessionState::Connected {
+        let (x, y) = run2(&mut a, &mut b, 20).await;
+        ea.extend(x);
+        eb.extend(y);
+    }
+    a.send_typed("alpha one").await.unwrap();
+    b.send_typed("bravo one").await.unwrap();
+    let (x, y) = until_handshakes(&mut a, &mut b, 15_000).await;
+    ea.extend(x);
+    eb.extend(y);
+    assert!(ea.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: A's handshake: {ea:?}");
+    assert!(eb.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: B's handshake: {eb:?}");
+
+    a.send_typed("alpha two\r\nsecond line").await.unwrap();
+    a.send_vmail(&vmail("Meeting", "At the hall, 7 pm. Bring the antenna.")).await.unwrap();
+    b.send_typed("bravo two").await.unwrap();
+    b.send_vmail(&vmail("Re: Meeting", "Copy, will be there")).await.unwrap();
+    let (x, y) = run2(&mut a, &mut b, 6000 + 4 * (delay_ab + delay_ba)).await;
+    ea.extend(x);
+    eb.extend(y);
+
+    // everything arrived, once, as sent (lines of one frame show as one message)
+    let (ta, tb) = (texts(&ea).join("\n"), texts(&eb).join("\n"));
+    for (got, want) in [(&tb, "alpha one"), (&tb, "alpha two\nsecond line"), (&ta, "bravo one"), (&ta, "bravo two")] {
+        assert_eq!(got.matches(want).count(), 1, "{tag}: {want:?} in {got:?}\nA: {ea:?}\nB: {eb:?}");
+        assert!(!got.contains(secure::SIG_TAG) && !got.contains("<OS"), "{tag}: a tag shows: {got:?}");
+    }
+    let (va, vb) = (vmails(&ea), vmails(&eb));
+    assert_eq!(vb.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(),
+        [("Meeting", "At the hall, 7 pm. Bring the antenna.")], "{tag}: {eb:?}");
+    assert_eq!(va.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(),
+        [("Re: Meeting", "Copy, will be there")], "{tag}: {ea:?}");
+
+    // the link is what both settings say, on both sides
+    let enc = expect_encrypted(ma, mb);
+    assert_eq!((a.secure.is_encrypted(), b.secure.is_encrypted()), (enc, enc), "{tag}");
+    let (na, nb) = (notes(&ea), notes(&eb));
+    for (who, n, mine) in [("A", &na, ma), ("B", &nb, mb)] {
+        let links: Vec<bool> = n.iter().filter_map(|n| match n {
+            SecureNote::Link { encrypted, .. } => Some(*encrypted),
+            _ => None,
+        }).collect();
+        // (a station with nothing on, or only signing, says nothing about the link unless
+        // the other side encrypts)
+        if enc {
+            assert_eq!(links, [true], "{tag}: {who}'s notes {n:?}");
+        } else if mine.encrypts() || mine.shared().is_some() {
+            assert_eq!(links, [false], "{tag}: {who}'s notes {n:?}");
+        } else {
+            assert!(links.iter().all(|e| !e), "{tag}: {who}'s notes {n:?}");
+        }
+        let false_alarms: Vec<_> = n.iter().filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect();
+        assert!(false_alarms.is_empty(), "{tag}: {who} warned: {false_alarms:?}");
+    }
+
+    // signatures: on a clear link, what a signing station sent checks out at the other end
+    for (who, n, sender) in [("B", &nb, ma), ("A", &na, mb)] {
+        let checks: Vec<SigCheck> = n.iter().filter_map(|n| match n {
+            SecureNote::Signed { check, .. } => Some(*check),
+            _ => None,
+        }).collect();
+        if sender.signs() && !enc {
+            // (three signed messages: two typed, one VMail)
+            assert_eq!(checks.len(), 3, "{tag}: {who} checked {checks:?}");
+            assert!(checks.iter().all(|c| matches!(c, SigCheck::Valid(KeyTrust::FirstContact | KeyTrust::Known))), "{tag}: {who} checked {checks:?}");
+        } else {
+            assert!(checks.is_empty(), "{tag}: {who} checked {checks:?}");
+        }
+    }
+
+    // the air
+    let heard = air.heard();
+    let all = heard.join("|");
+    if enc {
+        for secret in ["alpha", "bravo", "second line", "Meeting", "hall", "Copy, will"] {
+            assert!(!all.contains(secret), "{tag}: {secret:?} readable on the air: {heard:?}");
+        }
+        assert!(!all.contains(secure::SIG_TAG), "{tag}: {heard:?}");
+    }
+    if ma == Mode::Off && mb == Mode::Off {
+        assert!(!all.contains("<OS"), "{tag}: Openslot tags on the air with everything off: {heard:?}");
+        assert!(na.is_empty() && nb.is_empty(), "{tag}: {na:?} {nb:?}");
+    }
+    if ma.shared().is_some() || mb.shared().is_some() {
+        assert!(!all.contains(secure::KEY_TAG) || !(ma.shared().is_some() && mb.shared().is_some()), "{tag}: {heard:?}");
+    }
+    // both count the frames the same way (VarAC's line numbers)
+    assert_eq!(a.chat_id, b.chat_id, "{tag}: frame numbers differ");
+}
+
+const ALL: [Mode; 9] = [Mode::Off, Mode::Sign, Mode::Enc, Mode::EncSign, Mode::EncAes, Mode::Shared(0), Mode::Shared(1), Mode::SharedAes(0), Mode::Off];
+
+async fn row(ma: Mode, delay_ab: u64, delay_ba: u64) {
+    for mb in &ALL[..8] {
+        qso(ma, *mb, delay_ab, delay_ba).await;
+    }
+}
+
+#[tokio::test]
+async fn matrix_off() {
+    row(Mode::Off, 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_sign() {
+    row(Mode::Sign, 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_enc() {
+    row(Mode::Enc, 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_enc_sign() {
+    row(Mode::EncSign, 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_enc_aes() {
+    row(Mode::EncAes, 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_shared() {
+    row(Mode::Shared(0), 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_shared_other_key() {
+    row(Mode::Shared(1), 0, 0).await;
+}
+
+#[tokio::test]
+async fn matrix_shared_aes() {
+    row(Mode::SharedAes(0), 0, 0).await;
+}
+
+/// The caller's frames take a while (its key reaches the callee after the callee's opening
+/// has gone out), and the other way round.
+#[tokio::test]
+async fn slow_air_caller_to_callee() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::EncSign, Mode::Enc), (Mode::Shared(0), Mode::Shared(0)), (Mode::Off, Mode::Enc), (Mode::Enc, Mode::Off), (Mode::Sign, Mode::Off)] {
+        qso(ma, mb, 2500, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn slow_air_callee_to_caller() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Enc, Mode::EncAes), (Mode::Shared(0), Mode::Shared(0)), (Mode::Off, Mode::Enc), (Mode::Enc, Mode::Off), (Mode::Off, Mode::Sign)] {
+        qso(ma, mb, 0, 2500).await;
+    }
+}
+
+#[tokio::test]
+async fn slow_air_both_ways() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::SharedAes(0), Mode::Shared(0)), (Mode::Off, Mode::Off), (Mode::Sign, Mode::Sign)] {
+        qso(ma, mb, 1500, 1500).await;
+    }
+}
+
+/// Connected on a calling frequency: the callee offers a QSY first, the caller picks a
+/// slot, both move, then the openings. Encrypted the whole way when both have it on.
+#[tokio::test]
+async fn calling_frequency_handshake() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Off, Mode::Off), (Mode::Enc, Mode::Off), (Mode::Shared(0), Mode::Shared(0))] {
+        let tag = format!("{ma:?} -> {mb:?} on a calling frequency");
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        for s in [&a, &b] {
+            s.config.policy.on_calling_frequency.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+        let (mut ea, mut eb) = until_handshakes(&mut a, &mut b, 30_000).await;
+        assert!(ea.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: A {ea:?}");
+        assert!(eb.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: B {eb:?}");
+        a.send_typed("after the move").await.unwrap();
+        let (x, y) = run2(&mut a, &mut b, 3000).await;
+        ea.extend(x);
+        eb.extend(y);
+        assert_eq!(texts(&eb), ["after the move"], "{tag}: {eb:?}");
+        let enc = expect_encrypted(ma, mb);
+        assert_eq!((a.secure.is_encrypted(), b.secure.is_encrypted()), (enc, enc), "{tag}");
+        for (who, e) in [("A", &ea), ("B", &eb)] {
+            let alarms: Vec<_> = notes(e).into_iter().filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect();
+            assert!(alarms.is_empty(), "{tag}: {who} warned {alarms:?}");
+        }
+        if enc {
+            assert!(!air.heard().join("|").contains("after the move"), "{tag}");
+        }
+        assert_eq!(a.chat_id, b.chat_id, "{tag}: frame numbers differ");
+    }
+}
+
+/// A second link between the same two: the keys are known now, new link keys, counters
+/// from the start, and the old link leaves nothing behind.
+#[tokio::test]
+async fn second_link_knows_the_key() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Sign, Mode::Sign), (Mode::EncAes, Mode::Enc)] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        let mut first_sealed = Vec::new();
+        for round in 0..2 {
+            a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+            let (_, eb) = until_handshakes(&mut a, &mut b, 15_000).await;
+            a.send_typed(&format!("round {round}")).await.unwrap();
+            let (_, eb2) = run2(&mut a, &mut b, 2500).await;
+            let eb: Vec<_> = eb.into_iter().chain(eb2).collect();
+            assert_eq!(texts(&eb), [format!("round {round}")], "{tag} round {round}: {eb:?}");
+            let n = notes(&eb);
+            let trust = if round == 0 { "first contact" } else { "known" };
+            if ma.encrypts() && mb.encrypts() {
+                assert!(matches!(&n[..], [SecureNote::Link { encrypted: true, text }] if text.contains(trust)), "{tag} round {round}: {n:?}");
+            }
+            if ma.signs() {
+                let want = if round == 0 { KeyTrust::FirstContact } else { KeyTrust::Known };
+                assert!(n.iter().any(|n| matches!(n, SecureNote::Signed { check: SigCheck::Valid(t), .. } if *t == want)), "{tag} round {round}: {n:?}");
+            }
+            let sealed: Vec<String> = air.heard().into_iter().filter(|f| f.contains(secure::ENC_TAG)).collect();
+            if round == 0 {
+                first_sealed = sealed;
+            } else {
+                // (a fresh key: no frame of the second link repeats one of the first)
+                for f in sealed.iter().skip(first_sealed.len()) {
+                    assert!(!first_sealed.contains(f), "{tag}: repeated ciphertext {f}");
+                }
+            }
+            a.send_disconnect().await.unwrap();
+            run2(&mut a, &mut b, 500).await;
+            assert_eq!((a.state, b.state), (SessionState::Idle, SessionState::Idle), "{tag}");
+            assert_eq!(a.secure.state(), secure::LinkState::Off);
+        }
+        // B saved A's key once
+        if ma.encrypts() || ma.signs() {
+            assert_eq!(b.config.policy.secure.stations().len(), 1, "{tag}");
+        }
+    }
+}
+
+/// A file both ways round: offered, taken, sent, confirmed, with the bytes intact; on an
+/// encrypted link nothing of it is readable on the air.
+#[tokio::test]
+async fn file_transfer() {
+    // (text that doesn't compress to nothing)
+    let mut data = Vec::new();
+    for i in 0..3000u32 {
+        data.extend_from_slice(format!("line {i}: {}\n", i.wrapping_mul(2_654_435_761)).as_bytes());
+    }
+    for (ma, mb) in [(Mode::Off, Mode::Off), (Mode::Enc, Mode::Enc), (Mode::EncAes, Mode::EncAes), (Mode::Sign, Mode::Off), (Mode::Shared(0), Mode::Shared(0))] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+        until_handshakes(&mut a, &mut b, 15_000).await;
+        let prepared = crate::varac::bbs::prepare_file("notes.txt", &data).unwrap();
+        let payload = prepared.base64_payload.clone();
+        a.send_file(prepared).await.unwrap();
+        let (ea, eb) = run2(&mut a, &mut b, 6000).await;
+        let got: Vec<&Vec<u8>> = eb.iter().filter_map(|e| match e {
+            SessionEvent::Message(IncomingMessage::BbsFilePayload(d)) => Some(d),
+            _ => None,
+        }).collect();
+        assert_eq!(got.len(), 1, "{tag}: {eb:?}");
+        assert_eq!(got[0].as_slice(), payload.as_bytes(), "{tag}: the file changed on the way");
+        assert!(ea.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::BbsFileOk))), "{tag}: no <SFOK>: {ea:?}");
+        assert!(!a.file_in_progress, "{tag}");
+        if expect_encrypted(ma, mb) {
+            let all = air.heard().join("|");
+            assert!(!all.contains(&payload[..64]) && !all.contains("notes.txt"), "{tag}: the file is readable on the air");
+        }
+        let alarms: Vec<_> = notes(&ea).into_iter().chain(notes(&eb)).filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect();
+        assert!(alarms.is_empty(), "{tag}: {alarms:?}");
+    }
+}
+
+/// A VMail with an attachment, encrypted and not.
+#[tokio::test]
+async fn vmail_with_attachment() {
+    for (ma, mb) in [(Mode::Off, Mode::Off), (Mode::Enc, Mode::Enc), (Mode::Sign, Mode::Sign)] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+        let (_, mut eb) = until_handshakes(&mut a, &mut b, 15_000).await;
+        let mut v = vmail("Photos", "See attached");
+        v.has_attachment = true;
+        a.send_vmail_with_attachments(&v, &[("map.txt".into(), b"grid EM12kp, antenna on the north side".to_vec())]).await.unwrap();
+        let (_, y) = run2(&mut a, &mut b, 6000).await;
+        eb.extend(y);
+        let got = vmails(&eb);
+        assert_eq!(got.len(), 1, "{tag}: {eb:?}");
+        assert_eq!((got[0].subject.as_str(), got[0].body.as_str()), ("Photos", "See attached"), "{tag}");
+        if expect_encrypted(ma, mb) {
+            assert!(!air.heard().join("|").contains("Photos"), "{tag}");
+        }
+        let alarms: Vec<_> = notes(&eb).into_iter().filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect();
+        assert!(alarms.is_empty(), "{tag}: {alarms:?}");
+    }
+}
+
+/// Someone else on the air: a replayed key announcement, an old encrypted frame again, a
+/// forged one and a frame in the clear, all on an encrypted link. The link stays encrypted
+/// (and says so), each is refused or flagged, and the QSO carries on.
+#[tokio::test]
+async fn interference_on_an_encrypted_link() {
+    let (mut a, mut b, air) = two_stations(|p| Mode::Enc.apply(p), |p| Mode::Enc.apply(p), Duration::ZERO, Duration::ZERO).await;
+    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+    until_handshakes(&mut a, &mut b, 15_000).await;
+    b.send_typed("first").await.unwrap();
+    run2(&mut a, &mut b, 2500).await;
+    let heard = air.heard();
+    // (what B sent: "B>" then the frame's length and text)
+    let from_b: Vec<String> = heard.iter().filter_map(|f| f.strip_prefix("B>")).map(|f| f.split_once(' ').map(|(_, t)| t.to_string()).unwrap_or_default()).collect();
+    let b_key = from_b.iter().find(|t| t.starts_with(secure::KEY_TAG)).unwrap().clone();
+    let last_sealed = from_b.iter().filter(|t| t.starts_with(secure::ENC_TAG)).last().unwrap().clone();
+
+    for bad in [b_key.as_str(), last_sealed.as_str(), "<OSE:AAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA>", "pay no attention"] {
+        air.inject_to(true, bad).await;
+    }
+    let (ea, _) = run2(&mut a, &mut b, 1000).await;
+    let n = notes(&ea);
+    assert!(a.secure.is_encrypted(), "{n:?}");
+    assert!(!n.iter().any(|n| matches!(n, SecureNote::Link { encrypted: false, .. })), "A was told the link isn't encrypted: {n:?}");
+    assert!(n.iter().any(|n| matches!(n, SecureNote::Unencrypted(_))), "the clear frame is flagged: {n:?}");
+    assert!(n.iter().filter(|n| matches!(n, SecureNote::Warning(_))).count() >= 2, "the replayed and forged frames are refused: {n:?}");
+    assert!(!texts(&ea).contains(&"first".to_string()), "the replayed frame isn't shown again: {ea:?}");
+
+    b.send_typed("still here").await.unwrap();
+    let (ea, _) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&ea), ["still here"], "{ea:?}");
+}

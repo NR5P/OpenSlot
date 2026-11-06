@@ -664,7 +664,7 @@ impl VaracSession {
                                     }
                                     self.last_raw = raw_part.clone();
                                     self.side_info(&m, &raw_part);
-                                    self.check_signature(&raw_part, sig);
+                                    self.check_signature(&m, &raw_part, sig);
                                     self.handshake_step(m).await;
                                     i += 1;
                                 }
@@ -676,7 +676,7 @@ impl VaracSession {
                                     None => (self.complete(msg), raw),
                                 };
                                 self.side_info(&m, &raw);
-                                self.check_signature(&raw, sig.as_deref());
+                                self.check_signature(&m, &raw, sig.as_deref());
                                 self.last_raw = raw;
                                 self.handshake_step(m).await;
                             }
@@ -1625,9 +1625,13 @@ impl VaracSession {
     /// A signed message from the partner (`text` without its signature), or one that came
     /// unencrypted on an encrypted link: tell the app, just before the message itself (the
     /// app ties it to the next message event only).
-    fn check_signature(&mut self, text: &str, sig: Option<&str>) {
+    fn check_signature(&mut self, msg: &IncomingMessage, text: &str, sig: Option<&str>) {
+        // (the callee's <Q> and opening go out on CONNECTED, in the clear when our key
+        // hasn't reached it yet: not worth a warning — anything typed or a VMail still is)
+        let early_handshake = self.handshake != Handshake::Done
+            && !matches!(msg, IncomingMessage::RawText(_) | IncomingMessage::Chat(_) | IncomingMessage::VMail(_));
         let note = match sig {
-            _ if self.frame_was_clear && self.secure.is_encrypted() => self.secure.unencrypted(text),
+            _ if self.frame_was_clear && self.secure.is_encrypted() => self.secure.unencrypted(text, early_handshake),
             Some(sig) => Some(self.secure.verify(&self.config.policy.secure, text, sig)),
             None => None,
         };
@@ -2869,11 +2873,12 @@ pub enum SessionEvent {
 
 /// The incoming `<SFB>` file frame at the head of `buf`, not complete yet: (bytes of it
 /// here, its declared length). The payload is base64, so one character is one byte.
+/// (On an encrypted link the file comes sealed in an `<OSE:…>` frame: that's counted.)
 pub fn partial_file_frame(buf: &[u8]) -> Option<(usize, usize)> {
     let space = buf.iter().take(12).position(|&b| b == b' ')?;
     let total: usize = std::str::from_utf8(&buf[..space]).ok()?.parse().ok()?;
     let payload = &buf[space + 1..];
-    if !payload.starts_with(b"<SFB") || total == 0 {
+    if !(payload.starts_with(b"<SFB") || payload.starts_with(crate::varac::secure::ENC_TAG.as_bytes())) || total == 0 {
         return None;
     }
     Some((payload.len().min(total), total))
@@ -2929,6 +2934,8 @@ mod tests {
         assert_eq!(partial_file_frame(b"9 <SFB>QUJD12 <Q>"), Some((9, 9)));
         assert_eq!(partial_file_frame(b"12 <Q>hello"), None);
         assert_eq!(partial_file_frame(b"<SFB>"), None);
+        // (sealed on an encrypted link)
+        assert_eq!(partial_file_frame(b"500 <OSE:AAAAAQabcdef"), Some((17, 500)));
         assert_eq!(partial_file_frame(b""), None);
     }
 
@@ -4735,3 +4742,8 @@ mod secure_tests {
         assert_eq!(shown, ["Valid(FirstContact)", "good copy", "Bad", "forged"], "{events:?}");
     }
 }
+
+/// Two real sessions on a pretend air, every encryption / signing combination.
+#[cfg(test)]
+#[path = "session_two_station_tests.rs"]
+mod two_station_tests;

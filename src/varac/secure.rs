@@ -679,9 +679,19 @@ impl Link {
         })
     }
 
+    /// An announcement is only ever the partner's first frame: one after that (an old one
+    /// played back, or someone else's) changes nothing on this link, which stays as it is.
+    fn repeated_announcement(&mut self) -> Option<SecureNote> {
+        std::mem::replace(&mut self.heard_partner, true).then(|| {
+            SecureNote::Warning(format!("⚠ A second key announcement from {} (played back, or not from them): ignored", self.partner))
+        })
+    }
+
     /// The partner's `<OSK:…>` (the base64 inside the tag).
     pub fn partner_key(&mut self, policy: &SecurePolicy, payload: &str) -> Vec<SecureNote> {
-        self.heard_partner = true;
+        if let Some(note) = self.repeated_announcement() {
+            return vec![note];
+        }
         let mut notes = Vec::new();
         let parsed = b64().decode(payload.trim()).ok().and_then(|b| {
             let enc = b.len() > 2 && b[1] & FLAG_ENCRYPT != 0;
@@ -756,7 +766,9 @@ impl Link {
     /// The partner's `<OSP:…>` (the base64 inside the tag): its link key, hidden under the
     /// shared key we should both have.
     pub fn partner_shared(&mut self, payload: &str) -> Vec<SecureNote> {
-        self.heard_partner = true;
+        if let Some(note) = self.repeated_announcement() {
+            return vec![note];
+        }
         let p = self.partner.clone();
         let clear = |link: &mut Self, why: String| {
             let was_waiting = link.state == LinkState::Waiting;
@@ -830,9 +842,15 @@ impl Link {
         String::from_utf8(text).map_err(|_| fail("not text"))
     }
 
-    /// A message that came in the clear on this encrypted link (a station ID is fine).
-    pub fn unencrypted(&self, text: &str) -> Option<SecureNote> {
-        (self.is_encrypted() && !is_station_id(text))
+    /// Has the partner sent an encrypted frame yet (so it has our key)?
+    pub fn heard_encrypted(&self) -> bool {
+        self.rx.as_ref().is_some_and(|(_, last)| last.is_some())
+    }
+
+    /// A message that came in the clear on this encrypted link (a station ID is fine, and
+    /// so is the partner's handshake frame sent before our key reached it: `early_handshake`).
+    pub fn unencrypted(&self, text: &str, early_handshake: bool) -> Option<SecureNote> {
+        (self.is_encrypted() && !is_station_id(text) && !(early_handshake && !self.heard_encrypted()))
             .then(|| SecureNote::Unencrypted(format!("⚠ This message from {} came NOT encrypted", self.partner)))
     }
 
@@ -1167,6 +1185,29 @@ mod tests {
         assert!(SharedKey::new("x", "K1ABC", "short").is_err());
         assert!(SharedKey::new("x", "", "ABCD-EFGH-JKLM-NPQR").is_err());
         assert_eq!(SharedKey::new(" net ", "k1abc-7, w1aw", "ABCD-EFGH-JKLM-NPQR").unwrap().calls, ["K1ABC", "W1AW"]);
+    }
+
+    /// An announcement played back on a settled link (open keys or a shared key): a warning,
+    /// and the link stays encrypted with the same keys.
+    #[test]
+    fn a_second_announcement_changes_nothing() {
+        let secret = generate_shared_secret();
+        for (pa, pb) in [(policy(true, false), policy(true, false)), (shared(&secret, "K1ABC"), shared(&secret, "W1AW"))] {
+            let (mut a, ka) = Link::start(&pa, "W1AW", "K1ABC");
+            let (mut b, kb) = Link::start(&pb, "K1ABC", "W1AW");
+            let (ka, kb) = (ka.unwrap(), kb.unwrap());
+            let take = |l: &mut Link, p: &SecurePolicy, k: &str| match k.strip_prefix(SHARED_TAG) {
+                Some(r) => l.partner_shared(r.strip_suffix('>').unwrap()),
+                None => l.partner_key(p, payload(k)),
+            };
+            take(&mut a, &pa, &kb);
+            take(&mut b, &pb, &ka);
+            let again = take(&mut a, &pa, &kb);
+            assert!(matches!(again[..], [SecureNote::Warning(_)]), "{again:?}");
+            assert!(a.is_encrypted());
+            assert_eq!(b.open(&a.seal("still").unwrap()).unwrap(), "still");
+            assert_eq!(a.open(&b.seal("here").unwrap()).unwrap(), "here");
+        }
     }
 
     #[test]
