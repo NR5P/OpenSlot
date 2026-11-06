@@ -63,9 +63,28 @@ pub fn overlay_text(my: &str, his: &str, snr_sent: Option<i32>, snr_rcvd: Option
     t
 }
 
+/// Decode a picture, turned upright by its EXIF orientation (phone cameras store photos
+/// sideways and say so there).
+pub fn load_upright(data: &[u8]) -> Result<image::DynamicImage, String> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
 /// Scale to `pct` %, add the overlay (when given), encode as JPEG at `quality` (0–50).
 pub fn shrink(data: &[u8], pct: u32, quality: u8, overlay: Option<&str>) -> Result<(Vec<u8>, u32, u32), String> {
-    let img = image::load_from_memory(data).map_err(|e| e.to_string())?;
+    shrink_image(&load_upright(data)?, pct, quality, overlay)
+}
+
+/// [`shrink`] for a picture already decoded (to try several sizes of one picture).
+pub fn shrink_image(img: &image::DynamicImage, pct: u32, quality: u8, overlay: Option<&str>) -> Result<(Vec<u8>, u32, u32), String> {
     let pct = pct.clamp(1, 100);
     let (w, h) = ((img.width() * pct / 100).max(1), (img.height() * pct / 100).max(1));
     let mut rgba = img.resize_exact(w, h, image::imageops::FilterType::Triangle).to_rgba8();
@@ -84,6 +103,81 @@ pub fn shrink(data: &[u8], pct: u32, quality: u8, overlay: Option<&str>) -> Resu
         .encode_image(&rgb)
         .map_err(|e| e.to_string())?;
     Ok((out, w, h))
+}
+
+/// A file's size on the air: base64 of its gzip (`compressed` bytes).
+pub fn air_bytes(compressed: usize) -> usize {
+    compressed.div_ceil(3) * 4
+}
+
+/// The send-time choices for pictures, in minutes (0: the largest that fits the link).
+pub const PHOTO_MINUTES_CHOICES: [u32; 5] = [2, 5, 10, 20, 0];
+/// The default: about five minutes on the air.
+pub const PHOTO_MINUTES_DEFAULT: u32 = 5;
+
+/// "about 5 min" / "largest that fits", for the choice above.
+pub fn photo_minutes_label(minutes: u32) -> String {
+    if minutes == 0 { "largest that fits".into() } else { format!("about {minutes} min") }
+}
+
+/// The shrinker's starting size for a picture: the largest percentage (in steps of 5,
+/// of 1 below 20 %, where each step matters more) whose JPEG at `quality` is under VARA's `limit` on the compressed file and, with
+/// `minutes` (0 = no target), goes out in that time even at the slow end of the estimate
+/// at `snr`. 1 % when nothing fits. Returns (percent, jpeg, width, height).
+pub fn starting_size(
+    img: &image::DynamicImage,
+    quality: u8,
+    limit: Option<usize>,
+    minutes: u32,
+    snr: i32,
+    bandwidth: u32,
+    fm: bool,
+) -> Result<(u32, Vec<u8>, u32, u32), String> {
+    let budget = (minutes > 0).then(|| {
+        let (slow, _) = speed_bps(snr, bandwidth, fm);
+        minutes as usize * 60 * slow as usize / 8
+    });
+    let compressed = |jpg: &[u8]| crate::varac::bbs::compress(jpg).map(|c| c.len()).unwrap_or(jpg.len());
+    let fits = |jpg: &[u8]| {
+        let c = compressed(jpg);
+        limit.is_none_or(|l| c < l) && budget.is_none_or(|b| air_bytes(c) <= b)
+    };
+    let full = shrink_image(img, 100, quality, None)?;
+    if fits(&full.0) {
+        return Ok((100, full.0, full.1, full.2));
+    }
+    // A JPEG's size goes about with the pixel count (the percentage squared): start from
+    // that guess, a little under, and step down until it fits
+    let full_air = air_bytes(compressed(&full.0)) as f64;
+    let room = [limit.map(|l| air_bytes(l) as f64), budget.map(|b| b as f64)]
+        .into_iter()
+        .flatten()
+        .fold(f64::MAX, f64::min);
+    let guess = 100.0 * (0.85 * room / full_air).sqrt();
+    let down = |p: u32| if p > 20 { 5 } else { 1 };
+    let up = |p: u32| if p >= 20 { 5 } else { 1 };
+    let mut pct = if guess >= 20.0 { (guess / 5.0).floor() as u32 * 5 } else { guess.floor() as u32 }.clamp(1, 95);
+    let mut best = shrink_image(img, pct, quality, None)?;
+    if fits(&best.0) {
+        // (the guess is a little under: climb while the next size still fits)
+        while pct + up(pct) < 100 {
+            let next = shrink_image(img, pct + up(pct), quality, None)?;
+            if !fits(&next.0) {
+                break;
+            }
+            pct += up(pct);
+            best = next;
+        }
+        return Ok((pct, best.0, best.1, best.2));
+    }
+    while pct > 1 {
+        pct -= down(pct);
+        best = shrink_image(img, pct, quality, None)?;
+        if fits(&best.0) {
+            break;
+        }
+    }
+    Ok((pct, best.0, best.1, best.2))
 }
 
 /// A rough (low, high) transfer speed in bps at `snr`. VARA's speed climbs about
@@ -105,7 +199,8 @@ pub fn speed_bps(snr: i32, bandwidth: u32, fm: bool) -> (u32, u32) {
     ((hi * 0.65).round().max(1.0) as u32, hi as u32)
 }
 
-/// "a-b min at +NNdB" (whole minutes; b is at least a+1).
+/// "a-b min at +NNdB" (whole minutes; b is at least a+1), in hours ("a-b h") once the slow
+/// end passes two hours.
 pub fn time_estimate(bytes: usize, snr: i32, bandwidth: u32, fm: bool) -> String {
     let (lo, hi) = speed_bps(snr, bandwidth, fm);
     let fast = bytes as u64 * 8 / hi.max(1) as u64 / 60;
@@ -113,11 +208,57 @@ pub fn time_estimate(bytes: usize, snr: i32, bandwidth: u32, fm: bool) -> String
     if slow == fast {
         slow = fast + 1;
     }
-    format!("{fast}-{slow} min at {}dB", crate::varac::messages::snr_text(snr))
+    let snr = crate::varac::messages::snr_text(snr);
+    if slow >= 120 {
+        let (fast_h, slow_h) = (fast / 60, slow.div_ceil(60));
+        return format!("{}-{slow_h} h at {snr}dB", fast_h.min(slow_h - 1));
+    }
+    format!("{fast}-{slow} min at {snr}dB")
 }
 
 #[cfg(test)]
 mod tests {
+    /// A noisy picture (noise doesn't compress, like a photo).
+    fn noisy(w: u32, h: u32) -> image::DynamicImage {
+        let mut seed = 777u32;
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let n = (seed >> 16) as u8 / 4;
+            image::Rgb([(x % 256) as u8 / 2 + n, (y % 256) as u8 / 2 + n, n * 2])
+        }))
+    }
+
+    #[test]
+    fn starting_size_meets_the_time_target_and_the_limit() {
+        let img = noisy(1600, 1200);
+        let size = |jpg: &[u8]| crate::varac::bbs::compress(jpg).unwrap().len();
+        // largest that fits VARA's 100K at 500 Hz
+        let (big, jpg, ..) = starting_size(&img, 50, Some(100_000), 0, 10, 500, false).unwrap();
+        assert!(size(&jpg) < 100_000 && big < 100 && (big < 20 || big % 5 == 0), "{big}");
+        // two minutes: smaller, and the slow end of the estimate is within two minutes
+        let (small, jpg, ..) = starting_size(&img, 50, Some(100_000), 2, 10, 500, false).unwrap();
+        assert!(small < big, "{small} vs {big}");
+        let (slow, _) = speed_bps(10, 500, false);
+        assert!(air_bytes(size(&jpg)) * 8 <= 120 * slow as usize, "{small}%: {} bytes", size(&jpg));
+        // the next size up would have taken longer than two minutes
+        let up = if small >= 20 { 5 } else { 1 };
+        let (next, ..) = shrink_image(&img, small + up, 50, None).unwrap();
+        assert!(small == 1 || air_bytes(size(&next)) * 8 > 120 * slow as usize, "{small}");
+        // a better link fits a bigger picture in the same time
+        let (fast, ..) = starting_size(&img, 50, Some(100_000), 2, 15, 2300, false).unwrap();
+        assert!(fast >= small, "{fast} vs {small}");
+        // a small picture that fits goes at full size
+        let (pct, ..) = starting_size(&noisy(100, 80), 50, Some(100_000), 5, 10, 500, false).unwrap();
+        assert_eq!(pct, 100);
+    }
+
+    #[test]
+    fn photo_minutes_labels() {
+        assert_eq!(photo_minutes_label(5), "about 5 min");
+        assert_eq!(photo_minutes_label(0), "largest that fits");
+        assert!(PHOTO_MINUTES_CHOICES.contains(&PHOTO_MINUTES_DEFAULT));
+    }
+
     use super::*;
 
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -146,6 +287,9 @@ mod tests {
         assert_eq!(overlay_text("W5TST", "NR5P", Some(10), Some(-3)), "DE W5TST NR5P S:+10 R:-3");
         assert_eq!(overlay_text("W5TST", "", None, None), "DE W5TST");
         assert_eq!(time_estimate(30_000, 0, 2300, false), "14-21 min at +00dB");
+        // long ones in hours
+        let long = time_estimate(3_000_000, 10, 500, false);
+        assert!(long.ends_with(" h at +10dB"), "{long}");
         assert_eq!(speed_bps(10, 500, false), (263, 405));
         // top speeds at a strong signal (halved), never zero on a weak one
         assert_eq!(speed_bps(25, 2300, false).1, 3525);

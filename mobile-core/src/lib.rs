@@ -21,6 +21,7 @@ pub mod config {
 }
 
 pub mod engine;
+pub mod files;
 #[cfg(target_os = "android")]
 mod jni;
 
@@ -66,6 +67,10 @@ pub fn query(json: &str) -> String {
     let q: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
     if let Some(v) = engine::frequency_query(&q) {
         return v.to_string();
+    }
+    // The file picker's preview needs no engine either
+    if q["q"] == "file_info" {
+        return files::file_info(&q).to_string();
     }
     let engine = ENGINE.lock().unwrap_or_else(PoisonError::into_inner);
     match engine.as_ref() {

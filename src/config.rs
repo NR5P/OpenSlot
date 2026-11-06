@@ -284,6 +284,9 @@ pub struct ConfigFile {
     pub qsl_fade: Option<bool>,
     /// VarAC [FILE_TRANSFER] IncomingFilesSizeLimit (bytes, 5000)
     pub incoming_files_size_limit: Option<u64>,
+    /// A picture's starting size in the image shrinker: about this many minutes to send at
+    /// the link's SNR (0: the largest VARA allows; default 5)
+    pub photo_send_minutes: Option<u32>,
     /// VarAC [VARAHF_CONFIG] VaraModemType: VaraHF / VaraFM / VaraSAT
     pub vara_modem_type: Option<String>,
     /// VarAC [RIG_CONTROL] UsbMode: the radio mode set before every frequency change

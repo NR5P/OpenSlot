@@ -1,4 +1,6 @@
+import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 @main
@@ -373,6 +375,11 @@ struct ChatView: View {
     @State private var callTo = ""
     @State private var askLastHeard = false
     @State private var lastHeardCall = ""
+    @State private var pickingFile = false
+    @State private var pickingPhoto = false
+    @State private var photo: PhotosPickerItem?
+    @State private var outgoing: OutgoingFile?
+    @State private var pickError: String?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -440,7 +447,13 @@ struct ChatView: View {
                 if core.partnerTyping, let p = core.partner {
                     Text("\(p) is typing…").font(.caption).foregroundStyle(.secondary).padding(.bottom, 2)
                 }
+                if let t = core.transfer { TransferBar(transfer: t) }
                 HStack {
+                    Menu {
+                        Button { pickingFile = true } label: { Label("File", systemImage: "doc") }
+                        Button { pickingPhoto = true } label: { Label("Photo", systemImage: "photo") }
+                    } label: { Image(systemName: "paperclip").imageScale(.large) }
+                        .disabled(core.partner == nil || core.transfer != nil)
                     TextField(core.partner == nil ? "Not in a QSO" : "Message", text: $text, axis: .vertical)
                         .lineLimit(1...4).textFieldStyle(.roundedBorder).focused($focused)
                         .onChange(of: text) { old, new in
@@ -464,6 +477,26 @@ struct ChatView: View {
                     Button("Clear") { core.clearChat() }.disabled(core.chat.isEmpty)
                 }
             }
+            .fileImporter(isPresented: $pickingFile, allowedContentTypes: [.item]) { result in
+                switch result {
+                case .success(let url):
+                    do { outgoing = OutgoingFile(path: try OutgoingFile.copy(url)) } catch { pickError = error.localizedDescription }
+                case .failure(let e):
+                    pickError = e.localizedDescription
+                }
+            }
+            .photosPicker(isPresented: $pickingPhoto, selection: $photo, matching: .images)
+            .onChange(of: photo) {
+                guard let item = photo else { return }
+                photo = nil
+                Task {
+                    do { outgoing = OutgoingFile(path: try await OutgoingFile.copy(item)) } catch { pickError = error.localizedDescription }
+                }
+            }
+            .sheet(item: $outgoing) { f in SendFileSheet(path: f.path).environmentObject(core) }
+            .alert("Can't send that", isPresented: Binding(get: { pickError != nil }, set: { if !$0 { pickError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(pickError ?? "") }
             .alert("File offered", isPresented: Binding(get: { core.fileOffer != nil }, set: { if !$0 { core.fileOffer = nil } })) {
                 Button("Receive") { core.send(["cmd": "file_accept"]); core.fileOffer = nil }
                 Button("Decline", role: .cancel) { core.send(["cmd": "file_decline"]); core.fileOffer = nil }
@@ -490,6 +523,211 @@ struct ChatView: View {
                 Text("\(core.partner ?? "The station") asks to \(core.qsyRequest ?? ""). Retune your radio if you accept.")
             }
         }
+    }
+}
+
+/// A file picked to send: a copy in the app's own temporary folder, under its own name.
+struct OutgoingFile: Identifiable {
+    let path: String
+    var id: String { path }
+
+    struct PickError: LocalizedError {
+        let errorDescription: String?
+    }
+
+    private static func folder() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Outgoing/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// A file from the Files app (outside the app's sandbox until we're let in).
+    static func copy(_ url: URL) throws -> String {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let dest = try folder().appendingPathComponent(url.lastPathComponent)
+        try FileManager.default.copyItem(at: url, to: dest)
+        return dest.path
+    }
+
+    /// A photo from the library. HEIC (what the camera saves) becomes JPEG, which other
+    /// stations can open and the shrinker can read; the camera's orientation is kept.
+    static func copy(_ item: PhotosPickerItem) async throws -> String {
+        guard let data = try await item.loadTransferable(type: Data.self) else {
+            throw PickError(errorDescription: "The photo couldn't be read.")
+        }
+        let type = item.supportedContentTypes.first
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd_HHmmss"
+        let stamp = f.string(from: Date())
+        let name: String, bytes: Data
+        if let type, type.conforms(to: .jpeg) || type.conforms(to: .png) || type.conforms(to: .gif) || type.conforms(to: .bmp) {
+            name = "IMG_\(stamp).\(type.preferredFilenameExtension ?? "jpg")"
+            bytes = data
+        } else if let jpg = UIImage(data: data)?.jpegData(compressionQuality: 0.9) {
+            name = "IMG_\(stamp).jpg"
+            bytes = jpg
+        } else {
+            throw PickError(errorDescription: "This kind of photo can't be sent.")
+        }
+        let dest = try folder().appendingPathComponent(name)
+        try bytes.write(to: dest)
+        return dest.path
+    }
+}
+
+/// The file going over the link, above the message box: waiting for the partner's
+/// answer, then how much is sent (or received); ours can be stopped.
+struct TransferBar: View {
+    @EnvironmentObject var core: Core
+    let transfer: FileTransfer
+    @State private var confirmStop = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: transfer.outgoing ? "arrow.up.doc" : "arrow.down.doc").foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(transfer.name).font(.subheadline).lineLimit(1).truncationMode(.middle)
+                if transfer.total == 0 {
+                    Text(transfer.outgoing ? "Waiting for \(core.partner ?? "the station") to accept…" : "Receiving…")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ProgressView(value: transfer.fraction)
+                    Text("\(transfer.outgoing ? "Sent" : "Received") \(Int(transfer.fraction * 100))% of \(byteText(transfer.total))"
+                         + (transfer.timeLeft.map { " · \(spanText($0)) left" } ?? ""))
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            if transfer.outgoing {
+                // Withdrawing an offer is free; once the data is going only dropping the link stops it
+                Button("Stop", role: .destructive) { if transfer.total == 0 { core.cancelFile() } else { confirmStop = true } }
+                    .buttonStyle(.bordered).controlSize(.small)
+            }
+        }
+        .padding(.horizontal).padding(.vertical, 8)
+        .background(.bar)
+        .alert("Stop sending?", isPresented: $confirmStop) {
+            Button("Stop and end the QSO", role: .destructive) { core.cancelFile() }
+            Button("Keep sending", role: .cancel) {}
+        } message: {
+            Text("The modem can't take back what it's already sending, so stopping ends the QSO with \(core.partner ?? "the station").")
+        }
+    }
+}
+
+/// "about 3 min" / "40 s".
+func spanText(_ secs: TimeInterval) -> String {
+    secs < 60 ? "\(max(5, Int((secs / 5).rounded()) * 5)) s" : "about \(Int((secs / 60).rounded())) min"
+}
+
+func byteText(_ n: Int) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+}
+
+/// Before a file goes: its size, whether VARA allows it on this link and how long it
+/// takes. A picture goes through VarAC's image shrinker (resolution and quality), set at
+/// first to the largest size that fits, or as it is.
+struct SendFileSheet: View {
+    @EnvironmentObject var core: Core
+    @Environment(\.dismiss) private var dismiss
+    let path: String
+    @State private var info: [String: Any]?
+    @State private var shrink = true
+    @State private var pct = 100.0
+    @State private var quality = 50.0
+    @State private var working = false
+
+    private var isImage: Bool { info?["image"] as? Bool ?? false }
+    private var shrunk: [String: Any]? { info?["shrunk"] as? [String: Any] }
+    /// What goes out: the shrinker's picture, or the file as it is
+    private var chosen: [String: Any]? { isImage && shrink ? shrunk : info }
+    private var fits: Bool { chosen?["fits"] as? Bool ?? false }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let error = info?["error"] as? String {
+                    Text(error).foregroundStyle(.red)
+                } else if let info {
+                    Section {
+                        LabeledContent("File", value: info["name"] as? String ?? "")
+                        LabeledContent("Size", value: sizeLine(info))
+                        if isImage, let w = info["w"] as? Int, let h = info["h"] as? Int {
+                            LabeledContent("Picture", value: "\(w) × \(h)")
+                        }
+                        if !(isImage && shrink) { estimateRow(info) }
+                    }
+                    if isImage {
+                        Section {
+                            Toggle("Shrink the picture", isOn: $shrink)
+                            if shrink {
+                                VStack(alignment: .leading) {
+                                    Text("Resolution \(Int(pct)) %")
+                                    Slider(value: $pct, in: 1...100, step: 1) { editing in if !editing { reload() } }
+                                }
+                                VStack(alignment: .leading) {
+                                    Text("Quality \(Int(quality))")
+                                    Slider(value: $quality, in: 0...50, step: 2) { editing in if !editing { reload() } }
+                                }
+                                if let s = shrunk {
+                                    LabeledContent("Picture", value: "\(s["w"] as? Int ?? 0) × \(s["h"] as? Int ?? 0)")
+                                    LabeledContent("Size", value: sizeLine(s))
+                                    estimateRow(s)
+                                } else if let e = info["shrink_error"] as? String {
+                                    Text(e).foregroundStyle(.red)
+                                }
+                            }
+                        } footer: {
+                            Text("As VarAC's image shrinker: the picture is scaled and sent as a JPEG.")
+                        }
+                    }
+                    if chosen != nil && !fits, let limit = info["limit"] as? Int {
+                        Text("VARA HF doesn't allow files over \(byteText(limit)) compressed at \(core.fileBandwidth) Hz."
+                             + (isImage ? " Shrink the picture more." : ""))
+                            .foregroundStyle(.red)
+                    }
+                } else {
+                    HStack { ProgressView(); Text("Reading the file…").foregroundStyle(.secondary) }
+                }
+            }
+            .overlay { if working && info != nil { ProgressView().padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)) } }
+            .navigationTitle("Send a file")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") {
+                        core.sendFile(path: path, pct: isImage && shrink ? Int(pct) : nil, quality: Int(quality))
+                        dismiss()
+                    }
+                    .disabled(working || chosen == nil || !fits || core.partner == nil)
+                }
+            }
+            .task { await load(pct: nil) }
+        }
+    }
+
+    private func sizeLine(_ d: [String: Any]) -> String {
+        "\(byteText(d["bytes"] as? Int ?? 0)), \(byteText(d["compressed"] as? Int ?? 0)) compressed"
+    }
+
+    @ViewBuilder private func estimateRow(_ d: [String: Any]) -> some View {
+        LabeledContent("Time", value: d["estimate"] as? String ?? "")
+    }
+
+    private func reload() { Task { await load(pct: Int(pct)) } }
+
+    private func load(pct asked: Int?) async {
+        working = true
+        let i = await Core.fileInfo(path: path, bandwidth: core.fileBandwidth, snr: core.lastSnr, pct: asked,
+                                    quality: Int(quality), minutes: Settings().photoMinutes)
+        if asked == nil, let s = i["shrunk"] as? [String: Any] {
+            pct = Double(s["pct"] as? Int ?? 100)
+            // a picture that fits as it is goes as it is unless the operator shrinks it
+            shrink = !(i["fits"] as? Bool ?? false)
+        }
+        info = i
+        working = false
     }
 }
 
@@ -760,6 +998,7 @@ struct SettingsView: View {
     @AppStorage(Keys.idleMinutes) private var idleMinutes = 5
     @AppStorage(Keys.allowLastHeard) private var allowLastHeard = true
     @AppStorage(Keys.multiBandLastHeard) private var multiBandLastHeard = false
+    @AppStorage(Keys.photoMinutes) private var photoMinutes = 5
 
     var body: some View {
         NavigationStack {
@@ -818,6 +1057,16 @@ struct SettingsView: View {
                     Stepper("Wait on the slot \(cqSlotWait) s", value: $cqSlotWait, in: 30...900, step: 30)
                 } header: { Text("CQ") } footer: {
                     Text("A CQ names the slot you'll wait on for replies, then you go back to the calling frequency. With the selector skipped, CQs name no slot.")
+                }
+
+                Section {
+                    Picker("Photos: send in", selection: $photoMinutes) {
+                        ForEach([2, 5, 10, 20, 0], id: \.self) { m in
+                            Text(m == 0 ? "Largest that fits" : "About \(m) min").tag(m)
+                        }
+                    }
+                } header: { Text("Files") } footer: {
+                    Text("A photo starts at the size that goes out in about this time (at the link's SNR), never over what VARA allows. You can still change it before sending.")
                 }
 
                 Section {

@@ -297,6 +297,19 @@ pub enum Command {
     VerboseSnr { on: bool },
     /// Answer the partner's verbose SNR invitation
     VerboseSnrAnswer { accept: bool },
+    /// Offer the partner a file (VarAC `<SF:>`), in a QSO off the calling frequency; the
+    /// data goes when it answers. A picture with `pct` goes through the image shrinker at
+    /// `pct` % and `quality` (0–50, VarAC's 50 by default), as `file_info` previewed it.
+    SendFile {
+        path: String,
+        #[serde(default)]
+        pct: Option<u32>,
+        #[serde(default)]
+        quality: Option<u8>,
+    },
+    /// Stop our file: before the partner accepts, the offer is withdrawn (VarAC `<SFAB>`);
+    /// once the data is going VARA can't take it back, so the link is dropped (ABORT)
+    FileCancel,
 }
 
 pub struct Engine {
@@ -359,6 +372,19 @@ struct Bridge {
     last_snr: Option<f32>,
     /// The "QSY NOW" countdown on screen: when it answers by itself, and the offset (Hz)
     qsy_popup: Option<(std::time::Instant, i32)>,
+    /// The link's bandwidth (Hz), for VARA HF's limits on a file's size
+    link_bw: Option<u16>,
+    /// Our file being sent: its name and how many bytes its data frame puts in VARA's
+    /// buffer (for the progress)
+    sending: Option<SendingFile>,
+}
+
+struct SendingFile {
+    name: String,
+    /// The data frame's size in VARA's TX buffer (`<len> <SFB>base64`)
+    frame_bytes: usize,
+    /// The partner said send it: the data is going out
+    started: bool,
 }
 
 impl Bridge {
@@ -394,6 +420,8 @@ impl Bridge {
             conduct: Conduct::default(),
             last_snr: None,
             qsy_popup: None,
+            link_bw: None,
+            sending: None,
         };
         bridge.sync_policy();
         // The session answers pings with <R+NN> <VW> when we hold mail for the pinger (VarAC)
@@ -776,6 +804,29 @@ impl Bridge {
                 }
                 r
             }
+            Command::SendFile { path, pct, quality } => self.send_file(sess, &path, pct, quality).await,
+            // Before the partner says send it, the offer is withdrawn (<SFAB>). After, VARA
+            // has the data and can't take it back (its CLEANTXBUFFER only reports an empty
+            // buffer, and a DISCONNECT waits for it): only ABORT stops it, ending the QSO
+            Command::FileCancel => {
+                if sess.file_data_going() {
+                    let name = self.sending.take().map(|f| f.name).unwrap_or_default();
+                    system(format!("File transfer stopped: {name}. The link was dropped (VARA can't take back what it's sending)"));
+                    emit(json!({"type": "file_send", "state": "cancelled", "name": name}));
+                    sess.vara.send_command(&VaraCommand::Abort).await
+                } else {
+                    match sess.cancel_outgoing_file().await {
+                        Ok(true) => {
+                            let name = self.sending.take().map(|f| f.name).unwrap_or_default();
+                            system(format!("File offer withdrawn: {name}"));
+                            emit(json!({"type": "file_send", "state": "cancelled", "name": name}));
+                            Ok(())
+                        }
+                        Ok(false) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
             Command::VerboseSnrAnswer { accept } => {
                 let r = sess.answer_verbose_snr(accept).await;
                 if r.is_ok() {
@@ -1114,6 +1165,58 @@ impl Bridge {
         }
     }
 
+    /// `send_file`: offer the file (or the shrunk picture) the VarAC way. Refused off a
+    /// QSO, on a calling frequency (VarAC doesn't send files there), while another file
+    /// of ours is going, and over VARA HF's size limit for the link.
+    async fn send_file(&mut self, sess: &mut VaracSession, path: &str, pct: Option<u32>, quality: Option<u8>) -> std::io::Result<()> {
+        let refuse = |why: &str| {
+            system(format!("Can't send the file: {why}"));
+            emit(json!({"type": "file_send", "state": "refused", "why": why}));
+            Ok(())
+        };
+        if !sess.is_connected() {
+            return refuse("not in a QSO");
+        }
+        if on_calling_freq(self.frequency) {
+            return refuse("files aren't sent on a calling frequency. QSY first");
+        }
+        if self.sending.is_some() || sess.sending_file() {
+            return refuse("a file is already being sent");
+        }
+        let shrink = pct.map(|p| (p, quality.unwrap_or(crate::files::DEFAULT_QUALITY)));
+        let out = match crate::files::outgoing(std::path::Path::new(path), shrink) {
+            Ok(o) => o,
+            Err(e) => return refuse(&e),
+        };
+        let prepared = match bbs::prepare_file(&out.name, &out.data) {
+            Ok(p) => p,
+            Err(e) => return refuse(&e.to_string()),
+        };
+        // VARA HF's limits on the compressed file (VarAC's words)
+        if let Some(limit) = crate::varac::session::attachment_limit(self.link_bw) {
+            if prepared.compressed_size >= limit {
+                let (k, bw) = if limit == 100_000 { ("100K", 500) } else { ("1M", 2300) };
+                return refuse(&format!("VARA HF doesn't allow files over {k} compressed at {bw} Hz ({} bytes)", prepared.compressed_size));
+            }
+        }
+        let frame_bytes = crate::varac::framing::encode_frame(&format!("<SFB>{}", prepared.base64_payload)).len();
+        let compressed = prepared.compressed_size;
+        sess.send_file(prepared).await?;
+        let partner = self.partner.clone().unwrap_or_else(|| "the partner".into());
+        system(format!("File offered to {partner}: {} ({} bytes, {compressed} compressed)", out.name, out.data.len()));
+        emit(json!({"type": "file_send", "state": "offered", "name": out.name, "bytes": out.data.len(), "compressed": compressed}));
+        self.sending = Some(SendingFile { name: out.name, frame_bytes, started: false });
+        Ok(())
+    }
+
+    /// Our file didn't make it (`state`: refused or failed).
+    fn file_send_ended(&mut self, state: &str, why: &str) {
+        if let Some(f) = self.sending.take() {
+            system(format!("File not sent: {} ({why})", f.name));
+            emit(json!({"type": "file_send", "state": state, "name": f.name, "why": why}));
+        }
+    }
+
     fn received_dir(&self) -> PathBuf {
         let dir = PathBuf::from(&self.config.data_dir).join("Received");
         let _ = std::fs::create_dir_all(&dir);
@@ -1129,6 +1232,7 @@ impl Bridge {
                 let partner = if mine(&destination) { source.clone() } else { destination.clone() };
                 let partner = partner.trim_end_matches("-T").trim_end_matches("-t").to_string();
                 let bw = bandwidth.unwrap_or_else(|| self.config.bandwidth.clone());
+                self.link_bw = bw.trim().parse().ok();
                 self.partner = Some(partner.clone());
                 self.slot_cq = None;
                 if let Some(w) = self.slot_wait.take() {
@@ -1193,6 +1297,14 @@ impl Bridge {
             }
             SessionEvent::Disconnected => {
                 system("DISCONNECTED");
+                self.link_bw = None;
+                self.file_send_ended("failed", "the link closed before the file was sent");
+                // A file we said yes to that never all came
+                if self.pending_offer.is_some() && !self.offer_asked {
+                    let name = self.pending_offer.take().map(|o| bbs::strip_gzip_suffix(&o.name).to_string()).unwrap_or_default();
+                    system(format!("File not received: {name} (the link closed)"));
+                    emit(json!({"type": "file_receive_failed"}));
+                }
                 self.conduct = Conduct::default();
                 self.end_qso();
                 self.leave_slot("qso_end");
@@ -1207,6 +1319,10 @@ impl Bridge {
             }
             SessionEvent::BufferUpdate(n) => {
                 emit(json!({"type": "buffer", "bytes": n}));
+                if let Some(total) = self.sending.as_ref().filter(|f| f.started).map(|f| f.frame_bytes) {
+                    let sent = total.saturating_sub(n as usize);
+                    emit(json!({"type": "file_progress", "outgoing": true, "done": sent, "total": total}));
+                }
                 if n == 0 {
                     // What we sent is out: QSO activity (but not our own Call ID)
                     if !std::mem::take(&mut self.conduct.id_on_air) {
@@ -1286,7 +1402,9 @@ impl Bridge {
             SessionEvent::Notice(m) => system(m),
             SessionEvent::FrameId { .. } => {}
             SessionEvent::TxStarted { .. } => {}
-            SessionEvent::RxProgress { .. } => {}
+            SessionEvent::RxProgress { received, total } => {
+                emit(json!({"type": "file_progress", "outgoing": false, "done": received, "total": total}));
+            }
             SessionEvent::HandshakeComplete => {
                 self.conduct.link_open = true;
                 self.offer_mail().await;
@@ -1509,6 +1627,7 @@ impl Bridge {
                 match self.station.policy.file_offer_decision(offer.compressed_size as u64, self.away) {
                     FileOfferDecision::Accept => {
                         system(format!("File {name} accepted automatically"));
+                        emit(json!({"type": "file_incoming", "name": name}));
                         self.pending_offer = Some(offer);
                     }
                     FileOfferDecision::Refuse => {
@@ -1568,6 +1687,7 @@ impl Bridge {
                     }
                     Err(e) => {
                         system(format!("File transfer error: {e}"));
+                        emit(json!({"type": "file_receive_failed"}));
                         if !attachment {
                             if let Some(sess) = self.session.as_mut() {
                                 let _ = sess.send_file_abort().await;
@@ -1576,7 +1696,31 @@ impl Bridge {
                     }
                 }
             }
-            IncomingMessage::BbsFileOk => system("File transfer completed"),
+            // The partner said send it: the data goes out now (the session sent it)
+            IncomingMessage::BbsFileReady => {
+                if let Some(f) = self.sending.as_mut() {
+                    system(format!("{partner} is ready: sending {}", f.name));
+                    f.started = true;
+                    emit(json!({"type": "file_send", "state": "sending", "name": f.name, "total": f.frame_bytes}));
+                }
+            }
+            IncomingMessage::BbsFileOk => {
+                if let Some(f) = self.sending.take() {
+                    system(format!("File transfer completed: {} received it", partner));
+                    emit(json!({"type": "file_send", "state": "done", "name": f.name}));
+                } else {
+                    system("File transfer completed");
+                }
+            }
+            // Ours, when we're sending: the partner declined or dropped it
+            IncomingMessage::BbsFileAborted | IncomingMessage::BbsFileRejected if self.sending.is_some() && self.pending_offer.is_none() => {
+                let started = self.sending.as_ref().is_some_and(|f| f.started);
+                let why = if started { format!("{partner} stopped the transfer") } else { format!("{partner} declined the file") };
+                self.file_send_ended(if started { "failed" } else { "refused" }, &why);
+            }
+            IncomingMessage::BbsFileFailed if self.sending.is_some() => {
+                self.file_send_ended("failed", "FILE TRANSFER FAILED AT DESTINATION! Your partner was given the reason for the failure.");
+            }
             IncomingMessage::BbsFileAborted => {
                 self.pending_offer = None;
                 if std::mem::take(&mut self.offer_asked) {

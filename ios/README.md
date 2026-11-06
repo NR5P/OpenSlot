@@ -11,7 +11,12 @@ A SwiftUI app around the Rust core (`../mobile-core`), with the **XARA modem bui
   QSY requests. Calling a station, you pick the slot to QSY to (VarAC's invitation); VMail
   waits for a QSY off a calling frequency, and after the QSO the app offers to go back.
   Call CQ asks which VarAC slot to wait on for replies, then counts down the wait there
-  (tune the radio to the slot; the phone doesn't) and goes back to the calling frequency
+  (tune the radio to the slot; the phone doesn't) and goes back to the calling frequency.
+  **Send a file or photo** (the paperclip, in a QSO off the calling frequency): the send
+  sheet shows its size, whether VARA allows it on the link (under 100K compressed at 500
+  Hz, 1M at 2300) and how long it takes; a photo goes through VarAC's image shrinker,
+  starting at the largest size that fits. A bar shows the transfer; Stop withdraws the
+  offer, or once the data is going ends the QSO (VARA can't take back what it's sending)
 - **Stations**: stations heard calling CQ or beaconing (tap to connect or ping) and
   broadcasts; call CQ, beacon, broadcast. A CQ that names a slot (VarAC's slot system)
   shows it, and answering asks you to tune the radio to that slot first

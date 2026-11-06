@@ -4,9 +4,13 @@
 //!   cargo run --release --example lab_station -- CONFIG_JSON SCRIPT_JSON SECS
 //!
 //! CONFIG_JSON is the engine config (data_dir, callsign, cmd_port, ...) plus optional
-//! "qsy_slot" (answer for our QSY invitation, default 12), "accept_qsy" (default true) and
+//! "qsy_slot" (answer for our QSY invitation, default 12), "accept_qsy" (default true),
+//! "accept_files" (answer to a file offer: true (default), false, or "ignore" to leave it
+//! to the script) and
 //! "seed_heard": [[call, minutes_ago, snr], ...] (stations put in the heard list first).
-//! SCRIPT_JSON is [[seconds, command], ...]; seconds count from the modem link-up.
+//! SCRIPT_JSON is [[seconds, command], ...]; seconds count from the modem link-up, or with
+//! "script_from_link": true from the first QSO link (a VARA connect can take minutes);
+//! there a negative time counts from start-up (for the connect itself).
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -18,6 +22,10 @@ fn main() {
     let secs: f64 = a[2].parse().expect("seconds");
     let qsy_slot = cfg["qsy_slot"].as_u64().unwrap_or(12);
     let accept_qsy = cfg["accept_qsy"].as_bool().unwrap_or(true);
+    // (None: leave the offer to the script)
+    let accept_files = if cfg["accept_files"] == "ignore" { None } else { Some(cfg["accept_files"].as_bool().unwrap_or(true)) };
+    let from_link = cfg["script_from_link"].as_bool().unwrap_or(false);
+    let mut start: Option<Instant> = None;
 
     // The heard list our last-heard answers come from
     let dir = std::path::PathBuf::from(cfg["data_dir"].as_str().unwrap());
@@ -53,6 +61,9 @@ fn main() {
         }
     };
     cmd(&json!({"cmd": "connect_modem"}));
+    if !from_link {
+        start = Some(t0);
+    }
     let mut queue = script.into_iter().peekable();
     while t0.elapsed().as_secs_f64() < secs {
         while let Some(e) = openslot_mobile::next_event() {
@@ -63,14 +74,25 @@ fn main() {
                 _ => {}
             }
             say("<<", &e);
+            if start.is_none() && v["type"] == "connected" {
+                start = Some(Instant::now());
+            }
             // The prompts a phone's operator would answer
             match v["type"].as_str() {
                 Some("qsy_invite_request") => cmd(&json!({"cmd": "qsy_invite", "slot": qsy_slot})),
                 Some("qsy_request") => cmd(&json!({"cmd": if accept_qsy { "qsy_accept" } else { "qsy_reject" }})),
+                Some("file_offer") => {
+                    if let Some(yes) = accept_files {
+                        cmd(&json!({"cmd": if yes { "file_accept" } else { "file_decline" }}));
+                    }
+                }
                 _ => {}
             }
         }
-        while queue.peek().is_some_and(|(t, _)| t0.elapsed().as_secs_f64() >= *t) {
+        // (a negative time counts from start-up even with script_from_link: the connect)
+        while queue.peek().is_some_and(|(t, _)| {
+            if *t < 0.0 { t0.elapsed().as_secs_f64() >= -*t } else { start.is_some_and(|s0| s0.elapsed().as_secs_f64() >= *t) }
+        }) {
             let (_, c) = queue.next().unwrap();
             if c["q"].is_string() {
                 say("??", &format!("{} -> {}", c, openslot_mobile::query(&c.to_string())));

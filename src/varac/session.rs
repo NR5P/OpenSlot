@@ -1322,6 +1322,10 @@ impl VaracSession {
                         self.file_in_progress = false;
                         let _ = self.start_next_file_job().await;
                     }
+                    // The sender withdrew a file we had said yes to: nothing more is coming
+                    IncomingMessage::BbsFileAborted if self.file_incoming => {
+                        self.file_incoming = false;
+                    }
                     IncomingMessage::QsyAccepted if self.qsy_requested => {
                         // Like VarAC: test the link once both sides have moved
                         self.qsy_requested = false;
@@ -1759,6 +1763,36 @@ impl VaracSession {
     /// Abort a BBS file transfer.
     pub async fn send_file_abort(&mut self) -> Result<(), std::io::Error> {
         self.send_framed("<SFAB>").await
+    }
+
+    /// Withdraw our file offer before the partner answers `<SFRD>`: the partner is told
+    /// `<SFAB>` and a late `<SFRD>` sends nothing. Queued files are dropped too. False when
+    /// there's no offer to withdraw: once the data is going it can't be taken back (VARA's
+    /// CLEANTXBUFFER only reports whether its buffer is empty), only dropping the link
+    /// stops it.
+    #[allow(dead_code)] // the phones
+    pub async fn cancel_outgoing_file(&mut self) -> Result<bool, std::io::Error> {
+        if !self.file_in_progress || self.outgoing_file.is_none() {
+            return Ok(false);
+        }
+        self.outgoing_file = None;
+        self.outgoing_is_vmail = false;
+        self.file_in_progress = false;
+        self.file_jobs.clear();
+        self.send_file_abort().await?;
+        Ok(true)
+    }
+
+    /// Our file's data is on its way (the partner answered `<SFRD>`).
+    #[allow(dead_code)] // the phones
+    pub fn file_data_going(&self) -> bool {
+        self.file_in_progress && self.outgoing_file.is_none()
+    }
+
+    /// Whether a file of ours is offered or on its way.
+    #[allow(dead_code)] // the phones
+    pub fn sending_file(&self) -> bool {
+        self.file_in_progress
     }
 
     /// The file arrived broken (VarAC `<SFFA>`: "FILE TRANSFER FAILED AT DESTINATION").
@@ -4148,6 +4182,92 @@ mod sfm_flow_tests {
             Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
             _ => String::new(),
         }
+    }
+
+    /// Withdrawing our file offer before the partner answers: the partner gets `<SFAB>`, a
+    /// late `<SFRD>` sends nothing, and the next file can go. Once the data is going it
+    /// can't be withdrawn (VARA can't take it back).
+    #[tokio::test]
+    async fn outgoing_file_offer_can_be_withdrawn() {
+        use tokio::io::AsyncWriteExt;
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap(), data.accept().await.unwrap()) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (_c, (mut modem_data, _)) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: "W5TST".into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(ServiceFlags::VMAIL), bbs_dir: None, email_gate: None, bbs_gate: None,
+            policy: Default::default(),
+        };
+        let mut s = VaracSession::new(vara, cfg);
+        s.state = SessionState::Connected;
+        assert!(!s.cancel_outgoing_file().await.unwrap(), "nothing to withdraw yet");
+
+        let file = crate::varac::bbs::prepare_file("a.txt", b"hello file").unwrap();
+        s.send_file(file).await.unwrap();
+        assert!(s.sending_file() && !s.file_data_going());
+        let offer = read_one(&mut modem_data).await;
+        assert!(offer.contains("<SF:a.txt.VarAC_gzip|"), "{offer}");
+        s.tx_done().await; // (the offer is out)
+
+        assert!(s.cancel_outgoing_file().await.unwrap());
+        assert!(!s.sending_file());
+        let mut sent = String::new();
+        for _ in 0..3 {
+            sent.push_str(&read_one(&mut modem_data).await);
+            if sent.contains("<SFAB>") {
+                break;
+            }
+            if let Some(at) = s.tx_resume_at {
+                tokio::time::sleep_until(at).await;
+                let _ = s.pump_tx().await;
+            }
+        }
+        assert!(sent.contains("<SFAB>"), "{sent:?}");
+        s.tx_done().await;
+
+        // the partner's <SFRD> crossed it: no data goes out
+        modem_data.write_all(b"6 <SFRD>").await.unwrap();
+        take_data(&mut s).await;
+        let late = read_one(&mut modem_data).await;
+        assert!(!late.contains("<SFB>"), "{late:?}");
+
+        // the next file goes, and once its data is going it can't be withdrawn
+        let file = crate::varac::bbs::prepare_file("b.txt", b"second").unwrap();
+        s.send_file(file).await.unwrap();
+        let mut offer = read_one(&mut modem_data).await;
+        if !offer.contains("<SF:b.txt") {
+            if let Some(at) = s.tx_resume_at {
+                tokio::time::sleep_until(at).await;
+                let _ = s.pump_tx().await;
+            }
+            offer.push_str(&read_one(&mut modem_data).await);
+        }
+        assert!(offer.contains("<SF:b.txt"), "{offer:?}");
+        s.tx_done().await;
+        modem_data.write_all(b"6 <SFRD>").await.unwrap();
+        take_data(&mut s).await;
+        assert!(s.file_data_going());
+        let data = read_one(&mut modem_data).await;
+        assert!(data.contains("<SFB>"), "the data went: {data:?}");
+        assert!(!s.cancel_outgoing_file().await.unwrap());
+        assert!(s.sending_file(), "still sending: VARA has the data");
+    }
+
+    /// Run the session until it has read what the modem sent (its own queued events first).
+    async fn take_data(s: &mut VaracSession) {
+        for _ in 0..20 {
+            let input = tokio::time::timeout(std::time::Duration::from_millis(500), s.next_input()).await
+                .expect("the modem's data never came").unwrap();
+            let data = matches!(input, SessionInput::Data(_));
+            s.handle_input(input).await;
+            if data {
+                return;
+            }
+        }
+        panic!("no data from the modem");
     }
 
     /// VMail with attachment, as in VarAC: `<SQ>` once, wait up to 60 s, partner needs `V`.

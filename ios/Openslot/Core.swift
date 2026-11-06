@@ -15,6 +15,7 @@ enum Keys {
     static let callIdMinutes = "callIdMinutes", idleMinutes = "idleMinutes"
     static let allowLastHeard = "allowLastHeard", multiBandLastHeard = "multiBandLastHeard"
     static let myFrequencies = "myFrequencies"  // the picker's "My frequencies" (JSON)
+    static let photoMinutes = "photoMinutes"  // a photo's starting size: about this many minutes to send (0: largest)
     // The Modem tab's other XARA settings, as the NR5P XARA app
     static let monitor = "monitor", monitorFrames = "monitorFrames", monitorCalls = "monitorCalls"
     static let debugLog = "debugLog", recordAudio = "recordAudio", lan = "lan", uiControl = "uiControl"
@@ -79,6 +80,7 @@ struct Settings {
     var rigctld: String { Self.d.string(forKey: Keys.rigctld) ?? "192.168.1.10:4532" }
     var driveDb: Double { Self.d.object(forKey: Keys.driveDb) as? Double ?? -5 }
     var allowBuiltIn: Bool { Self.d.bool(forKey: Keys.allowBuiltIn) }
+    var photoMinutes: Int { Self.d.object(forKey: Keys.photoMinutes) as? Int ?? 5 }
     var registered: Bool { Self.d.bool(forKey: Keys.registered) }
     var monitor: Bool { Self.d.bool(forKey: Keys.monitor) }
     var monitorFrames: Bool { Self.d.bool(forKey: Keys.monitorFrames) }
@@ -237,6 +239,26 @@ struct VMailItem: Identifiable, Hashable {
     let urgent: Bool
 }
 
+/// A file going over the link: ours (`outgoing`) or the partner's. `total` is 0 while our
+/// offer waits for the partner's answer.
+struct FileTransfer: Equatable {
+    var name: String
+    var outgoing: Bool
+    var done: Int
+    var total: Int
+    /// When the data started moving and how much was there then, for the time left
+    var started: Date?
+    var startDone = 0
+    var fraction: Double { total > 0 ? min(1, Double(done) / Double(total)) : 0 }
+    /// Seconds to go at the speed so far (nil until there's enough to tell)
+    var timeLeft: TimeInterval? {
+        guard let started, done > startDone, done < total else { return nil }
+        let secs = Date().timeIntervalSince(started)
+        guard secs >= 5 else { return nil }
+        return Double(total - done) / (Double(done - startDone) / secs)
+    }
+}
+
 /// The Rust core (protocol, session, storage) and the built-in XARA modem, as the UI sees them.
 @MainActor
 final class Core: ObservableObject {
@@ -259,6 +281,11 @@ final class Core: ObservableObject {
     @Published private(set) var unread = 0
     @Published private(set) var vmailRevision = 0
     @Published var fileOffer: String?
+    /// A file going out or coming in on this link (the Chat screen's transfer bar)
+    @Published private(set) var transfer: FileTransfer?
+    /// VARA's last SNR report, for the send sheet's time estimate
+    private(set) var lastSnr = 0
+    private var incomingName: String?
     @Published var qsyRequest: String?
     /// Verbose SNR is running on this link (an SNR report each minute)
     @Published private(set) var verboseSnr = false
@@ -493,6 +520,37 @@ final class Core: ObservableObject {
         send(["cmd": "connect", "call": h.call, "slot_hz": hz])
     }
 
+    // MARK: files
+
+    /// The send sheet's preview of a file (the engine's file_info): sizes, whether it fits
+    /// the link, the time it takes, and for a picture the shrinker's result at `pct` (nil:
+    /// the largest size that fits). Shrinking a photo takes a moment: run off the main thread.
+    nonisolated static func fileInfo(path: String, bandwidth: String, snr: Int, pct: Int?, quality: Int, minutes: Int) async -> [String: Any] {
+        var q: [String: Any] = ["q": "file_info", "path": path, "bandwidth": bandwidth, "snr": snr, "quality": quality, "minutes": minutes]
+        if let pct { q["pct"] = pct }
+        guard let data = try? JSONSerialization.data(withJSONObject: q),
+              let json = String(data: data, encoding: .utf8) else { return ["error": "The file couldn't be read."] }
+        let answer: String = await Task.detached(priority: .userInitiated) {
+            guard let out = openslot_query(json) else { return "" }
+            defer { openslot_free(out) }
+            return String(cString: out)
+        }.value
+        return (try? JSONSerialization.jsonObject(with: Data(answer.utf8))) as? [String: Any]
+            ?? ["error": "The file couldn't be read."]
+    }
+
+    /// The bandwidth the link runs at (else the one set), for the file limits.
+    var fileBandwidth: String { linkBandwidth.isEmpty ? Settings().bandwidth : linkBandwidth }
+
+    /// Offer the partner a file; a picture with `pct` goes through the image shrinker.
+    func sendFile(path: String, pct: Int?, quality: Int) {
+        var c: [String: Any] = ["cmd": "send_file", "path": path]
+        if let pct { c["pct"] = pct; c["quality"] = quality }
+        send(c)
+    }
+
+    func cancelFile() { send(["cmd": "file_cancel"]) }
+
     func sendVMail(to: String, subject: String, body: String, urgent: Bool) {
         send(["cmd": "vmail", "to": to, "subject": subject, "body": body, "urgent": urgent])
     }
@@ -649,6 +707,7 @@ final class Core: ObservableObject {
             linkBandwidth = e["bandwidth"] as? String ?? ""
             partnerInfo = ""
         case "disconnected":
+            transfer = nil
             partner = nil
             partnerInfo = ""
             partnerTyping = false
@@ -690,10 +749,38 @@ final class Core: ObservableObject {
             unread = (query(["q": "unread"]) as? Int) ?? 0
             vmailRevision += 1
         case "file_offer":
+            incomingName = e["name"] as? String
             fileOffer = "\(e["name"] as? String ?? "a file") (\(e["size"] ?? 0) bytes)"
                 + ((e["attachment"] as? Bool ?? false) ? ", over your incoming files size limit. Rejecting it rejects the whole VMail" : "")
         case "file_offer_closed":
             fileOffer = nil
+            incomingName = nil
+        case "file_incoming":
+            incomingName = e["name"] as? String
+        case "file_send":
+            let name = e["name"] as? String ?? "file"
+            switch e["state"] as? String {
+            case "offered":
+                transfer = FileTransfer(name: name, outgoing: true, done: 0, total: 0)
+            case "sending":
+                transfer = FileTransfer(name: name, outgoing: true, done: 0, total: e["total"] as? Int ?? 0, started: Date())
+            default: // done, refused, failed, cancelled (the chat says which)
+                if transfer?.outgoing == true { transfer = nil }
+            }
+        case "file_progress":
+            let outgoing = e["outgoing"] as? Bool ?? false
+            let done = e["done"] as? Int ?? 0, total = e["total"] as? Int ?? 0
+            if outgoing {
+                if transfer?.outgoing == true { transfer?.done = done; transfer?.total = total }
+            } else if transfer?.outgoing != true {
+                transfer = FileTransfer(name: incomingName ?? "file", outgoing: false, done: done, total: total,
+                                        started: Date(), startDone: done)
+            }
+        case "file_saved", "file_receive_failed":
+            if transfer?.outgoing == false { transfer = nil }
+            incomingName = nil
+        case "snr":
+            if let db = e["db"] as? Double { lastSnr = Int(db.rounded()) }
         case "qsy_request":
             if let hz = e["offset_hz"] as? Int {
                 qsyRequest = String(format: "QSY %+d Hz", hz)

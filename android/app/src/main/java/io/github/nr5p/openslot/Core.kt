@@ -98,6 +98,8 @@ class Prefs(context: Context) {
     var cqSlot by int("cqSlot", 11)
     var cqSlotWait by int("cqSlotWait", 300)
     var skipSlotSelector by bool("skipSlotSelector", false)
+    /** A photo's starting size: about this many minutes to send (0: the largest that fits). */
+    var photoMinutes by int("photoMinutes", 5)
     /** Profile and QSO conduct (Settings), as VarAC. */
     var email by string("email", "")
     var fullCall by string("fullCall", "")
@@ -281,6 +283,23 @@ data class VMailItem(
     val time: String, val read: Boolean, val urgent: Boolean,
 )
 
+/** A file going over the link: ours ([outgoing]) or the partner's. [total] is 0 while our
+ *  offer waits for the partner's answer. */
+data class FileTransfer(
+    val name: String, val outgoing: Boolean, val done: Long, val total: Long,
+    /** When the data started moving (epoch ms) and how much was there then, for the time left */
+    val started: Long = 0, val startDone: Long = 0,
+) {
+    val fraction: Float get() = if (total > 0) (done.toFloat() / total).coerceAtMost(1f) else 0f
+    /** Seconds to go at the speed so far (null until there's enough to tell). */
+    val timeLeft: Double? get() {
+        if (started == 0L || done <= startDone || done >= total) return null
+        val secs = (System.currentTimeMillis() - started) / 1000.0
+        if (secs < 5) return null
+        return (total - done) / ((done - startDone) / secs)
+    }
+}
+
 /** The engine and the built-in modem, as the UI sees them. */
 object Core {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -305,6 +324,13 @@ object Core {
     val unread = MutableStateFlow(0)
     val vmailRevision = MutableStateFlow(0)
     val fileOffer = MutableStateFlow<String?>(null)
+    /** A file going out or coming in on this link (the Chat screen's transfer bar). */
+    val transfer = MutableStateFlow<FileTransfer?>(null)
+    /** VARA's last SNR report, for the send sheet's time estimate. */
+    var lastSnr = 0
+        private set
+    private var incomingName: String? = null
+    private var linkBandwidth = ""
     val qsyRequest = MutableStateFlow<String?>(null)
     /** Verbose SNR is running on this link (an SNR report each minute). */
     val verboseSnr = MutableStateFlow(false)
@@ -375,6 +401,30 @@ object Core {
     }
 
     fun query(q: JSONObject): String = Native.query(q.toString().utf8()).text()
+
+    // ---- files ----
+
+    /** The bandwidth the link runs at (else the one set), for the file limits. */
+    val fileBandwidth: String get() = linkBandwidth.ifEmpty { bandwidth.value }
+
+    /** The send sheet's preview of a file (the engine's file_info): sizes, whether it fits
+     *  the link, the time it takes, and for a picture the shrinker's result at [pct] (null:
+     *  the largest size that fits). Shrinking a photo takes a moment: off the main thread. */
+    suspend fun fileInfo(path: String, pct: Int?, quality: Int): JSONObject = withContext(Dispatchers.Default) {
+        val q = JSONObject().put("q", "file_info").put("path", path).put("bandwidth", fileBandwidth)
+            .put("snr", lastSnr).put("quality", quality).put("minutes", prefs.photoMinutes)
+        if (pct != null) q.put("pct", pct)
+        runCatching { JSONObject(query(q)) }.getOrElse { JSONObject().put("error", "The file couldn't be read.") }
+    }
+
+    /** Offer the partner a file; a picture with [pct] goes through the image shrinker. */
+    fun sendFile(path: String, pct: Int?, quality: Int) {
+        val c = JSONObject().put("cmd", "send_file").put("path", path)
+        if (pct != null) c.put("pct", pct).put("quality", quality)
+        send(c)
+    }
+
+    fun cancelFile() = send("file_cancel")
 
     // ---- going on the air ----
 
@@ -702,10 +752,13 @@ object Core {
             }
             "connected" -> {
                 qsyBack.value = null
+                linkBandwidth = e.optString("bandwidth")
                 partner.value = e.optString("call")
                 partnerInfo.value = ""
             }
             "disconnected" -> {
+                transfer.value = null
+                linkBandwidth = ""
                 partner.value = null
                 partnerInfo.value = ""
                 typing.value = false
@@ -745,9 +798,41 @@ object Core {
                 refreshUnread()
                 vmailRevision.value++
             }
-            "file_offer" -> fileOffer.value = "${e.optString("name")} (${e.optLong("size")} bytes)" +
-                if (e.optBoolean("attachment")) ", over your incoming files size limit. Rejecting it rejects the whole VMail" else ""
-            "file_offer_closed" -> fileOffer.value = null
+            "file_offer" -> {
+                incomingName = e.optString("name")
+                fileOffer.value = "${e.optString("name")} (${e.optLong("size")} bytes)" +
+                    if (e.optBoolean("attachment")) ", over your incoming files size limit. Rejecting it rejects the whole VMail" else ""
+            }
+            "file_offer_closed" -> {
+                fileOffer.value = null
+                incomingName = null
+            }
+            "file_incoming" -> incomingName = e.optString("name")
+            "file_send" -> {
+                val name = e.optString("name", "file")
+                when (e.optString("state")) {
+                    "offered" -> transfer.value = FileTransfer(name, true, 0, 0)
+                    "sending" -> transfer.value = FileTransfer(name, true, 0, e.optLong("total"), System.currentTimeMillis())
+                    // done, refused, failed, cancelled (the chat says which)
+                    else -> if (transfer.value?.outgoing == true) transfer.value = null
+                }
+            }
+            "file_progress" -> {
+                val t = transfer.value
+                if (e.optBoolean("outgoing")) {
+                    if (t?.outgoing == true) transfer.value = t.copy(done = e.optLong("done"), total = e.optLong("total"))
+                } else if (t?.outgoing != true) {
+                    transfer.value = FileTransfer(
+                        incomingName ?: "file", false, e.optLong("done"), e.optLong("total"),
+                        System.currentTimeMillis(), e.optLong("done"),
+                    )
+                }
+            }
+            "file_saved", "file_receive_failed" -> {
+                if (transfer.value?.outgoing == false) transfer.value = null
+                incomingName = null
+            }
+            "snr" -> lastSnr = Math.round(e.optDouble("db", lastSnr.toDouble())).toInt()
             "qsy_request" -> qsyRequest.value = if (e.has("offset_hz")) {
                 String.format(Locale.US, "QSY %+d Hz", e.optInt("offset_hz"))
             } else {

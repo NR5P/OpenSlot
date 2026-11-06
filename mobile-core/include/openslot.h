@@ -19,7 +19,12 @@
 //   clear_tx_buffer, set_frequency{hz}, policy{any config field from allow_info on},
 //   verbose_snr{on}, verbose_snr_answer{accept}, qsy_request{offset_hz},
 //   qsy_invite{slot}, inquire{what: last_heard|last_heard_call|parked|locator|gps|
-//   version|schedule, call?}, return_cf{hz}, connect{call, slot_hz?}
+//   version|schedule, call?}, return_cf{hz}, connect{call, slot_hz?},
+//   send_file{path, pct?, quality?}, file_cancel
+//   (send_file offers the file in a QSO off a calling frequency, VarAC's way; a picture
+//   with pct goes through the image shrinker at pct % and quality 0-50, default 50;
+//   file_cancel withdraws the offer, or once the data is going drops the link: VARA can't
+//   take back data it has)
 //   (connect, ping, cq and beacon are refused at 2300/2750 Hz on a calling frequency;
 //   a cq naming a VarAC slot is followed by a wait there, see slot_wait)
 // Events (openslot_next_event), {"type": ...}:
@@ -27,7 +32,10 @@
 //   chat{from, text, outgoing, time}, system{text, time}, typing, opening{call, snr, name,
 //   qth, locator}, cq{call, source, bandwidth, beacon, slot, slot_label?, slot_hz?, time},
 //   broadcast{from, to, message, time}, vmail{from, subject, parked}, vmail_changed,
-//   file_offer{name, size}, file_saved{path}, qsy_request{offset_hz | freq_hz},
+//   file_offer{name, size}, file_incoming{name}, file_saved{path}, file_receive_failed,
+//   file_send{state: offered|sending|done|refused|failed|cancelled, name?, why?, bytes?,
+//   compressed?, total?}, file_progress{outgoing, done, total},
+//   qsy_request{offset_hz | freq_hz},
 //   qsy{offset_hz}, ptt{on}, busy{on}, buffer{bytes}, snr{db}, snr_report{db},
 //   verbose_snr{on}, verbose_snr_invite{call},
 //   slot_wait{slot, label, hz, cf_hz, seconds}, slot_wait_end{why}, cf_return{cf_hz, why},
@@ -35,7 +43,12 @@
 //   log{text}
 // Queries (openslot_query), {"q": ...}:
 //   vmails{folder: inbox|sent|outbox|parking}, vmail_read{guid}, vmail_delete{guid},
-//   unread, qsos, heard, chat_history{call}, adif
+//   unread, qsos, heard, chat_history{call}, adif,
+//   file_info{path, bandwidth, snr?, pct?, quality?, minutes?} (no engine needed; a
+//   picture without pct starts at the size that sends in about `minutes`, default 5,
+//   0 = the largest VARA allows): {name, bytes,
+//   compressed, fits, estimate, limit, image, w?, h?, shrunk?{pct, quality, name, bytes,
+//   compressed, fits, estimate, w, h}} or {error}
 
 #ifndef OPENSLOT_H
 #define OPENSLOT_H

@@ -186,7 +186,9 @@ pub enum GuiCommand {
 #[derive(Debug, Clone)]
 pub struct RxFile {
     pub name: String,
+    /// The partner (the file comes from it, or goes to it when `outgoing`)
     pub from: Option<String>,
+    pub outgoing: bool,
     /// The file's gzip size (from the offer) and the frame's length on the air (base64)
     pub file_bytes: usize,
     pub total: usize,
@@ -484,6 +486,8 @@ pub struct SettingsForm {
     pub send_relay_notifications: bool,
     pub allow_parking: bool,
     pub incoming_files_size_limit: String,
+    /// The image shrinker starts at about this many minutes to send (0: largest that fits)
+    pub photo_send_minutes: u32,
     pub emcomm_auto_reply_checkin: bool,
     pub email: String,
     pub full_callsign: String,
@@ -571,6 +575,12 @@ pub struct GuiState {
     pub file_accepted: bool,
     /// The file coming in now (or just finished), for the download card.
     pub rx_file: Option<RxFile>,
+    /// Our file going out now (or just finished), for the upload card; its name and gzip
+    /// size wait in `tx_file_next` from SEND until its data goes on the air.
+    pub tx_file: Option<RxFile>,
+    pub tx_file_next: Option<(String, usize)>,
+    /// The Send File window's look at the chosen file: (path, bytes, gzip size)
+    pub file_send_info: Option<(String, usize, usize)>,
     /// Files attached in the VMail compose window.
     pub compose_attachments: Vec<std::path::PathBuf>,
     /// Where the last VMail attachment zip was unpacked (noted on the VMail).
@@ -1098,6 +1108,9 @@ impl GuiState {
             pending_vmail_attachment: false,
             file_accepted: false,
             rx_file: None,
+            tx_file: None,
+            tx_file_next: None,
+            file_send_info: None,
             compose_attachments: Vec::new(),
             last_attachment_dir: None,
             compose_open: false,
@@ -1380,6 +1393,7 @@ impl GuiState {
                 send_relay_notifications: true,
                 allow_parking: true,
                 incoming_files_size_limit: "5000".into(),
+                photo_send_minutes: crate::varac::images::PHOTO_MINUTES_DEFAULT,
                 emcomm_auto_reply_checkin: true,
                 email: String::new(),
                 full_callsign: String::new(),
@@ -1610,6 +1624,57 @@ impl GuiState {
             return true;
         }
         false
+    }
+
+    /// Our file's data went to the modem (`text` is the frame, `bytes` its length): the
+    /// upload card starts. A VMail's attachment shows as its VMail instead.
+    pub fn tx_file_started(&mut self, text: &str, bytes: usize) {
+        if !text.starts_with("<SFB>") || text.contains("<SM") {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let (name, gz) = self.tx_file_next.take().unwrap_or_else(|| ("File".into(), bytes * 3 / 4));
+        self.tx_file = Some(RxFile {
+            name,
+            from: self.connected_to.clone(),
+            outgoing: true,
+            file_bytes: gz,
+            total: bytes,
+            received: 0,
+            started: now,
+            samples: vec![(now, 0)],
+            done: None,
+        });
+    }
+
+    /// VARA's BUFFER report: what has left the buffer of our file is on its way.
+    pub fn tx_file_buffer(&mut self, buffered: usize) {
+        if let Some(f) = self.tx_file.as_mut().filter(|f| f.done.is_none()) {
+            let sent = f.total.saturating_sub(buffered);
+            if sent > f.received {
+                f.received = sent;
+                f.samples.push((std::time::Instant::now(), sent));
+            }
+        }
+    }
+
+    /// Our file is over: the partner has it all (`ok`), or it stopped.
+    pub fn tx_file_ended(&mut self, ok: bool) {
+        if let Some(f) = self.tx_file.as_mut().filter(|f| f.done.is_none()) {
+            if ok {
+                f.received = f.total;
+            }
+            f.done = Some((std::time::Instant::now(), ok));
+        }
+    }
+
+    /// What a file is judged on before it goes: VARA HF's limit on the compressed file at
+    /// the modem's bandwidth (none on VARA FM), the last SNR, the bandwidth and FM.
+    pub fn send_conditions(&self) -> (Option<usize>, i32, u32, bool) {
+        let fm = self.settings_form.vara_modem_type == "VaraFM";
+        let bw = self.cq_bandwidth();
+        let limit = if fm { None } else { crate::varac::session::attachment_limit(Some(bw)) };
+        (limit, self.snr_last.map(|s| s.round() as i32).unwrap_or(0), bw as u32, fm)
     }
 
     /// The bandwidth our CQs and beacons announce: the modem's.
@@ -2611,13 +2676,60 @@ mod auto_tune_tests {
         }
     }
 
+    /// The upload card: starts when our file's data goes to the modem (not a VMail's), follows
+    /// the modem's buffer reports and ends when the partner has it, or doesn't.
+    #[test]
+    fn tx_file_card_follows_the_modem() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut st = GuiState::new("NR5P".into(), true, tx);
+        st.connected_to = Some("W5TST".into());
+        st.tx_file_started("hello", 5);
+        st.tx_file_started("<SFB>xx<SM><TME:1>", 100);
+        assert!(st.tx_file.is_none(), "chat and VMail frames don't start it");
+        st.tx_file_next = Some(("log.txt".into(), 600));
+        st.tx_file_started("<SFB>QUJD", 805);
+        let f = st.tx_file.as_ref().unwrap();
+        assert!(f.outgoing && f.name == "log.txt" && f.file_bytes == 600 && f.total == 805 && f.from.as_deref() == Some("W5TST"));
+        assert!(st.tx_file_next.is_none());
+        st.tx_file_buffer(805); // (nothing out yet)
+        st.tx_file_buffer(500);
+        st.tx_file_buffer(600); // (a report that goes back doesn't)
+        assert_eq!(st.tx_file.as_ref().unwrap().received, 305);
+        assert_eq!(st.tx_file.as_ref().unwrap().samples.len(), 2);
+        st.tx_file_ended(true);
+        let f = st.tx_file.as_ref().unwrap();
+        assert_eq!((f.received, f.done.map(|d| d.1)), (805, Some(true)));
+        // a later report or end doesn't touch a finished card
+        st.tx_file_buffer(0);
+        st.tx_file_ended(false);
+        assert_eq!(st.tx_file.as_ref().unwrap().done.map(|d| d.1), Some(true));
+        // a file with no name noted (sent from elsewhere) still gets a card
+        st.tx_file_started("<SFB>QUJD", 400);
+        assert_eq!((st.tx_file.as_ref().unwrap().name.as_str(), st.tx_file.as_ref().unwrap().file_bytes), ("File", 300));
+        st.tx_file_ended(false);
+        assert_eq!(st.tx_file.as_ref().unwrap().done.map(|d| d.1), Some(false));
+    }
+
+    #[test]
+    fn send_conditions_follow_the_modem() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut st = GuiState::new("NR5P".into(), true, tx);
+        st.settings_form.bandwidth = "500".into();
+        st.snr_last = Some(7.4);
+        assert_eq!(st.send_conditions(), (Some(100_000), 7, 500, false));
+        st.settings_form.bandwidth = "2300".into();
+        assert_eq!(st.send_conditions().0, Some(1_000_000));
+        st.settings_form.vara_modem_type = "VaraFM".into();
+        assert_eq!(st.send_conditions().0, None, "no HF limit on VARA FM");
+    }
+
     /// The download card's speed: over the last minute of deliveries, none before a second.
     #[test]
     fn rx_file_speed() {
         let t0 = std::time::Instant::now();
         let s = |secs: u64, n: usize| (t0 + std::time::Duration::from_secs(secs), n);
         let mut f = RxFile {
-            name: "f".into(), from: None, file_bytes: 0, total: 10_000, received: 0,
+            name: "f".into(), from: None, outgoing: false, file_bytes: 0, total: 10_000, received: 0,
             started: t0, samples: vec![s(0, 0)], done: None,
         };
         assert_eq!(f.bps(), None, "one sample: no speed yet");

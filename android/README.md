@@ -8,7 +8,8 @@ VARA licence)**, showing other stations' traffic, debug log and recording, clien
 local network, web UI control), and its Web UI (waterfall and status), Received and Log
 pages.
 The Chat screen has the desktop's dial frequency picker (type one, pick a VarAC calling
-frequency or one of your own) and the 500/2300/2750 Hz bandwidth buttons.
+frequency or one of your own) and the 500/2300/2750 Hz bandwidth buttons, and sends files
+and photos as the iOS app does (the paperclip; a photo goes through VarAC's image shrinker).
 
 Plug the radio's USB audio interface (a Digirig or similar) into the phone and pick it
 as *Audio in* and *Audio out* on the Modem tab (a USB device is chosen by default). PTT is VOX

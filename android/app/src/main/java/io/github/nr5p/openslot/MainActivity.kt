@@ -13,8 +13,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.ui.draw.clip
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -511,7 +513,34 @@ fun ChatScreen() {
     val connected by Core.modemConnected.collectAsState()
     val typing by Core.typing.collectAsState()
     val verboseSnr by Core.verboseSnr.collectAsState()
+    val transfer by Core.transfer.collectAsState()
     var callTo by remember { mutableStateOf("") }
+    // Sending a file: pick it (a document, or a photo), copy it in, then the send dialog
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var outgoing by remember { mutableStateOf<String?>(null) }
+    var pickError by remember { mutableStateOf<String?>(null) }
+    var attachMenu by remember { mutableStateOf(false) }
+    fun picked(copy: suspend () -> String) {
+        scope.launch {
+            runCatching { copy() }.onSuccess { outgoing = it }.onFailure { pickError = it.message ?: "The file couldn't be read." }
+        }
+    }
+    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) picked { Outgoing.copyFile(context, uri) }
+    }
+    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) picked { Outgoing.copyPhoto(context, uri) }
+    }
+    outgoing?.let { SendFileDialog(it) { outgoing = null } }
+    pickError?.let {
+        AlertDialog(
+            onDismissRequest = { pickError = null },
+            title = { Text("Can't send that") },
+            text = { Text(it) },
+            confirmButton = { TextButton({ pickError = null }) { Text("OK") } },
+        )
+    }
     var askLastHeard by remember { mutableStateOf(false) }
     var lastHeardCall by remember { mutableStateOf("") }
     if (askLastHeard) {
@@ -596,7 +625,20 @@ fun ChatScreen() {
         if (typing && p != null) {
             Text("$p is typing…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 12.dp))
         }
+        transfer?.let { TransferBar(it, p) }
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box {
+                IconButton({ attachMenu = true }, enabled = p != null && transfer == null) {
+                    Icon(Icons.Default.AttachFile, "Send a file")
+                }
+                DropdownMenu(attachMenu, { attachMenu = false }) {
+                    DropdownMenuItem({ Text("File") }, { attachMenu = false; pickFile.launch(arrayOf("*/*")) })
+                    DropdownMenuItem({ Text("Photo") }, {
+                        attachMenu = false
+                        pickPhoto.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    })
+                }
+            }
             OutlinedTextField(
                 text,
                 {
@@ -845,6 +887,8 @@ fun SettingsScreen() {
     var allowLastHeard by remember { mutableStateOf(prefs.allowLastHeard) }
     var multiBandLastHeard by remember { mutableStateOf(prefs.multiBandLastHeard) }
     var cqSlotWait by remember { mutableStateOf(prefs.cqSlotWait.toString()) }
+    var photoMinutes by remember { mutableStateOf(prefs.photoMinutes) }
+    var photoMenu by remember { mutableStateOf(false) }
     var showLog by remember { mutableStateOf(false) }
     fun save() {
         prefs.call = call.trim().uppercase(); prefs.name = name; prefs.qth = qth; prefs.locator = locator.uppercase()
@@ -930,6 +974,22 @@ fun SettingsScreen() {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
         Text("A CQ names the slot you'll wait on for replies, then you go back to the calling " +
             "frequency. With the selector skipped, CQs name no slot.", style = MaterialTheme.typography.bodySmall)
+
+        Header("Files")
+        fun photoLabel(m: Int) = if (m == 0) "Largest that fits" else "About $m min"
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Photos: send in", Modifier.weight(1f))
+            Box {
+                OutlinedButton({ photoMenu = true }) { Text(photoLabel(photoMinutes)) }
+                DropdownMenu(photoMenu, { photoMenu = false }) {
+                    listOf(2, 5, 10, 20, 0).forEach { m ->
+                        DropdownMenuItem({ Text(photoLabel(m)) }, { photoMinutes = m; prefs.photoMinutes = m; photoMenu = false })
+                    }
+                }
+            }
+        }
+        Text("A photo starts at the size that goes out in about this time (at the link's SNR), never over what " +
+            "VARA allows. You can still change it before sending.", style = MaterialTheme.typography.bodySmall)
 
         Header("Radio")
         OutlinedTextField(frequency, { frequency = it.filter(Char::isDigit) }, Modifier.fillMaxWidth(), label = { Text("Dial frequency (Hz)") },

@@ -882,9 +882,9 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
         sh.dirty = false;
         sh.result = Some(crate::varac::images::shrink(&sh.original, sh.pct, sh.quality, sh.overlay.then_some(overlay_text.as_str())));
     }
-    let snr = state.snr_last.map(|s| s.round() as i32).unwrap_or(0);
-    let bw: u32 = state.settings_form.bandwidth.trim().parse().unwrap_or(500);
-    let fm = state.settings_form.vara_modem_type == "VaraFM";
+    let (limit, snr, bw, fm) = state.send_conditions();
+    let gz = |d: &[u8]| crate::varac::bbs::compress(d).map(|c| c.len()).unwrap_or(d.len());
+    let air = |d: &[u8]| crate::varac::images::air_bytes(gz(d));
 
     egui::Window::new("Image shrinker")
         .open(&mut open)
@@ -892,10 +892,15 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
         .show(ctx, |ui| {
             ui.label(RichText::new(sh.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).strong());
             ui.label(RichText::new(format!("Original: {} Bytes, {} X {} — {}", sh.original.len(), sh.size.0, sh.size.1,
-                crate::varac::images::time_estimate(sh.original.len(), snr, bw, fm))).small().color(GRAY));
+                // (a picture hardly compresses: its own size, not gzipping megabytes every frame)
+                crate::varac::images::time_estimate(crate::varac::images::air_bytes(sh.original.len()), snr, bw, fm))).small().color(GRAY));
+            ui.label(RichText::new(format!(
+                "Starts at the size that sends in {} (Settings → Files)",
+                crate::varac::images::photo_minutes_label(state.settings_form.photo_send_minutes)
+            )).small().color(GRAY));
             ui.add_space(6.0);
             // (recompressed when the slider is let go, not on every step of a drag)
-            let r = ui.add(egui::Slider::new(&mut sh.pct, 1..=100).step_by(5.0).text("Resolution %"));
+            let r = ui.add(egui::Slider::new(&mut sh.pct, 1..=100).text("Resolution %"));
             if r.drag_stopped() || (r.changed() && !r.dragged()) {
                 sh.dirty = true;
             }
@@ -910,7 +915,10 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
             match &sh.result {
                 Some(Ok((jpg, w, h))) => {
                     ui.label(RichText::new(format!("Compressed: {} Bytes, {w} X {h} — {}", jpg.len(),
-                        crate::varac::images::time_estimate(jpg.len(), snr, bw, fm))).strong().color(theme::GREEN));
+                        crate::varac::images::time_estimate(air(jpg), snr, bw, fm))).strong().color(theme::GREEN));
+                    if let Some(l) = limit.filter(|l| gz(jpg) >= *l) {
+                        ui.colored_label(RED, format!("Too big: VARA HF allows under {} KB compressed at {bw} Hz. Shrink it more.", l / 1000));
+                    }
                 }
                 Some(Err(e)) => {
                     ui.colored_label(RED, format!("Can't compress: {e}"));
@@ -919,10 +927,12 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Send original").clicked() {
+                let under = |n: usize| limit.is_none_or(|l| n < l);
+                if ui.add_enabled(under(sh.original.len()), egui::Button::new("Send original")).clicked() {
                     action = Some(false);
                 }
-                if ui.add_enabled(matches!(sh.result, Some(Ok(_))), egui::Button::new(RichText::new("Send compressed").strong())).clicked() {
+                let ok = matches!(&sh.result, Some(Ok((jpg, ..))) if under(gz(jpg)));
+                if ui.add_enabled(ok, egui::Button::new(RichText::new("Send compressed").strong())).clicked() {
                     action = Some(true);
                 }
                 if ui.button("Save compressed…").clicked() {
@@ -944,6 +954,8 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
     match action {
         Some(false) => {
             state.sent_files.push(sh.path.clone());
+            let name = sh.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            state.tx_file_next = Some((name, sh.original.len()));
             state.send_cmd(GuiCommand::SendFile(sh.path.clone()));
             state.status_msg = format!("Sending file: {}", sh.path.display());
         }
@@ -962,6 +974,7 @@ pub fn draw_shrinker(ctx: &egui::Context, state: &mut GuiState) {
                 };
                 state.sent_files.push(target.clone());
                 state.status_msg = format!("Sending file: {}", target.display());
+                state.tx_file_next = Some((name, gz(jpg)));
                 state.send_cmd(GuiCommand::SendFile(target));
             }
         }

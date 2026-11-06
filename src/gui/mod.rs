@@ -329,6 +329,7 @@ impl VaracApp {
                 f.send_relay_notifications = cfg.send_relay_notifications.unwrap_or(true);
                 f.allow_parking = cfg.allow_parking.unwrap_or(true);
                 f.incoming_files_size_limit = cfg.incoming_files_size_limit.unwrap_or(5000).to_string();
+                f.photo_send_minutes = cfg.photo_send_minutes.unwrap_or(crate::varac::images::PHOTO_MINUTES_DEFAULT);
                 f.emcomm_auto_reply_checkin = cfg.emcomm_auto_reply_checkin.unwrap_or(true);
                 if let Some(v) = cfg.call_id_minutes { f.call_id_minutes = v.to_string(); }
                 if let Some(v) = cfg.idle_disconnect_minutes { f.idle_disconnect_minutes = v.to_string(); }
@@ -763,6 +764,8 @@ impl VaracApp {
                     if let Some(f) = self.state.rx_file.as_mut().filter(|f| f.done.is_none()) {
                         f.done = Some((std::time::Instant::now(), false));
                     }
+                    self.state.tx_file_ended(false);
+                    self.state.tx_file_next = None;
                     self.state.reset_snr_tracking();
                     self.state.connection_start = None;
                     self.state.partner_name = None;
@@ -792,6 +795,7 @@ impl VaracApp {
                 SessionMsg::Buffer(n) => {
                     self.state.buffer_bytes = n;
                     self.state.buffer_at = Some(std::time::Instant::now());
+                    self.state.tx_file_buffer(n as usize);
                 }
                 SessionMsg::Bitrate { level, bps, tx } => {
                     if tx {
@@ -800,6 +804,7 @@ impl VaracApp {
                 }
                 SessionMsg::TxStarted { text, bytes } => {
                     let now = std::time::Instant::now();
+                    self.state.tx_file_started(&text, bytes);
                     for i in our_lines_in_frame(&self.state.chat_lines, &text, |l| l.tx == Some(state::TxStage::Queued)) {
                         self.state.chat_lines[i].tx = Some(state::TxStage::OnAir { total: bytes as u32, since: now });
                     }
@@ -830,6 +835,7 @@ impl VaracApp {
                         self.state.rx_file = Some(state::RxFile {
                             name,
                             from: self.state.connected_to.clone(),
+                            outgoing: false,
                             file_bytes: offer.map_or(total * 3 / 4, |o| o.compressed_size),
                             total,
                             received: 0,
@@ -1911,6 +1917,15 @@ impl VaracApp {
             IncomingMessage::BbsFileAborted | IncomingMessage::BbsFileFailed => Some(false),
             _ => None,
         };
+        // The upload card: the partner has it all, or turned it down or lost it
+        let receiving = self.state.rx_file.as_ref().is_some_and(|f| f.done.is_none());
+        match msg {
+            IncomingMessage::BbsFileOk => self.state.tx_file_ended(true),
+            IncomingMessage::BbsFileAborted | IncomingMessage::BbsFileFailed | IncomingMessage::BbsFileRejected if !receiving => {
+                self.state.tx_file_ended(false)
+            }
+            _ => {}
+        }
         if let (Some(ok), Some(f)) = (ended, self.state.rx_file.as_mut()) {
             if f.done.is_none() {
                 if ok {
@@ -4289,9 +4304,10 @@ fn fmt_span(secs: f32) -> String {
 /// lands from the modem and runs on at the measured speed between them (never past the next
 /// lot); then size, speed and time left. When it ends it turns green with a check (red with
 /// a cross if it stopped) and fades away. Returns false once it is gone or dismissed.
-fn draw_rx_file_card(ui: &mut egui::Ui, state: &GuiState) -> bool {
+/// The card of a file on its way in or (`outgoing`) out: a ring that fills, the size so
+/// far, the speed and the time left. False once it has faded out (or was closed).
+fn draw_file_card(ui: &mut egui::Ui, f: &state::RxFile) -> bool {
     use std::f32::consts::{FRAC_PI_2, TAU};
-    let Some(f) = state.rx_file.as_ref() else { return false };
     let now = std::time::Instant::now();
     let t = ui.input(|i| i.time) as f32;
     let total = f.total.max(1) as f32;
@@ -4342,7 +4358,12 @@ fn draw_rx_file_card(ui: &mut egui::Ui, state: &GuiState) -> bool {
                         let avg = if secs >= 1.0 { format!(" · avg {:.0} bps", total * 8.0 / secs) } else { String::new() };
                         format!("{} in {}{avg}", fmt_size(f.file_bytes as f32), fmt_span(secs))
                     }
-                    (Some((_, false)), _) => format!("stopped · {} of {} arrived", fmt_size(have), fmt_size(f.file_bytes as f32)),
+                    (Some((_, false)), _) => format!(
+                        "stopped · {} of {} {}",
+                        fmt_size(have),
+                        fmt_size(f.file_bytes as f32),
+                        if f.outgoing { "sent" } else { "arrived" }
+                    ),
                 };
                 let caption_color = if f.done.is_none() { theme::TEXT } else { color };
                 ui.horizontal(|ui| {
@@ -4368,10 +4389,12 @@ fn draw_rx_file_card(ui: &mut egui::Ui, state: &GuiState) -> bool {
                     let stroke = Stroke::new(2.0_f32, color);
                     match f.done {
                         None => {
+                            // down for a file coming in, up for ours going out
+                            let dir = if f.outgoing { -1.0 } else { 1.0 };
                             let dy = (t * 3.2).sin() * 2.0 * k;
-                            let (top, tip) = (egui::pos2(c.x, c.y + (dy - 6.5) * 1.0_f32.min(k * 1.2)), egui::pos2(c.x, c.y + (5.5 + dy) * k));
+                            let (top, tip) = (egui::pos2(c.x, c.y + dir * (dy - 6.5) * 1.0_f32.min(k * 1.2)), egui::pos2(c.x, c.y + dir * (5.5 + dy) * k));
                             p.line_segment([top, tip], stroke);
-                            p.add(egui::Shape::line(vec![tip + Vec2::new(-4.5, -4.5) * k, tip, tip + Vec2::new(4.5, -4.5) * k], stroke));
+                            p.add(egui::Shape::line(vec![tip + Vec2::new(-4.5, -4.5 * dir) * k, tip, tip + Vec2::new(4.5, -4.5 * dir) * k], stroke));
                         }
                         Some((_, true)) => {
                             p.add(egui::Shape::line(
@@ -4414,7 +4437,8 @@ fn draw_rx_file_card(ui: &mut egui::Ui, state: &GuiState) -> bool {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 if let Some(call) = &f.from {
-                                    ui.label(RichText::new(format!("from {call} · ")).size(11.0).color(theme::MUTED));
+                                    let dir = if f.outgoing { "to" } else { "from" };
+                                    ui.label(RichText::new(format!("{dir} {call} · ")).size(11.0).color(theme::MUTED));
                                 }
                                 ui.label(RichText::new(&caption).size(11.0).color(caption_color));
                             });
@@ -4588,8 +4612,11 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
             });
         });
         ui.separator();
-        if state.rx_file.is_some() && !draw_rx_file_card(ui, state) {
+        if state.rx_file.as_ref().is_some_and(|f| !draw_file_card(ui, f)) {
             state.rx_file = None;
+        }
+        if state.tx_file.as_ref().is_some_and(|f| !draw_file_card(ui, f)) {
+            state.tx_file = None;
         }
 
         let search_lower = state.chat_search.to_lowercase();
@@ -5806,8 +5833,8 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
         .default_width(500.0)
         .show(ctx, |ui| {
             ui.label(RichText::new(
-                "Send a file to the connected station via BBS transfer.\n\
-                 Files are gzip-compressed before sending. Max 32 KiB compressed."
+                "Send a file to the connected station, VarAC's way: it's gzip-compressed, and VARA HF \
+                 allows under 100 KB compressed at 500 Hz, 1 MB at 2300 Hz. Pictures open in the image shrinker."
             ).small().color(GRAY));
             ui.add_space(8.0);
 
@@ -5831,6 +5858,30 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
                 ui.colored_label(RED, "File not found");
             }
 
+            // Its size and the time it takes (a picture: in the shrinker, next)
+            let mut fits = true;
+            if file_exists && !crate::varac::images::is_image(path) {
+                if state.file_send_info.as_ref().is_none_or(|(p, ..)| *p != state.file_path_input) {
+                    state.file_send_info = std::fs::read(path).ok().map(|d| {
+                        let gz = bbs::compress(&d).map(|c| c.len()).unwrap_or(d.len());
+                        (state.file_path_input.clone(), d.len(), gz)
+                    });
+                }
+                if let Some((_, bytes, gz)) = state.file_send_info.clone() {
+                    let (limit, snr, bw, fm) = state.send_conditions();
+                    let air = crate::varac::images::air_bytes(gz);
+                    ui.label(format!(
+                        "{} bytes, {gz} compressed · {}",
+                        bytes,
+                        crate::varac::images::time_estimate(air, snr, bw, fm)
+                    ));
+                    if let Some(l) = limit.filter(|l| gz >= *l) {
+                        fits = false;
+                        ui.colored_label(RED, format!("Too big: VARA HF allows under {} KB compressed at {bw} Hz.", l / 1000));
+                    }
+                }
+            }
+
             // VarAC refuses file transfers on a calling frequency (it would block the channel)
             let on_calling_freq = messages::is_calling_frequency(state.dial());
             if on_calling_freq {
@@ -5838,22 +5889,32 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let can_send = file_exists && state.session_state == SessionState::Connected && !on_calling_freq;
+                let can_send = file_exists && fits && state.session_state == SessionState::Connected && !on_calling_freq;
                 if ui.add_enabled(can_send, egui::Button::new(RichText::new("SEND").color(GREEN).strong())).clicked() {
                     let file_path = std::path::PathBuf::from(&state.file_path_input);
                     // VarAC opens its image shrinker for pictures
                     if crate::varac::images::is_image(&file_path) {
                         if let Ok(data) = std::fs::read(&file_path) {
-                            if let Ok(img) = image::load_from_memory(&data) {
+                            if let Ok(img) = crate::varac::images::load_upright(&data) {
+                                // It starts at the size that goes in the operator's send time
+                                // (Settings), never over VARA's limit
+                                let (limit, snr, bw, fm) = state.send_conditions();
+                                let start = crate::varac::images::starting_size(
+                                    &img, 50, limit, state.settings_form.photo_send_minutes, snr, bw, fm,
+                                );
+                                let (pct, result, dirty) = match start {
+                                    Ok((pct, jpg, w, h)) => (pct, Some(Ok((jpg, w, h))), false),
+                                    Err(_) => (100, None, true),
+                                };
                                 state.shrinker = Some(state::Shrinker {
                                     path: file_path,
                                     size: (img.width(), img.height()),
                                     original: data,
-                                    pct: 100,
+                                    pct,
                                     quality: 50,
                                     overlay: false,
-                                    result: None,
-                                    dirty: true,
+                                    result,
+                                    dirty,
                                 });
                                 state.file_send_open = false;
                                 state.file_path_input.clear();
@@ -5862,6 +5923,9 @@ fn draw_file_send_window(ctx: &egui::Context, state: &mut GuiState) {
                         }
                     }
                     state.sent_files.push(file_path.clone());
+                    let name = file_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let gz = state.file_send_info.as_ref().map_or(0, |i| i.2);
+                    state.tx_file_next = Some((name, gz));
                     state.send_cmd(GuiCommand::SendFile(file_path));
                     state.file_send_open = false;
                     state.status_msg = format!("Sending file: {}", state.file_path_input);
@@ -6822,6 +6886,20 @@ fn draw_settings_window(
                             ui.add(TextEdit::singleline(&mut state.settings_form.incoming_files_size_limit).desired_width(70.0))
                                 .on_hover_text("Smaller files and VMail attachments are accepted at once; bigger ones are refused while away, else you're asked (VarAC: 5000)");
                         });
+                        ui.horizontal(|ui| {
+                            use crate::varac::images::{PHOTO_MINUTES_CHOICES, photo_minutes_label};
+                            ui.label("Pictures: send in");
+                            egui::ComboBox::from_id_salt("photo_send_minutes")
+                                .selected_text(photo_minutes_label(state.settings_form.photo_send_minutes))
+                                .show_ui(ui, |ui| {
+                                    for m in PHOTO_MINUTES_CHOICES {
+                                        ui.selectable_value(&mut state.settings_form.photo_send_minutes, m, photo_minutes_label(m));
+                                    }
+                                })
+                                .response
+                                .on_hover_text("The image shrinker starts a picture at the size that goes out in about this time at the \
+                                                link's SNR, never over what VARA allows. You can still change it before sending.");
+                        });
                         ui.add_space(6.0);
                         ui.label(RichText::new("Callsigns block list").strong());
                         ui.add(TextEdit::singleline(&mut state.settings_form.callsigns_block_list).desired_width(420.0).hint_text("CALL1,CALL2"))
@@ -7657,6 +7735,7 @@ fn save_config_file(state: &GuiState) {
         send_relay_notifications: Some(form.send_relay_notifications),
         allow_parking: Some(form.allow_parking),
         incoming_files_size_limit: form.incoming_files_size_limit.trim().parse().ok(),
+        photo_send_minutes: Some(form.photo_send_minutes),
         mute_all_sounds: existing.mute_all_sounds,
         sounds_off: existing.sounds_off.clone(),
         narrator: existing.narrator,
@@ -11603,5 +11682,241 @@ mod tests {
     #[test]
     fn dxcc_unknown() {
         assert_eq!(dxcc_entity(""), None);
+    }
+}
+
+/// Pictures of the file-sending windows, drawn by the real code in a connected QSO:
+///   cargo test window_shots -- --ignored
+/// writes PNGs to target/window-shots (or $OPENSLOT_SHOTS). Ignored by default: it needs a GPU.
+#[cfg(test)]
+mod window_shots {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::{Harness, wgpu::TestRenderer};
+
+    fn out_dir() -> std::path::PathBuf {
+        let d = std::env::var("OPENSLOT_SHOTS").map(Into::into).unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/window-shots")
+        });
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn save(h: &Harness<'_, GuiState>, name: &str) {
+        let img = TestRenderer::new().render(h);
+        img.save(out_dir().join(format!("{name}.png"))).unwrap();
+    }
+
+    fn click_at(h: &mut Harness<'_, GuiState>, pos: egui::Pos2) {
+        let ev = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        h.input_mut().events.push(egui::Event::PointerMoved(pos));
+        h.input_mut().events.push(ev(true));
+        h.run();
+        h.input_mut().events.push(ev(false));
+        h.run();
+    }
+
+    fn style(ctx: &egui::Context) {
+        setup_context(ctx);
+        theme::apply_with(ctx, true, 14.0, false);
+    }
+
+    /// In a QSO with N0TST at 500 Hz, +10 dB, off the calling frequency.
+    fn in_qso() -> GuiState {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(rx); // (commands the windows send go nowhere)
+        let mut st = GuiState::new("W5TST".into(), true, tx);
+        st.session_state = SessionState::Connected;
+        st.connected_to = Some("N0TST".into());
+        st.settings_form.bandwidth = "500".into();
+        st.current_frequency = 14_120_000;
+        st.snr_last = Some(10.0);
+        st
+    }
+
+    /// Test files: a text log, a file over VARA's limit and a camera-sized photo.
+    fn files() -> (String, String, String) {
+        let dir = std::env::temp_dir().join("openslot-window-shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("qso log.txt");
+        let lines: String = (1..=80).map(|i| format!("{i} 2026-11-06 N0TST 14.120 MHz 500 Hz SNR +{} dB QSO test line\n", i % 20)).collect();
+        std::fs::write(&log, lines).unwrap();
+        let big = dir.join("too big.bin");
+        let mut seed = 99u32;
+        let noise: Vec<u8> = (0..1_200_000).map(|_| { seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345); (seed >> 16) as u8 }).collect();
+        std::fs::write(&big, noise).unwrap();
+        let photo = dir.join("IMG_4021.JPG");
+        let mut s2 = 7u32;
+        let img = image::RgbImage::from_fn(3024, 2268, |x, y| {
+            s2 = s2.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let n = (s2 >> 27) as u8;
+            image::Rgb([(x / 12 % 256) as u8 / 2 + 60 + n, (y / 9 % 256) as u8 / 2 + 40 + n, 150u8.saturating_sub((y / 20) as u8) + n])
+        });
+        let mut jpg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 92).encode_image(&img).unwrap();
+        std::fs::write(&photo, jpg).unwrap();
+        let p = |p: std::path::PathBuf| p.display().to_string();
+        (p(log), p(big), p(photo))
+    }
+
+    fn send_window(st: GuiState, size: (f32, f32)) -> Harness<'static, GuiState> {
+        Harness::builder().with_size(egui::vec2(size.0, size.1)).build_state(
+            |ctx, st: &mut GuiState| {
+                style(ctx);
+                egui::CentralPanel::default().show(ctx, |_| {});
+                draw_file_send_window(ctx, st);
+                features::draw_shrinker(ctx, st);
+            },
+            st,
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn window_shots() {
+        let (log, big, photo) = files();
+
+        // 1. Settings → QSO: the pictures' send time, its choices open
+        let mut st = in_qso();
+        st.settings_open = true;
+        st.settings_form.settings_tab = 2;
+        st.settings_form.callsign = "W5TST".into();
+        let station = StationConfig {
+            callsign: "W5TST".into(), name: None, qth: None, locator: None,
+            services: crate::varac::messages::ServiceFlags(crate::varac::messages::ServiceFlags::VMAIL),
+            bbs_dir: None, email_gate: None, bbs_gate: None, policy: Default::default(),
+        };
+        let modem = crate::tui::ModemConfig {
+            host: "127.0.0.1".into(), cmd_port: 8300, data_port: 8301, kiss_port: 8100,
+            bandwidth: crate::vara::commands::Bandwidth::Bw500,
+        };
+        let mut h = Harness::builder().with_size(egui::vec2(900.0, 1300.0)).build_state(
+            move |ctx, st: &mut GuiState| {
+                style(ctx);
+                egui::CentralPanel::default().show(ctx, |_| {});
+                draw_settings_window(ctx, st, &station, &modem);
+            },
+            st,
+        );
+        h.run();
+        // scroll the tab down to the file settings, as the mouse wheel would
+        h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(400.0, 500.0)));
+        for _ in 0..6 {
+            h.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run();
+        }
+        // (the drop-down has no accessible name: click it where it is, as a mouse would)
+        click_at(&mut h, egui::pos2(195.0, 787.0));
+        save(&h, "1-settings-pictures-send-in");
+        h.get_by_label("about 2 min").click();
+        h.run();
+        assert_eq!(h.state().settings_form.photo_send_minutes, 2);
+
+        // 2. Send File: a text file, its sizes and time
+        let mut st = in_qso();
+        st.file_send_open = true;
+        st.file_path_input = log;
+        let log_len = std::fs::metadata(&st.file_path_input).unwrap().len() as usize;
+        let mut h = send_window(st, (860.0, 240.0));
+        h.run();
+        save(&h, "2-send-file-text");
+        let (_, bytes, gz) = h.state().file_send_info.clone().unwrap();
+        assert!(bytes == log_len && gz < bytes, "{bytes} {gz}");
+
+        // 3. Send File: over VARA's 100K at 500 Hz, refused
+        let mut st = in_qso();
+        st.file_send_open = true;
+        st.file_path_input = big;
+        let mut h = send_window(st, (860.0, 240.0));
+        h.run();
+        save(&h, "3-send-file-too-big");
+        h.get_by_label("SEND").click();
+        h.run();
+        assert!(h.state().file_send_open && h.state().tx_file_next.is_none(), "SEND stays off over the limit");
+
+        // 4. A photo: SEND opens the shrinker at the size for about 5 minutes
+        let mut st = in_qso();
+        st.file_send_open = true;
+        st.file_path_input = photo.clone();
+        let mut h = send_window(st, (720.0, 520.0));
+        h.run();
+        h.get_by_label("SEND").click();
+        h.run();
+        h.run();
+        let pct5 = h.state().shrinker.as_ref().unwrap().pct;
+        save(&h, "4-shrinker-about-5-min");
+        // what's shown is what the shrinker chose (the slider doesn't move it), and it goes in
+        // about five minutes even at the slow end
+        let sh = h.state().shrinker.as_ref().unwrap();
+        let (_, snr, bw, fm) = h.state().send_conditions();
+        let jpg = &sh.result.as_ref().unwrap().as_ref().unwrap().0;
+        let air = crate::varac::images::air_bytes(bbs::compress(jpg).unwrap().len());
+        assert!(air * 8 <= 5 * 60 * crate::varac::images::speed_bps(snr, bw, fm).0 as usize, "{pct5}%: {air}");
+        let (fresh, ..) = crate::varac::images::shrink(&sh.original, pct5, 50, None).unwrap();
+        assert_eq!(fresh.len(), jpg.len(), "the picture shown is the one at {pct5}%");
+
+        // 5. … and with "largest that fits": bigger, and slower
+        let mut st = in_qso();
+        st.settings_form.photo_send_minutes = 0;
+        st.file_send_open = true;
+        st.file_path_input = photo;
+        let mut h = send_window(st, (720.0, 520.0));
+        h.run();
+        h.get_by_label("SEND").click();
+        h.run();
+        h.run();
+        let pct_max = h.state().shrinker.as_ref().unwrap().pct;
+        assert!(pct_max > pct5, "{pct_max} vs {pct5}");
+        save(&h, "5-shrinker-largest-that-fits");
+
+        // 6. Pushed too big by hand: the warning, and Send compressed is off
+        let sh = h.state_mut().shrinker.as_mut().unwrap();
+        sh.pct = 90;
+        sh.dirty = true;
+        h.run();
+        h.run();
+        save(&h, "6-shrinker-too-big");
+
+        // 7. Sending: the upload card, 40% out, speed and time left; 8. done
+        let mut st = in_qso();
+        let now = std::time::Instant::now();
+        let ago = |s: u64| now - std::time::Duration::from_secs(s);
+        st.tx_file = Some(state::RxFile {
+            name: "IMG_4021_resized_20261106_154210.jpg".into(),
+            from: Some("N0TST".into()),
+            outgoing: true,
+            file_bytes: 11_795,
+            total: 15_800,
+            received: 6_320,
+            started: ago(60),
+            samples: vec![(ago(60), 0), (ago(45), 1_580), (ago(30), 3_160), (ago(15), 4_740), (now, 6_320)],
+            done: None,
+        });
+        let card = |st: GuiState| {
+            Harness::builder().with_size(egui::vec2(560.0, 110.0)).build_state(
+                |ctx, st: &mut GuiState| {
+                    style(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(f) = st.tx_file.as_ref() {
+                            draw_file_card(ui, f);
+                        }
+                    });
+                },
+                st,
+            )
+        };
+        let mut h = card(st);
+        h.run();
+        save(&h, "7-sending-card");
+        let mut st = in_qso();
+        st.tx_file = h.state_mut().tx_file.take();
+        st.tx_file_ended(true);
+        let mut h = card(st);
+        h.run();
+        save(&h, "8-sending-card-done");
     }
 }
