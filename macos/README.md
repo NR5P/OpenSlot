@@ -27,14 +27,16 @@ older `varac-rust` folder is moved there on first launch).
 ## Building
 
 Needs Rust, Xcode's command line tools, and the XARA checkout next to this repository
-(`~/Desktop/xara` beside `~/Desktop/varac-rust`).
+(`~/Desktop/xara` beside `~/Desktop/OpenSlot`), on the branch you want built in (normally `main`).
 
     macos/bundle.sh             # build/Openslot.app for this Mac
     macos/bundle.sh universal   # Apple silicon + Intel
 
 Copy `macos/build/Openslot.app` to `/Applications`. The first start of the modem asks
-for microphone access; that's how XARA hears the radio. The app is signed ad hoc, which is
-enough for this Mac; to give it to others, sign it with a Developer ID and notarize it.
+for microphone access; that's how XARA hears the radio. The app is signed with the first
+Developer ID certificate in your keychain (`OPENSLOT_SIGN_IDENTITY` picks another, `-` signs
+ad hoc). It isn't notarized, so on other Macs Gatekeeper asks before opening it; releasing it
+is in [docs/building-and-releasing.md](../docs/building-and-releasing.md).
 
 For development: `cargo run --manifest-path macos/Cargo.toml -- --callsign N0CALL`.
 

@@ -26,9 +26,9 @@ How the sharing works:
   in. Phone screens are native because egui can't reliably bring up the on-screen keyboard
   on iOS, and because a phone app needs native audio-session, background-running and
   permission handling.
-- XARA comes from a checkout next to this one (`../xara`), used as a path dependency.
-  Its Windows support (WASAPI audio, COM ports, console Ctrl-C) is on that checkout's
-  `windows` branch.
+- XARA comes from a checkout next to this one (`../xara`, NR5P/xara), used as a path
+  dependency, on whatever branch is checked out there; the Release workflow uses NR5P/xara
+  `main` from GitHub instead. See [docs/building-and-releasing.md](docs/building-and-releasing.md).
 
 Each platform folder is its own Cargo/Xcode/Gradle project with its own `target/` or
 `build/` (git-ignored), so building one never touches the root's `target/`.

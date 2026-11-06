@@ -1,7 +1,10 @@
 # Builds the Linux and Windows downloads and attaches them to a GitHub release. Push a tag
 # to run it:
 #
-#   git tag v0.1.0 && git push openslot v0.1.0
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The full release steps (versions, lock files, the Mac app, TestFlight) are in
+# docs/building-and-releasing.md.
 #
 # The Linux and Windows apps have the XARA modem built in from a checkout next to this
 # repository, so their jobs check out NR5P/xara beside it. The Mac app needs the same, so it's
