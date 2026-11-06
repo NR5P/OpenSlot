@@ -1585,8 +1585,12 @@ impl VaracSession {
     fn secure_in(&mut self, mut message: String) -> Option<String> {
         use crate::varac::secure::{ENC_TAG, KEY_TAG, SHARED_TAG};
         let mut notes = Vec::new();
-        let announced = message.strip_prefix(KEY_TAG).map(|r| (r, false))
-            .or_else(|| message.strip_prefix(SHARED_TAG).map(|r| (r, true)));
+        // (an announcement is only ever the partner's first frame, and only an encrypted
+        // link has <OSE:> frames: anything else that starts so is just text, as typed)
+        let announced = self.secure.expects_announcement().then(|| {
+            message.strip_prefix(KEY_TAG).map(|r| (r, false))
+                .or_else(|| message.strip_prefix(SHARED_TAG).map(|r| (r, true)))
+        }).flatten();
         if let Some((rest, shared)) = announced {
             let (payload, after) = rest.split_once('>').unwrap_or((rest, ""));
             notes = if shared {
@@ -1605,8 +1609,9 @@ impl VaracSession {
         } else {
             notes.extend(self.secure.no_partner_key());
         }
-        self.frame_was_clear = !message.starts_with(ENC_TAG);
-        if message.starts_with(ENC_TAG) {
+        let sealed = message.starts_with(ENC_TAG) && self.secure.is_encrypted();
+        self.frame_was_clear = !sealed;
+        if sealed {
             match self.secure.open(&message) {
                 Ok(plain) => message = plain,
                 Err(note) => {
@@ -4732,7 +4737,7 @@ mod secure_tests {
         let (_, their_key) = secure::Link::start(&ps, "NR5P", "W5TST");
         send(&mut d, &their_key.unwrap()).await;
         send(&mut d, &ps.sign_text("NR5P", "W5TST", "good copy").unwrap()).await;
-        send(&mut d, "forged<OSG:AAAA>").await;
+        send(&mut d, &format!("forged<OSG:{}>", "A".repeat(86))).await;
         let events = run(&mut s, 400).await;
         let shown: Vec<String> = events.iter().filter_map(|e| match e {
             SessionEvent::Secure(SecureNote::Signed { check, .. }) => Some(format!("{check:?}")),

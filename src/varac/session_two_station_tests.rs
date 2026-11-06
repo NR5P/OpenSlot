@@ -620,3 +620,310 @@ async fn interference_on_an_encrypted_link() {
     let (ea, _) = run2(&mut a, &mut b, 2500).await;
     assert_eq!(texts(&ea), ["still here"], "{ea:?}");
 }
+
+// === Round two: odd inputs, changes mid-link, saved keys, the rarer parts of a QSO ===
+
+/// A connected QSO between the two (caller A), handshakes done.
+async fn connect(a: &mut VaracSession, b: &mut VaracSession, to: &str) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
+    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: to.into() }).await.unwrap();
+    until_handshakes(a, b, 15_000).await
+}
+
+fn alarms(events: &[SessionEvent]) -> Vec<SecureNote> {
+    notes(events).into_iter().filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect()
+}
+
+/// A small, repeatable random source (no extra crate).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+}
+
+/// Junk on the air in every Openslot tag, on an encrypted link and on a clear one: nothing
+/// panics, the link stays what it was, and the QSO goes on.
+#[tokio::test]
+async fn junk_frames_on_the_air() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Off, Mode::Off), (Mode::Sign, Mode::Sign), (Mode::Shared(0), Mode::Shared(0))] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        connect(&mut a, &mut b, "N0BBB").await;
+        let enc = expect_encrypted(ma, mb);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // real frames from B, cut short or with a character changed
+        let from_b: Vec<String> = air.heard().iter().filter_map(|f| f.strip_prefix("B>"))
+            .filter_map(|f| f.split_once(' ').map(|(_, t)| t.to_string())).collect();
+        let mut junk: Vec<String> = Vec::new();
+        for f in &from_b {
+            for cut in [1, f.len() / 2, f.len().saturating_sub(2)] {
+                junk.push(f.chars().take(cut).collect());
+            }
+            let mut flipped: Vec<char> = f.chars().collect();
+            if flipped.len() > 8 {
+                let i = 6 + (rng.next() as usize) % (flipped.len() - 7);
+                flipped[i] = if flipped[i] == 'A' { 'B' } else { 'A' };
+                junk.push(flipped.into_iter().collect());
+            }
+        }
+        for t in [secure::KEY_TAG, secure::SHARED_TAG, secure::ENC_TAG, secure::SIG_TAG] {
+            for n in [0, 1, 4, 5, 20, 21, 33, 49, 65, 81, 97, 98, 130, 131, 500] {
+                junk.push(format!("{t}{}>", b64.encode(rng.bytes(n))));
+            }
+            junk.push(format!("{t}not base64!>"));
+            junk.push(t.to_string());
+            junk.push(format!("{t}>>>>"));
+            junk.push(format!("hello{t}{}>", b64.encode(rng.bytes(64))));
+        }
+        for j in &junk {
+            air.inject_to(true, j).await;
+        }
+        let (ea, _) = run2(&mut a, &mut b, 1500).await;
+        assert_eq!(a.secure.is_encrypted(), enc, "{tag}: {:?}", notes(&ea));
+        assert!(!notes(&ea).iter().any(|n| matches!(n, SecureNote::Link { .. })), "{tag}: the link changed: {:?}", notes(&ea));
+        b.send_typed("after the junk").await.unwrap();
+        a.send_typed("me too").await.unwrap();
+        let (ea, eb) = run2(&mut a, &mut b, 3000).await;
+        assert!(texts(&ea).iter().any(|t| t == "after the junk"), "{tag}: {ea:?}");
+        assert!(texts(&eb).iter().any(|t| t == "me too"), "{tag}: {eb:?}");
+    }
+}
+
+/// Encryption or signing switched on or off in the middle of a QSO: the link goes on as it
+/// started (encrypted stays encrypted), and the next link follows the new setting.
+#[tokio::test]
+async fn settings_changed_mid_link() {
+    // encryption turned off on both during an encrypted QSO
+    let (mut a, mut b, air) = two_stations(|p| Mode::Enc.apply(p), |p| Mode::Enc.apply(p), Duration::ZERO, Duration::ZERO).await;
+    connect(&mut a, &mut b, "N0BBB").await;
+    a.config.policy.secure.set(false, false);
+    b.config.policy.secure.set(false, false);
+    a.send_typed("still private").await.unwrap();
+    let (ea, eb) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&eb), ["still private"], "{eb:?}");
+    assert!(!air.heard().join("|").contains("still private"), "sent in the clear after the switch");
+    assert!(alarms(&ea).is_empty() && alarms(&eb).is_empty());
+    a.send_disconnect().await.unwrap();
+    run2(&mut a, &mut b, 500).await;
+    let (ea, eb) = connect(&mut a, &mut b, "N0BBB").await;
+    assert!(!a.secure.is_encrypted() && notes(&ea).is_empty() && notes(&eb).is_empty(), "{ea:?}");
+
+    // signing turned on during a clear QSO: signed from then on; the key isn't known yet
+    let (mut a, mut b, _air) = two_stations(|_| {}, |_| {}, Duration::ZERO, Duration::ZERO).await;
+    connect(&mut a, &mut b, "N0BBB").await;
+    a.config.policy.secure.set(false, true);
+    a.send_typed("signed now").await.unwrap();
+    let (_, eb) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&eb), ["signed now"], "{eb:?}");
+    let checks: Vec<SigCheck> = notes(&eb).iter().filter_map(|n| match n {
+        SecureNote::Signed { check, .. } => Some(*check),
+        _ => None,
+    }).collect();
+    assert_eq!(checks, [SigCheck::NoKey], "{eb:?}");
+
+    // encryption turned on during a clear QSO: nothing changes until the next link
+    let (mut a, mut b, air) = two_stations(|_| {}, |_| {}, Duration::ZERO, Duration::ZERO).await;
+    connect(&mut a, &mut b, "N0BBB").await;
+    a.config.policy.secure.set(true, false);
+    b.config.policy.secure.set(true, false);
+    a.send_typed("clear still").await.unwrap();
+    let (_, eb) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&eb), ["clear still"], "{eb:?}");
+    a.send_disconnect().await.unwrap();
+    run2(&mut a, &mut b, 500).await;
+    connect(&mut a, &mut b, "N0BBB").await;
+    a.send_typed("now private").await.unwrap();
+    let (_, eb) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&eb), ["now private"], "{eb:?}");
+    assert!(a.secure.is_encrypted() && !air.heard().join("|").contains("now private"));
+}
+
+/// Typed while waiting for the partner's key, then the link drops before it comes: none of
+/// it goes out, then or on the next link.
+#[tokio::test]
+async fn held_text_dies_with_the_link() {
+    // (B's frames take 8 s to reach A: A never hears B's key on the first link)
+    let (mut a, mut b, air) = two_stations(|p| Mode::Enc.apply(p), |p| Mode::Enc.apply(p), Duration::ZERO, Duration::from_secs(8)).await;
+    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+    while a.state != SessionState::Connected {
+        run2(&mut a, &mut b, 20).await;
+    }
+    a.send_typed("held secret").await.unwrap();
+    a.send_vmail(&vmail("Held", "held body")).await.unwrap();
+    run2(&mut a, &mut b, 1500).await;
+    assert_eq!(a.secure.state(), secure::LinkState::Waiting);
+    assert_eq!(a.queued_texts().len(), 2, "{:?}", a.queued_texts());
+    a.send_disconnect().await.unwrap();
+    run2(&mut a, &mut b, 500).await;
+    assert!(a.queued_texts().is_empty(), "{:?}", a.queued_texts());
+    // (the late frames of the old link still land at A: nothing must come of them)
+    run2(&mut a, &mut b, 9000).await;
+    let heard = air.heard().join("|");
+    assert!(!heard.contains("held") && !heard.contains("Held"), "{heard}");
+}
+
+/// The saved key file across restarts: first contact, known after a restart, a NEW key
+/// flagged when the partner replaces its key (and still encrypted, with the warning), known
+/// again once accepted.
+#[tokio::test]
+async fn saved_keys_across_restarts() {
+    let dir = std::env::temp_dir().join(format!("openslot-two-station-{}", std::process::id()));
+    let (fa, fb) = (dir.join("a").join("keys.json"), dir.join("b").join("keys.json"));
+    for mode in [Mode::Enc, Mode::Sign] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut seen = Vec::new();
+        for step in ["first", "restart", "replaced", "still flagged", "accepted"] {
+            let (pa, pb) = (fa.clone(), fb.clone());
+            let (mut a, mut b, _air) = two_stations(move |p| {
+                p.open_keyring(pa);
+                mode.apply(p);
+            }, move |p| {
+                p.open_keyring(pb);
+                mode.apply(p);
+            }, Duration::ZERO, Duration::ZERO).await;
+            if step == "replaced" {
+                a.config.policy.secure.replace_identity().unwrap();
+            }
+            if step == "accepted" {
+                b.config.policy.secure.accept_new_key("N0AAA");
+            }
+            let (_, mut eb) = connect(&mut a, &mut b, "N0BBB").await;
+            a.send_typed(step).await.unwrap();
+            let (_, y) = run2(&mut a, &mut b, 2500).await;
+            eb.extend(y);
+            assert_eq!(texts(&eb), [step], "{mode:?} {step}: {eb:?}");
+            let n = notes(&eb);
+            let what = match (mode, &n[..]) {
+                (Mode::Enc, [SecureNote::Link { encrypted: true, text }]) if text.contains("first contact") => "first",
+                (Mode::Enc, [SecureNote::Link { encrypted: true, text }]) if text.contains("known since") => "known",
+                (Mode::Enc, [SecureNote::Link { encrypted: true, text }]) if text.contains("NEW KEY") => "new",
+                (Mode::Sign, [SecureNote::Signed { check: SigCheck::Valid(KeyTrust::FirstContact), .. }]) => "first",
+                (Mode::Sign, [SecureNote::Signed { check: SigCheck::Valid(KeyTrust::Known), .. }]) => "known",
+                (Mode::Sign, [SecureNote::Warning(_), SecureNote::Signed { check: SigCheck::Valid(KeyTrust::Changed), .. }]) => "new",
+                _ => panic!("{mode:?} {step}: {n:?}"),
+            };
+            seen.push(what);
+            assert_eq!(b.config.policy.secure.stations().len(), 1, "{mode:?} {step}");
+        }
+        assert_eq!(seen, ["first", "known", "new", "new", "known"], "{mode:?}");
+        let saved = std::fs::read_to_string(&fb).unwrap();
+        assert!(saved.contains("N0AAA"), "{saved}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A ping (the -T alias) with everything on: no key announcement, nothing encrypted.
+#[tokio::test]
+async fn ping_with_encryption_on() {
+    let (mut a, mut b, air) = two_stations(|p| Mode::EncSign.apply(p), |p| Mode::EncSign.apply(p), Duration::ZERO, Duration::ZERO).await;
+    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB-T".into() }).await.unwrap();
+    let (ea, eb) = run2(&mut a, &mut b, 3000).await;
+    assert!(a.ping && b.ping, "{ea:?} {eb:?}");
+    assert!(!air.heard().join("|").contains("<OS"), "{:?}", air.heard());
+    assert!(notes(&ea).is_empty() && notes(&eb).is_empty(), "{ea:?} {eb:?}");
+    assert!(b.config.policy.secure.stations().is_empty());
+}
+
+/// The rest of a QSO: QSY up mid-QSO, is-typing, a like, an info request, a long VMail and
+/// text in other scripts. Sealed on an encrypted link, and understood either way.
+#[tokio::test]
+async fn the_rest_of_a_qso() {
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Off, Mode::Off), (Mode::SharedAes(0), Mode::Shared(0))] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let enc = expect_encrypted(ma, mb);
+        let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        let (mut ea, mut eb) = connect(&mut a, &mut b, "N0BBB").await;
+        a.send_qsy_step(true, 500).await.unwrap();
+        let (x, y) = run2(&mut a, &mut b, 3000).await;
+        // (the app accepts a QSY step, as it does on ACCEPT)
+        for e in &y {
+            if let SessionEvent::QsyInvitation { target: QsyTarget::Up, .. } = e {
+                b.answer_qsy(true, false, 500).await.unwrap();
+            }
+        }
+        ea.extend(x);
+        eb.extend(y);
+        let (x, y) = run2(&mut a, &mut b, 4000).await;
+        ea.extend(x);
+        eb.extend(y);
+        assert!(eb.iter().any(|e| matches!(e, SessionEvent::QsyInvitation { target: QsyTarget::Up, .. })), "{tag}: QSY up not understood: {eb:?}");
+        b.send_is_typing().await.unwrap();
+        b.send_typed("Ünïcode ✓ 73 — привет 日本").await.unwrap();
+        let long: String = (0..400).map(|i| format!("word{i} ")).collect();
+        a.send_vmail(&vmail("Long", long.trim_end())).await.unwrap();
+        a.send_info_request().await.unwrap();
+        let (x, y) = run2(&mut a, &mut b, 5000).await;
+        ea.extend(x);
+        eb.extend(y);
+        assert!(texts(&ea).iter().any(|t| t == "Ünïcode ✓ 73 — привет 日本"), "{tag}: {:?}", texts(&ea));
+        assert_eq!(vmails(&eb).iter().map(|v| v.body.clone()).collect::<Vec<_>>(), [long.trim_end().to_string()], "{tag}");
+        let liked = a.chat_id;
+        b.send_reaction(liked, true).await.unwrap();
+        let (x, y) = run2(&mut a, &mut b, 2500).await;
+        ea.extend(x);
+        eb.extend(y);
+        assert!(alarms(&ea).is_empty() && alarms(&eb).is_empty(), "{tag}: {:?} {:?}", alarms(&ea), alarms(&eb));
+        assert_eq!(a.chat_id, b.chat_id, "{tag}");
+        if enc {
+            let heard = air.heard().join("|");
+            for t in ["<QSYU>", "&IT&", "&L1", "<INFO", "word1", "Long"] {
+                assert!(!heard.contains(t), "{tag}: {t} readable on the air");
+            }
+        }
+    }
+}
+
+/// Away and a welcome message on a calling frequency, both encrypted.
+#[tokio::test]
+async fn away_and_welcome_encrypted() {
+    for away in [false, true] {
+        let (mut a, mut b, air) = two_stations(|p| Mode::Enc.apply(p), |p| Mode::Enc.apply(p), Duration::ZERO, Duration::ZERO).await;
+        for s in [&a, &b] {
+            s.config.policy.on_calling_frequency.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        b.config.policy.set_welcome("Welcome to my station <NAME>", true);
+        if away {
+            b.set_away(Some("gone fishing".into()));
+        }
+        let (mut ea, eb) = connect(&mut a, &mut b, "N0BBB").await;
+        let (x, _) = run2(&mut a, &mut b, 3000).await;
+        ea.extend(x);
+        assert!(a.secure.is_encrypted() && b.secure.is_encrypted(), "away {away}");
+        assert!(alarms(&ea).is_empty() && alarms(&eb).is_empty(), "away {away}: {:?} {:?}", alarms(&ea), alarms(&eb));
+        assert!(format!("{ea:?}").contains("Welcome to my station"), "away {away}: no welcome: {ea:?}");
+        assert!(!air.heard().join("|").contains("Welcome"), "away {away}: welcome readable on the air");
+    }
+}
+
+/// What someone types that looks like an Openslot tag still arrives as typed, on a clear
+/// link and on an encrypted one.
+#[tokio::test]
+async fn typed_text_that_looks_like_a_tag() {
+    // (text in angle brackets in general is VarAC's tags, read as tags: not tried here)
+    let typed = ["<OSK:hello>", "<OSE:abc>", "<OSP:xyz>", "<OSG:", "<OSK:", "<OSE:"];
+    for (ma, mb) in [(Mode::Off, Mode::Off), (Mode::Enc, Mode::Enc), (Mode::Sign, Mode::Off)] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, _air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        connect(&mut a, &mut b, "N0BBB").await;
+        let mut lost = Vec::new();
+        for t in typed {
+            a.send_typed(t).await.unwrap();
+            let (_, eb) = run2(&mut a, &mut b, 2200).await;
+            let got = texts(&eb).join("\n");
+            if got != t {
+                lost.push(format!("{t:?} -> {got:?} ({:?})", alarms(&eb)));
+            }
+        }
+        assert!(lost.is_empty(), "{tag}: {lost:#?}");
+    }
+}

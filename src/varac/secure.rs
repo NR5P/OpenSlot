@@ -454,12 +454,18 @@ fn signed_announcement(from: &str, to: &str, body: &[u8]) -> Vec<u8> {
     m
 }
 
+/// A signature as it's written: 64 bytes, so 86 characters of base64. (Anything else in
+/// `<OSG:…>` is text someone typed.)
+fn is_signature(sig: &str) -> bool {
+    sig.len() == 86 && sig.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Split a message's trailing `<OSG:…>` off: (the message, the signature's base64).
 pub fn split_signature(text: &str) -> (&str, Option<&str>) {
     let Some(i) = text.rfind(SIG_TAG) else { return (text, None) };
     let rest = &text[i + SIG_TAG.len()..];
     match rest.strip_suffix('>') {
-        Some(sig) if !sig.is_empty() && sig.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => (&text[..i], Some(sig)),
+        Some(sig) if is_signature(sig) => (&text[..i], Some(sig)),
         _ => (text, None),
     }
 }
@@ -488,8 +494,18 @@ pub fn strip_signatures(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find(SIG_TAG) {
-        out.push_str(&rest[..i]);
-        rest = rest[i..].find('>').map_or("", |j| &rest[i + j + 1..]);
+        let after = &rest[i + SIG_TAG.len()..];
+        match after.find('>') {
+            Some(j) if is_signature(&after[..j]) => {
+                out.push_str(&rest[..i]);
+                rest = &after[j + 1..];
+            }
+            // (not a signature: kept as typed)
+            _ => {
+                out.push_str(&rest[..i + SIG_TAG.len()]);
+                rest = after;
+            }
+        }
     }
     out.push_str(rest);
     out
@@ -677,6 +693,11 @@ impl Link {
             encrypted: false,
             text: format!("🔓 {} sent no key (not Openslot, or encryption is off there): this link is NOT encrypted", self.partner),
         })
+    }
+
+    /// Nothing has come from the partner yet: its first frame may be its announcement.
+    pub fn expects_announcement(&self) -> bool {
+        !self.heard_partner
     }
 
     /// An announcement is only ever the partner's first frame: one after that (an old one
@@ -1021,8 +1042,12 @@ mod tests {
         // a later link: the saved key still checks it
         let b2 = Link::start(&pb, "K1ABC", "W1AW").0;
         assert!(matches!(b2.verify(&pb, "line one\r\nline two", sig.unwrap()), SecureNote::Signed { check: SigCheck::Valid(KeyTrust::Known), .. }));
-        assert_eq!(strip_signatures(&format!("{signed}\r\nnext{}", "<OSG:abc>")), "line one\r\n\r\nline two\r\nnext");
+        let other = pb.sign_text("K1ABC", "W1AW", "x").unwrap();
+        assert_eq!(strip_signatures(&format!("{signed}\r\nnext{}", &other[1..])), "line one\r\n\r\nline two\r\nnext");
         assert_eq!(split_signature("no <OSG:sig here>"), ("no <OSG:sig here>", None));
+        // (only a real signature's length is one: anything else is text as typed)
+        assert_eq!(split_signature("look <OSG:abc>"), ("look <OSG:abc>", None));
+        assert_eq!(strip_signatures("look <OSG:abc> and <OSG:"), "look <OSG:abc> and <OSG:");
     }
 
     #[test]

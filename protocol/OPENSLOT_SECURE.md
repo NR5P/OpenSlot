@@ -27,6 +27,10 @@ encryption, 98 bytes without.
 The receiver trusts an identity key on first use, per base callsign. A different key later
 is kept aside and flagged until the operator accepts it.
 
+Only the partner's first frame on a link is read as an announcement (`<OSK:>` or `<OSP:>`).
+A frame that starts with either tag later on (played back, or typed) changes nothing: it is
+read as an ordinary message, and flagged as unencrypted on an encrypted link.
+
 ## Shared-key announcement `<OSP:…>`
 
 Sent instead of `<OSK:>` when *Use shared keys* is on and a shared key is set for the
@@ -61,7 +65,7 @@ ChaCha20-Poly1305 key per direction with info
 
 **AES-256-GCM** instead, when either side asked for it (flag 4 in its `<OSK:>`, or a version 2
 `<OSP:>`): the same, with info `"OSE2 " …` and AES-256-GCM in place of ChaCha20-Poly1305
-everywhere below. Asking is covered by the announcement's signature (`<OSK:>`) or can't be
+below (the frame's aad stays `"OSE1"`: the two ciphers never share a key). Asking is covered by the announcement's signature (`<OSK:>`) or can't be
 changed without the shared key (`<OSP:>`), so it can't be stripped on the way.
 
     counter (4, big-endian, from 1, strictly increasing per direction)
@@ -71,12 +75,13 @@ changed without the shared key (`<OSP:>`), so it can't be stripped on the way.
 The whole frame is sealed, as VarAC would have sent it, after the queue joins messages with
 CRLF. The receiver opens it and reads it as a normal frame. VarAC's frame numbering counts
 the plaintext both ways, as before. A station ID on its own (`de CALL`, `de CALL <R+NN>`,
-` <R+NN>`) stays in the clear. Any other clear frame on an encrypted link is flagged to the
-operator.
+` <R+NN>`) stays in the clear, and so may the callee's `<Q>` / opening queued on `CONNECTED`
+(sent before our key reached it). Any other clear frame on an encrypted link is flagged to
+the operator. An `<OSE:>` frame on a link that isn't encrypted is read as text.
 
 ## Signature `<OSG:…>`
 
-The 64-byte Ed25519 signature at the end of a typed message or a VMail (`<SM>…`) sent on a
+The 64-byte Ed25519 signature (86 characters; anything else in `<OSG:…>` is text) at the end of a typed message or a VMail (`<SM>…`) sent on a
 link that isn't encrypted (an encrypted link is already authenticated by the signed
 announcements). It covers
 `"OSG1\n" FROM "\n" TO "\n"` + the message with blank lines removed (lines are CRLF-separated;
