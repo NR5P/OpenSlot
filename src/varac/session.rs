@@ -4545,6 +4545,160 @@ mod secure_tests {
         assert_eq!(sent(&mut d, 1000).await.as_deref(), Some("hi there"));
     }
 
+    /// One of two real sessions on a pretend air: its modem's command and data sockets.
+    async fn station(call: &str, partner: &str, caller: bool, setup: impl FnOnce(&SecurePolicy)) -> (VaracSession, TcpStream, TcpStream) {
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap().0, data.accept().await.unwrap().0) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (mut c, d) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: call.into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(0), bbs_dir: None, email_gate: None, bbs_gate: None, policy: Default::default(),
+        };
+        cfg.policy.on_calling_frequency.store(false, std::sync::atomic::Ordering::Relaxed);
+        setup(&cfg.policy.secure);
+        let s = VaracSession::new(vara, cfg);
+        let (from, to) = if caller { (call, partner) } else { (partner, call) };
+        c.write_all(format!("CONNECTED {from} {to} 500\r").as_bytes()).await.unwrap();
+        (s, c, d)
+    }
+
+    /// The air between two sessions: what one hands its modem reaches the other, and the
+    /// sender's modem then reports its buffer empty. Everything sent is kept in `heard`.
+    fn air(a: (TcpStream, TcpStream), b: (TcpStream, TcpStream)) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ac, ad) = a;
+        let (bc, bd) = b;
+        let (adr, adw) = ad.into_split();
+        let (bdr, bdw) = bd.into_split();
+        for (mut from, mut to, mut cmd, h) in [(adr, bdw, ac, heard.clone()), (bdr, adw, bc, heard.clone())] {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n @ 1..) = from.read(&mut buf).await {
+                    h.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    if to.write_all(&buf[..n]).await.is_err() || cmd.write_all(b"BUFFER 0\r").await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        heard
+    }
+
+    /// Both sessions' events for `ms`.
+    async fn run2(a: &mut VaracSession, b: &mut VaracSession, ms: u64) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                tokio::select! {
+                    Some(ev) = a.poll() => ea.push(ev),
+                    Some(ev) = b.poll() => eb.push(ev),
+                }
+            }
+        })
+        .await;
+        (ea, eb)
+    }
+
+    fn vmail(subject: &str, body: &str) -> VMail {
+        VMail {
+            guid: "t".into(), from: String::new(), to: String::new(), subject: subject.into(), body: body.into(),
+            compose_time: String::new(), timestamp: Utc::now(), urgent: false, is_parked: false,
+            has_attachment: false, reply_to: None, raw: false,
+        }
+    }
+
+    fn got_vmail(events: &[SessionEvent]) -> Option<VMail> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Message(IncomingMessage::VMail(v)) => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    fn signed_note(events: &[SessionEvent]) -> Option<SigCheck> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Secure(SecureNote::Signed { check, .. }) => Some(*check),
+            _ => None,
+        })
+    }
+
+    /// Two real sessions: a link with `setup` on each side, settled, then a VMail from the
+    /// caller (and what the air heard).
+    async fn vmail_between(
+        sa: impl FnOnce(&SecurePolicy),
+        sb: impl FnOnce(&SecurePolicy),
+    ) -> (Vec<SessionEvent>, Vec<SessionEvent>, Vec<String>) {
+        let (mut a, ac, ad) = station("N0AAA", "N0BBB", true, sa).await;
+        let (mut b, bc, bd) = station("N0BBB", "N0AAA", false, sb).await;
+        let heard = air((ac, ad), (bc, bd));
+        let (ea0, eb0) = run2(&mut a, &mut b, 3000).await;
+        a.send_vmail(&vmail("Meeting", "At the hall, 7 pm. Bring the antenna.")).await.unwrap();
+        let (mut ea, mut eb) = run2(&mut a, &mut b, 3000).await;
+        ea.splice(0..0, ea0);
+        eb.splice(0..0, eb0);
+        let h = heard.lock().unwrap().clone();
+        (ea, eb, h)
+    }
+
+    #[tokio::test]
+    async fn two_sessions_signed_vmail() {
+        let (_, eb, heard) = vmail_between(|p| p.set(false, true), |_| {}).await;
+        let v = got_vmail(&eb).expect("VMail arrives");
+        assert_eq!((v.subject.as_str(), v.body.as_str()), ("Meeting", "At the hall, 7 pm. Bring the antenna."));
+        assert_eq!(signed_note(&eb), Some(SigCheck::Valid(KeyTrust::FirstContact)), "{eb:?}");
+        assert!(heard.iter().any(|f| f.contains("<SM>") && f.contains(secure::SIG_TAG)), "{heard:?}");
+    }
+
+    #[tokio::test]
+    async fn two_sessions_encrypted_vmail_both_ciphers() {
+        for aes in [false, true] {
+            let on = move |p: &SecurePolicy| {
+                p.set(true, true);
+                p.set_aes(aes);
+            };
+            let (ea, eb, heard) = vmail_between(on, on).await;
+            let v = got_vmail(&eb).expect("VMail arrives");
+            assert_eq!(v.body, "At the hall, 7 pm. Bring the antenna.");
+            assert!(!heard.iter().any(|f| f.contains("hall") || f.contains("Meeting")), "readable on the air: {heard:?}");
+            assert!(!heard.iter().any(|f| f.contains(secure::SIG_TAG)), "no separate signature on an encrypted link");
+            let cipher = if aes { "AES-256-GCM" } else { "ChaCha20-Poly1305" };
+            for ev in [&ea, &eb] {
+                assert!(ev.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: true, text }) if text.contains(cipher))), "{ev:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_sessions_shared_key_vmail_and_chat_both_ways() {
+        let secret = secure::generate_shared_secret();
+        let (s1, s2) = (secret.clone(), secret.clone());
+        let (mut a, ac, ad) = station("N0AAA", "N0BBB", true, |p| {
+            p.set_shared(true);
+            p.add_shared(secure::SharedKey::new("club", "N0BBB", &s1).unwrap());
+        }).await;
+        let (mut b, bc, bd) = station("N0BBB", "N0AAA", false, |p| {
+            p.set_shared(true);
+            p.add_shared(secure::SharedKey::new("club", "*", &s2).unwrap());
+        }).await;
+        let heard = air((ac, ad), (bc, bd));
+        // (typed as soon as the link is up: held until both keys are in)
+        while !matches!(a.state, SessionState::Connected) {
+            run2(&mut a, &mut b, 20).await;
+        }
+        a.send_typed("typed before the keys crossed").await.unwrap();
+        let (_, eb) = run2(&mut a, &mut b, 3000).await;
+        assert!(eb.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::RawText(t)) if t == "typed before the keys crossed")), "{eb:?}");
+        b.send_typed("and back").await.unwrap();
+        a.send_vmail(&vmail("Plan", "Net at 0200Z")).await.unwrap();
+        let (ea, eb) = run2(&mut a, &mut b, 3000).await;
+        assert!(ea.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::RawText(t)) if t == "and back")), "{ea:?}");
+        assert_eq!(got_vmail(&eb).map(|v| v.body), Some("Net at 0200Z".into()));
+        let h = heard.lock().unwrap().clone();
+        assert!(!h.iter().any(|f| f.contains(secure::KEY_TAG) || f.contains("crossed") || f.contains("0200Z") || f.contains("and back")), "{h:?}");
+    }
+
     #[tokio::test]
     async fn signed_both_ways() {
         let (mut s, mut c, mut d) = linked(false, true).await;
