@@ -30,7 +30,7 @@ started from.
 ## Building and installing
 
 Needs Rust with the MSVC toolchain (Visual Studio's C++ build tools), and the XARA checkout
-next to this repository (`Desktop\xara` beside `Desktop\varac-rust`).
+next to this repository (`Desktop\xara` beside `Desktop\OpenSlot`), on the branch you want built in (normally `main`).
 
     powershell -ExecutionPolicy Bypass -File windows\install.ps1
 

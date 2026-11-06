@@ -309,6 +309,19 @@ pub struct ConfigFile {
     /// VarAC [VMAIL] SendRelayNotifications / AllowParking (both ON by default)
     pub send_relay_notifications: Option<bool>,
     pub allow_parking: Option<bool>,
+    /// Openslot: "Use encryption", the box that makes the encryption options and the main
+    /// page's lock available (off by default; not allowed on amateur frequencies)
+    pub use_encryption: Option<bool>,
+    /// Openslot: the main page's lock, encryption on or off (kept as it was left)
+    pub encryption_lock: Option<bool>,
+    /// Openslot: encrypt links with Openslot stations that have it on too (off by default)
+    pub encryption: Option<bool>,
+    /// Openslot: sign what we type and our VMail (off by default)
+    pub signing: Option<bool>,
+    /// Openslot: use the shared keys typed in for stations (kept in keys.json; off by default)
+    pub shared_keys: Option<bool>,
+    /// Openslot: encrypt with AES-256-GCM instead of ChaCha20-Poly1305 (off by default)
+    pub encryption_aes: Option<bool>,
     /// VarAC [APPEARANCE] UITheme: DEFAULT or SCIFI
     pub ui_theme: Option<String>,
     /// VarAC MuteAllSounds and the Play…Sound switches (keys of the sounds switched off)
@@ -850,6 +863,24 @@ pub fn rotator() -> Option<(String, u16)> {
             f.rotator_port.unwrap_or(12000),
         )
     })
+}
+
+/// Openslot's encryption and signing as the config file sets them, with the station keys
+/// kept next to it (`keys.json`).
+/// Encryption may be used now: "Use encryption" is checked and the main page's lock is on.
+pub fn encryption_unlocked(f: &ConfigFile) -> bool {
+    f.use_encryption.unwrap_or(false) && f.encryption_lock.unwrap_or(false)
+}
+
+pub fn apply_secure(p: &crate::varac::secure::SecurePolicy) {
+    if let Some(dir) = config_dir() {
+        p.open_keyring(dir.join("keys.json"));
+    }
+    let f = read_config_file().unwrap_or_default();
+    let on = encryption_unlocked(&f);
+    p.set(on && f.encryption.unwrap_or(false), f.signing.unwrap_or(false));
+    p.set_shared(on && f.shared_keys.unwrap_or(false));
+    p.set_aes(f.encryption_aes.unwrap_or(false));
 }
 
 pub fn path_finder_enabled() -> bool {

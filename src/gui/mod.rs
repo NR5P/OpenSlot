@@ -328,6 +328,13 @@ impl VaracApp {
                 f.ale_enabled = cfg.ale_enabled.unwrap_or(false);
                 f.send_relay_notifications = cfg.send_relay_notifications.unwrap_or(true);
                 f.allow_parking = cfg.allow_parking.unwrap_or(true);
+                f.encrypt_link = cfg.encryption.unwrap_or(false);
+                f.sign_messages = cfg.signing.unwrap_or(false);
+                f.use_shared_keys = cfg.shared_keys.unwrap_or(false);
+                f.use_encryption = cfg.use_encryption.unwrap_or(false);
+                state.encryption_lock = cfg.encryption_lock.unwrap_or(false);
+                state.encryption_saved = (f.use_encryption, f.encrypt_link, f.use_shared_keys);
+                f.use_aes = cfg.encryption_aes.unwrap_or(false);
                 f.incoming_files_size_limit = cfg.incoming_files_size_limit.unwrap_or(5000).to_string();
                 f.photo_send_minutes = cfg.photo_send_minutes.unwrap_or(crate::varac::images::PHOTO_MINUTES_DEFAULT);
                 f.emcomm_auto_reply_checkin = cfg.emcomm_auto_reply_checkin.unwrap_or(true);
@@ -487,6 +494,10 @@ impl VaracApp {
 
     fn process_session_messages(&mut self) {
         while let Ok(msg) = self.session_rx.try_recv() {
+            // (a signature note belongs to the message right after it, nothing later)
+            if !matches!(msg, SessionMsg::Secure(_) | SessionMsg::Message(_)) {
+                self.state.pending_signature = None;
+            }
             match msg {
                 SessionMsg::Connected { source, destination, bandwidth } => {
                     if let Some(w) = self.state.ale.as_mut() {
@@ -687,6 +698,7 @@ impl VaracApp {
                     self.state.status_msg = "Ping finished".into();
                 }
                 SessionMsg::Disconnected => {
+                    (self.state.link_encrypted, self.state.pending_signature) = (false, None);
                     // an ALE attempt that never connected: next option
                     if self.state.connected_to.is_none() {
                         if let Some(w) = self.state.ale.as_mut() {
@@ -1221,6 +1233,26 @@ impl VaracApp {
                 SessionMsg::Message(msg) => {
                     self.handle_incoming_message(&msg);
                 }
+                SessionMsg::Secure(note) => {
+                    use crate::varac::secure::SecureNote;
+                    match note {
+                        SecureNote::Link { encrypted, text } => {
+                            self.state.link_encrypted = encrypted;
+                            self.state.add_system_chat(text);
+                        }
+                        SecureNote::Signed { .. } | SecureNote::Unencrypted(_) => self.state.pending_signature = Some(note),
+                        SecureNote::Warning(text) => self.state.add_system_chat(text),
+                        // (what wasn't sent goes back to the message box, as EDIT does)
+                        SecureNote::Withheld { text, typed } => {
+                            self.state.add_system_chat(text);
+                            if !typed.is_empty() {
+                                let mut back = typed.iter().map(|t| t.replace("//n", "\n")).collect::<Vec<_>>().join("\n");
+                                back.push('\n');
+                                self.state.input_text = back + &self.state.input_text;
+                            }
+                        }
+                    }
+                }
                 SessionMsg::Log(text) => {
                     self.state.add_log(text);
                 }
@@ -1589,6 +1621,22 @@ impl VaracApp {
         }
     }
 
+    /// The lock above SEND was clicked: encryption on or off from the next link, kept for
+    /// the next start.
+    fn encryption_lock_tick(&mut self) {
+        if !std::mem::take(&mut self.state.encryption_lock_toggled) {
+            return;
+        }
+        let lock = !self.state.encryption_lock;
+        self.state.encryption_lock = lock;
+        crate::config::update_config_file(|c| c.encryption_lock = Some(lock));
+        let (use_encryption, encrypt_link, shared) = self.state.encryption_saved;
+        let on = use_encryption && lock;
+        self.station_config.policy.secure.set_encrypt(on && encrypt_link);
+        self.station_config.policy.secure.set_shared(on && shared);
+        self.state.add_log(format!("Encryption {} (from the next link)", if on { "ON" } else { "off" }));
+    }
+
     fn freq_schedule_tick(&mut self) {
         use crate::varac::scheduler::{self as sch, Mode, ScanAction};
         if std::mem::take(&mut self.state.fsr_dirty) {
@@ -1883,6 +1931,37 @@ impl VaracApp {
     }
 
     /// Tell PSKReporter who we are and whether to report (startup, Settings saved).
+    /// The badge for the partner's chat line (encrypted link, or how its signature checked
+    /// out). A signature on anything else, or one that fails, is also told in the chat.
+    fn incoming_security(&mut self, msg: &IncomingMessage, signature: Option<&crate::varac::secure::SecureNote>) -> Option<state::LineSecurity> {
+        use crate::varac::secure::{KeyTrust, SecureNote, SigCheck};
+        let chat = matches!(msg, IncomingMessage::Chat(_) | IncomingMessage::RawText(_));
+        let check = match signature {
+            Some(SecureNote::Unencrypted(text)) => {
+                self.state.add_system_chat(text.clone());
+                return None;
+            }
+            Some(SecureNote::Signed { check, text }) => {
+                let doubtful = matches!(check, SigCheck::Bad | SigCheck::Valid(KeyTrust::Changed));
+                if !chat {
+                    let what = if matches!(msg, IncomingMessage::VMail(_)) { "VMail: " } else { "" };
+                    self.state.add_system_chat(format!("{what}{text}"));
+                } else if doubtful {
+                    self.state.add_system_chat(text.clone());
+                }
+                Some(*check)
+            }
+            _ => None,
+        };
+        if !chat {
+            return None;
+        }
+        if self.state.link_encrypted {
+            return Some(state::LineSecurity::Encrypted);
+        }
+        check.map(state::LineSecurity::of)
+    }
+
     fn configure_psk(&self) {
         let lg = crate::config::logging();
         let _ = self.psk.send(crate::varac::pskreporter::Command::Configure {
@@ -1936,6 +2015,9 @@ impl VaracApp {
         }
         let ts = self.state.format_time();
         let partner = self.state.connected_to.clone().unwrap_or_else(|| "?".into());
+        // Openslot: this message's signature check (it came just before) and the link's state
+        let signature = self.state.pending_signature.take();
+        let badge = self.incoming_security(msg, signature.as_ref());
 
         match msg {
             IncomingMessage::Opening(report) => {
@@ -2132,6 +2214,7 @@ impl VaracApp {
                     reply_to: chat_msg.reply_to.clone(),
                     chat_id: self.state.rx_chat_id,
                     reply_quote: chat_msg.reply_to.as_deref().and_then(|r| r.parse().ok()).and_then(|id| self.state.chat_quote(id)),
+                    secure: badge,
                     ..Default::default()
                 });
                 if let Some(guid) = &self.current_qso_guid {
@@ -2173,6 +2256,7 @@ impl VaracApp {
                     is_system: false,
                     reply_to: None,
                     chat_id: self.state.rx_chat_id,
+                    secure: badge,
                     ..Default::default()
                 });
                 if let Some(guid) = &self.current_qso_guid {
@@ -2772,6 +2856,7 @@ impl VaracApp {
 
 
         self.freq_schedule_tick();
+        self.encryption_lock_tick();
 
         // Rig control event processing
         if let Some(ref mut rig) = self.rig {
@@ -4178,6 +4263,198 @@ fn our_lines_in_frame(lines: &std::collections::VecDeque<ChatLine>, text: &str, 
     parts.iter().filter_map(|p| lines.iter().rposition(|l| l.is_outgoing && want(l) && &l.text == p)).collect()
 }
 
+/// Openslot's encryption and signing switches, our key and the stations' keys.
+fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy, linked: bool) {
+    // (what a box does, under it in small type)
+    let explain = |ui: &mut egui::Ui, text: &str| {
+        ui.indent(text, |ui| ui.label(RichText::new(text).small().color(theme::MUTED)));
+    };
+    ui.heading("Encryption");
+    ui.label(RichText::new("⚠ Encryption is not allowed on amateur radio frequencies (FCC §97.113(a)(4), and most countries' \
+        rules). Use it only where it's permitted, such as MARS, SHARES or other licensed services. It works only between \
+        Openslot stations.").small().color(theme::YELLOW));
+    ui.add_space(4.0);
+    ui.checkbox(&mut form.use_encryption, RichText::new("Use encryption").strong());
+    explain(ui, "Makes the options below available, and puts a 🔒 button above SEND on the main page to turn encryption \
+        on and off from there. With this off, nothing is ever encrypted and the options are greyed out.");
+    ui.add_enabled_ui(form.use_encryption, |ui| {
+        ui.indent("encryption_options", |ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("1. How the key is agreed").strong());
+            ui.label(RichText::new("Pick one or both. This decides how the two stations end up with the same secret key.")
+                .small().color(theme::MUTED));
+            ui.add_space(2.0);
+            ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations (X25519 key exchange)");
+            explain(ui, "Scrambles everything on the link (chat, VMail and files) so only the station you're linked with can read it. \
+                It works only when that station is Openslot and has this on too. Keys are made and swapped by themselves at the start \
+                of the link; until the other station's key arrives, what you type waits, so nothing private goes out in the clear. \
+                Encrypted lines show 🔒 beside the time. If the other station isn't Openslot, or has this off, the chat says \
+                \"🔓 this link is NOT encrypted\" and everything goes out as normal. Your station ID (de CALL) always goes in the clear.");
+            ui.add_space(4.0);
+            ui.checkbox(&mut form.use_shared_keys, "Use shared keys (pre-shared key with PBKDF2, X25519 link keys)");
+            explain(ui, "Encryption with a key you and the other operator arranged beforehand, for the stations listed below. With \
+                the same key on both sides, the link is encrypted from the very first frame, and nothing about either station's key \
+                can be read on the air. A fresh link key is made every time, so even if a shared key leaks later, recordings of \
+                earlier links can't be read with it alone. If the other station has no key for you, or a different one, the chat \
+                says \"🔓 this link is NOT encrypted\", and what you typed goes out in the clear. Works on its own, whether or not \
+                the option above is on.");
+            if form.use_shared_keys {
+                draw_shared_keys(ui, form, secure);
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("2. Encryption method (cipher)").strong());
+            ui.label(RichText::new("Pick one. This is what scrambles the messages with that key, whichever way above was used.")
+                .small().color(theme::MUTED));
+            ui.add_space(2.0);
+            ui.radio_value(&mut form.use_aes, false, "ChaCha20-Poly1305 (256-bit, the default)");
+            explain(ui, "A modern cipher used by HTTPS, Signal and WireGuard.");
+            ui.radio_value(&mut form.use_aes, true, "AES-256-GCM (256-bit)");
+            explain(ui, "The better-known standard, equally strong. Pick it when a rule you work under asks for AES.");
+            ui.label(RichText::new("If either station picks AES-256-GCM, the link uses it. The chat names the cipher when the link \
+                is encrypted (🔒 Encrypted link with … (AES-256-GCM; …)).").small().color(theme::MUTED));
+        });
+    });
+    ui.add_space(8.0);
+    ui.heading("Signing");
+    ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail (Ed25519 digital signatures)");
+    explain(ui, "Adds a digital signature to what you type and to your VMail (not VMail with attachments), so other Openslot \
+        stations can check it really came from you and wasn't changed. The text stays readable to everyone: signing hides \
+        nothing and is not encryption, so it doesn't need the box above. On their side, a green ✔ means it's from your key; \
+        ⚠ means it isn't the key they saved for you, or the text was changed. On an encrypted link no separate signature is \
+        sent: the encryption already proves who's talking.");
+    ui.label(RichText::new("With encryption or signing on, VarAC stations see Openslot's key and signature tags (<OSK:…>, \
+        <OSG:…>) as text, so leave them off when you work VarAC stations.").small().color(theme::MUTED));
+    ui.add_space(8.0);
+    let mine = secure.my_fingerprint();
+    ui.horizontal(|ui| {
+        ui.label("Your key (Ed25519 identity):");
+        match &mine {
+            Some(fp) => { ui.label(RichText::new(fp).monospace().strong()); }
+            None => { ui.label(RichText::new("made when you save with Encrypt links or signing on").color(theme::MUTED)); }
+        }
+        if mine.is_some() && !form.confirm_new_identity {
+            let button = ui.add_enabled(!linked, egui::Button::new("Make a new key…").small());
+            let button = if linked {
+                button.on_disabled_hover_text("Disconnect first: the station you're linked with has your current key for this link")
+            } else {
+                button.on_hover_text("Throw this key away and make a new one, if it may have been seen by someone else")
+            };
+            if button.clicked() {
+                form.confirm_new_identity = true;
+            }
+        }
+    });
+    ui.label(RichText::new("Your station's permanent key, used by Encrypt links and signing (not by shared keys). It proves your \
+        messages and links come from you. It's swapped by itself when you link; to be sure who you're talking to, compare the \
+        fingerprints with the other station some other way (voice, email).").small().color(theme::MUTED));
+    if form.confirm_new_identity {
+        ui.add_space(4.0);
+        ui.label(RichText::new("⚠ Make a new key? The current one is thrown away for good. Do this if your computer or keys.json \
+            may have been seen by someone else. Every station you've linked with will be warned that you sent a new key, and \
+            won't trust it until they accept it, so tell them your new fingerprint some other way (voice, email).")
+            .small().color(theme::YELLOW));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!linked, egui::Button::new("Yes, make a new key")).clicked() {
+                secure.replace_identity();
+                form.confirm_new_identity = false;
+            }
+            if ui.button("Cancel").clicked() {
+                form.confirm_new_identity = false;
+            }
+        });
+    }
+    ui.add_space(8.0);
+    ui.heading("Stations' keys");
+    let stations = secure.stations();
+    if stations.is_empty() {
+        ui.label(RichText::new("None yet: a station's key is saved the first time you link with it.").color(theme::MUTED));
+        return;
+    }
+    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+        egui::Grid::new("station_keys").num_columns(4).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+            for s in stations {
+                ui.label(RichText::new(&s.call).strong());
+                ui.label(RichText::new(&s.fingerprint).monospace());
+                ui.label(RichText::new(format!("since {}", s.first_seen)).small().color(theme::MUTED));
+                ui.horizontal(|ui| {
+                    if let Some(new) = &s.new_fingerprint {
+                        ui.label(RichText::new(format!("⚠ sent a new key {new}")).small().color(theme::YELLOW));
+                        if ui.small_button("Accept new key").on_hover_text("Only if you've checked with them that it's theirs").clicked() {
+                            secure.accept_new_key(&s.call);
+                        }
+                    }
+                    if ui.small_button("Forget").on_hover_text("Its key is saved again on the next link").clicked() {
+                        secure.forget(&s.call);
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    });
+}
+
+/// The shared keys typed in beforehand (kept in keys.json), and a row to add one.
+fn draw_shared_keys(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
+    ui.indent("shared_keys", |ui| {
+        ui.label(RichText::new("Give the other operator the same key some other way (in person, by phone or email), never over the radio. \
+            Letter case, spaces and dashes don't matter when it's typed in. A key for * is used with any station that has no key of its own here.").small().color(theme::MUTED));
+        let keys = secure.shared_keys();
+        if !keys.is_empty() {
+            egui::Grid::new("shared_key_list").num_columns(4).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                for k in keys {
+                    ui.label(RichText::new(&k.name).strong());
+                    ui.label(k.calls.join(" "));
+                    // (only the start of the key on screen)
+                    let start: String = k.secret.chars().take(4).collect();
+                    ui.label(RichText::new(format!("{start}-…")).monospace().color(theme::MUTED));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Copy key").clicked() {
+                            ui.ctx().copy_text(k.secret.clone());
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            secure.remove_shared(&k.name);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        }
+        let (name, calls, secret, error) = &mut form.shared_new;
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(name).desired_width(90.0).hint_text("name"));
+            ui.add(TextEdit::singleline(calls).desired_width(150.0).hint_text("callsigns, or *"));
+            ui.add(TextEdit::singleline(secret).desired_width(260.0).hint_text("key").font(egui::TextStyle::Monospace));
+            if ui.small_button("Generate").on_hover_text("Make a new random key to share").clicked() {
+                *secret = crate::varac::secure::generate_shared_secret();
+            }
+            if ui.button("Add").clicked() {
+                match crate::varac::secure::SharedKey::new(name, calls, secret) {
+                    Ok(k) => {
+                        secure.add_shared(k);
+                        (*name, *calls, *secret, *error) = Default::default();
+                    }
+                    Err(why) => *error = Some(why.to_string()),
+                }
+            }
+        });
+        if let Some(why) = error {
+            ui.label(RichText::new(why.as_str()).small().color(theme::RED));
+        }
+    });
+}
+
+/// The small mark beside a chat line's time: encrypted, or how it was signed.
+fn security_mark(sec: state::LineSecurity) -> (&'static str, Color32, &'static str) {
+    use state::LineSecurity::*;
+    match sec {
+        Encrypted => ("🔒", theme::GREEN, "Encrypted"),
+        Signed => ("✔", theme::MUTED, "Signed"),
+        Verified => ("✔", theme::GREEN, "Signed: it's from this station's key"),
+        Unverified => ("⚠", theme::YELLOW, "Signed, but not with the key saved for this station"),
+        Forged => ("⚠", theme::RED, "The signature doesn't match: this may not be from them, or it was changed"),
+    }
+}
+
 /// Under one of our lines: where it is on its way out. Queued: a slowly drifting dashed
 /// track. On the air: a glowing bar that fills as the modem's buffer empties (moving on
 /// smoothly between its reports at the current speed), with speed and time left. Sent: the
@@ -4694,6 +4971,10 @@ fn draw_chat_area(ui: &mut egui::Ui, state: &mut GuiState) {
                                             }
                                             ui.label(RichText::new(&line.callsign).strong().color(call_color));
                                             ui.label(RichText::new(&line.time).small().color(theme::MUTED));
+                                            if let Some(sec) = line.secure {
+                                                let (mark, color, tip) = security_mark(sec);
+                                                ui.label(RichText::new(mark).small().color(color)).on_hover_text(tip);
+                                            }
                                         });
                                         if let Some(q) = &line.reply_quote {
                                             ui.label(RichText::new(format!(">>>> REPLIED TO: {q}")).small().italics().color(theme::MUTED));
@@ -6579,7 +6860,7 @@ fn draw_settings_window(
             // Tab bar
             ui.horizontal(|ui| {
                 // Same order as VarAC's Settings window (indices are stable ids)
-                let tabs = [(5, "RIG"), (1, "Vara"), (2, "QSO"), (3, "CQ / Beacon"), (0, "My Information"), (6, "Email"), (7, "AI / HamPlay"), (4, "Appearance")];
+                let tabs = [(5, "RIG"), (1, "Vara"), (2, "QSO"), (3, "CQ / Beacon"), (0, "My Information"), (6, "Email"), (7, "AI / HamPlay"), (4, "Appearance"), (8, "Security")];
                 for (i, label) in tabs {
                     if ui.selectable_label(state.settings_form.settings_tab == i, label).clicked() {
                         state.settings_form.settings_tab = i;
@@ -7327,6 +7608,10 @@ fn draw_settings_window(
                         });
                     }
                     7 => features::draw_ai_settings(ui, &mut state.settings_form),
+                    8 => {
+                        let linked = state.connected_to.is_some();
+                        draw_security_settings(ui, &mut state.settings_form, &station_config.policy.secure, linked)
+                    }
                     _ => {}
                 }
             });
@@ -7361,6 +7646,12 @@ fn draw_settings_window(
                     station_config.policy.file_size_limit.store(f.incoming_files_size_limit.trim().parse().unwrap_or(5000), std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.auto_file.store(f.emcomm_mode && f.emcomm_auto_file_approval, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.allow_parking.store(f.allow_parking, std::sync::atomic::Ordering::Relaxed);
+                    // (encryption only with Use encryption checked and the main page's lock on)
+                    let on = f.use_encryption && state.encryption_lock;
+                    station_config.policy.secure.set(on && f.encrypt_link, f.sign_messages);
+                    station_config.policy.secure.set_shared(on && f.use_shared_keys);
+                    state.encryption_saved = (f.use_encryption, f.encrypt_link, f.use_shared_keys);
+                    station_config.policy.secure.set_aes(f.use_aes);
                     station_config.policy.ai_gateway.store(f.ai_enabled && f.ai_announce, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.set_emcomm(
                         f.emcomm_mode && f.emcomm_disable_snr,
@@ -7734,6 +8025,12 @@ fn save_config_file(state: &GuiState) {
         ale_enabled: Some(form.ale_enabled),
         send_relay_notifications: Some(form.send_relay_notifications),
         allow_parking: Some(form.allow_parking),
+        encryption: Some(form.encrypt_link),
+        signing: Some(form.sign_messages),
+        shared_keys: Some(form.use_shared_keys),
+        use_encryption: Some(form.use_encryption),
+        encryption_lock: Some(state.encryption_lock),
+        encryption_aes: Some(form.use_aes),
         incoming_files_size_limit: form.incoming_files_size_limit.trim().parse().ok(),
         photo_send_minutes: Some(form.photo_send_minutes),
         mute_all_sounds: existing.mute_all_sounds,
@@ -9906,6 +10203,7 @@ pub fn spawn_session_bridge(
                             }
                             crate::varac::session::SessionEvent::Handshake(step) => SessionMsg::Log(format!("Handshake: {step}")),
                             crate::varac::session::SessionEvent::Notice(m) => SessionMsg::SystemChat(m),
+                            crate::varac::session::SessionEvent::Secure(n) => SessionMsg::Secure(n),
                             crate::varac::session::SessionEvent::QsyInvitation { target, inviter } => {
                                 qsy_inviting = inviter;
                                 SessionMsg::QsyInvitation { target, inviter }
@@ -10820,7 +11118,7 @@ async fn process_command(
         }
         GuiCommand::SendChat(text) => {
             if let Some(sess) = session.as_mut() {
-                let _ = sess.send_chat(&text).await;
+                let _ = sess.send_typed(&text).await;
             }
         }
         GuiCommand::SendVMail(vmail) => {

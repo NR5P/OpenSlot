@@ -3248,6 +3248,7 @@ dependencies = [
  "open",
  "ratatui",
  "rfd",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

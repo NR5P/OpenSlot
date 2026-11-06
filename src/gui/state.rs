@@ -37,6 +37,8 @@ pub enum SessionMsg {
         snr: Option<f32>,
     },
     Message(IncomingMessage),
+    /// Openslot encryption / signing state or signature check
+    Secure(crate::varac::secure::SecureNote),
     /// A station handed us an email as gateway; it's queued for the sender (error = not stored).
     EmailQueued { from: String, to: String, subject: String, error: Option<String> },
     /// Connected gateway and emails queued: ask whether to relay (VarAC's popup).
@@ -241,6 +243,33 @@ pub struct ChatLine {
     pub alert: Option<AlertColors>,
     /// Our line's send progress (lines typed this session)
     pub tx: Option<TxStage>,
+    /// Encrypted / signed (Openslot), shown beside the time
+    pub secure: Option<LineSecurity>,
+}
+
+/// How a chat line went over the air (Openslot encryption / signing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineSecurity {
+    Encrypted,
+    /// Ours, signed
+    Signed,
+    /// Theirs: the signature checks out with their saved key
+    Verified,
+    /// Theirs: signed with a key that isn't the saved one, or one we don't have
+    Unverified,
+    /// Theirs: the signature doesn't match
+    Forged,
+}
+
+impl LineSecurity {
+    pub fn of(check: crate::varac::secure::SigCheck) -> Self {
+        use crate::varac::secure::{KeyTrust, SigCheck};
+        match check {
+            SigCheck::Valid(KeyTrust::FirstContact | KeyTrust::Known) => Self::Verified,
+            SigCheck::Valid(KeyTrust::Changed) | SigCheck::NoKey => Self::Unverified,
+            SigCheck::Bad => Self::Forged,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -485,6 +514,17 @@ pub struct SettingsForm {
     pub ale_enabled: bool,
     pub send_relay_notifications: bool,
     pub allow_parking: bool,
+    /// Openslot encryption / signing (Security tab)
+    pub encrypt_link: bool,
+    pub sign_messages: bool,
+    pub use_shared_keys: bool,
+    /// "Use encryption": the encryption options and the main page's lock are available
+    pub use_encryption: bool,
+    pub use_aes: bool,
+    /// A shared key being added: name, callsigns, key, and why it wasn't taken
+    pub shared_new: (String, String, String, Option<String>),
+    /// "Make a new key" pressed: asking to be sure before the old key is thrown away
+    pub confirm_new_identity: bool,
     pub incoming_files_size_limit: String,
     /// The image shrinker starts at about this many minutes to send (0: largest that fits)
     pub photo_send_minutes: u32,
@@ -521,6 +561,16 @@ pub struct SettingsForm {
 }
 
 pub struct GuiState {
+    /// The current link is encrypted (Openslot)
+    pub link_encrypted: bool,
+    /// The lock above SEND: encryption on or off (Openslot; kept as it was left)
+    pub encryption_lock: bool,
+    /// The lock was clicked: to apply and save
+    pub encryption_lock_toggled: bool,
+    /// The saved Security choices the lock needs: Use encryption, Encrypt links, Use shared keys
+    pub encryption_saved: (bool, bool, bool),
+    /// How the partner's next message's signature checked out (Openslot)
+    pub pending_signature: Option<crate::varac::secure::SecureNote>,
     pub chat_lines: VecDeque<ChatLine>,
     pub cq_entries: VecDeque<CqEntry>,
     pub beacon_entries: VecDeque<CqEntry>,
@@ -1071,6 +1121,11 @@ impl GuiState {
             "Offline — use Connect Modem".into()
         };
         Self {
+            link_encrypted: false,
+            encryption_lock: false,
+            encryption_lock_toggled: false,
+            encryption_saved: (false, false, false),
+            pending_signature: None,
             chat_lines: VecDeque::with_capacity(500),
             cq_entries: VecDeque::with_capacity(200),
             beacon_entries: VecDeque::with_capacity(200),
@@ -1392,6 +1447,13 @@ impl GuiState {
                 ale_enabled: false,
                 send_relay_notifications: true,
                 allow_parking: true,
+                encrypt_link: false,
+                sign_messages: false,
+                use_shared_keys: false,
+                use_encryption: false,
+                use_aes: false,
+                shared_new: Default::default(),
+                confirm_new_identity: false,
                 incoming_files_size_limit: "5000".into(),
                 photo_send_minutes: crate::varac::images::PHOTO_MINUTES_DEFAULT,
                 emcomm_auto_reply_checkin: true,

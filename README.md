@@ -146,9 +146,15 @@ tools/interop_lab.sh down /tmp/lab
 
 ## Building
 
+This builds the plain Linux program, without the built-in modem:
+
 ```bash
 cargo build --release
 ```
+
+The Mac, Windows, Linux, iPhone and Android apps with the XARA modem built in, where that
+modem comes from, and how releases are made are all in
+[docs/building-and-releasing.md](docs/building-and-releasing.md).
 
 The binary is at `target/release/openslot` (~6 MB, includes bundled SQLite).
 

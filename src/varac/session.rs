@@ -69,6 +69,8 @@ pub struct StationPolicy {
     pub freq_schedule: std::sync::Arc<std::sync::RwLock<String>>,
     /// The scanner runs with "announce" on (advanced beacons say so)
     pub scanning: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Openslot's optional encryption and signing (both off by default) and the key store
+    pub secure: crate::varac::secure::SecurePolicy,
 }
 
 /// May a VMail with attachment be sent now (see `attachment_gate`)?
@@ -145,6 +147,7 @@ impl StationPolicy {
             emcomm_no_call_id: Arc::new(AtomicBool::new(false)),
             auto_file: Arc::new(AtomicBool::new(false)),
             scanning: Arc::new(AtomicBool::new(false)),
+            secure: crate::varac::secure::SecurePolicy::default(),
         }
     }
 
@@ -297,7 +300,10 @@ pub struct VaracSession {
     /// Outgoing frames. VarAC sends one message per transmission and waits for the
     /// modem to report `BUFFER 0` before the next: when several frames arrive in one
     /// VARA packet, real VarAC fails with "UNABLE TO DECODE DATA" and aborts the link.
-    tx_queue: std::collections::VecDeque<(String, Vec<u8>)>,
+    /// (text, frame, held: waits while encryption is on and the partner's key is unknown)
+    /// (text, frame, held while waiting for the partner's key, the operator's own words:
+    /// only ever sent encrypted while encryption is on)
+    tx_queue: std::collections::VecDeque<(String, Vec<u8>, bool, bool)>,
     /// Text of the frame the modem is sending now (numbered once it's out)
     tx_inflight_text: Option<String>,
     /// Chat frame number: frames numbered in both directions, per QSO (as VarAC numbers them)
@@ -347,6 +353,10 @@ pub struct VaracSession {
     pending: std::collections::VecDeque<SessionEvent>,
     /// Raw text of the frame most recently decoded.
     last_raw: String,
+    /// This link's encryption / signing state (Off unless an option is on, or the partner signs)
+    secure: crate::varac::secure::Link,
+    /// The frame being read came in the clear (on an encrypted link, its messages are flagged)
+    frame_was_clear: bool,
     /// Modem KISS port: broadcasts are AX.25 UI frames sent here, no link needed.
     kiss: Option<crate::vara::kiss::KissConnection>,
 }
@@ -500,6 +510,8 @@ impl VaracSession {
             services_reply: None,
             pending: std::collections::VecDeque::new(),
             last_raw: String::new(),
+            secure: crate::varac::secure::Link::default(),
+            frame_was_clear: false,
             kiss: None,
         }
     }
@@ -632,17 +644,20 @@ impl VaracSession {
                                 // shows them; tags on their own lines are handled one by one)
                                 let mut i = 0;
                                 while i < parts.len() {
-                                    let part = parts[i];
+                                    // (an Openslot signature ends its message)
+                                    let (part, mut sig) = crate::varac::secure::split_signature(parts[i]);
                                     let mut m = self.complete(parse_application_message(part));
                                     let mut raw_part = part.to_string();
                                     if let IncomingMessage::RawText(ref mut t) = m {
-                                        while i + 1 < parts.len() {
-                                            match parse_application_message(parts[i + 1]) {
+                                        while i + 1 < parts.len() && sig.is_none() {
+                                            let (next_part, next_sig) = crate::varac::secure::split_signature(parts[i + 1]);
+                                            match parse_application_message(next_part) {
                                                 IncomingMessage::RawText(next) => {
                                                     t.push('\n');
                                                     t.push_str(&next);
                                                     raw_part.push_str("\r\n");
-                                                    raw_part.push_str(parts[i + 1]);
+                                                    raw_part.push_str(next_part);
+                                                    sig = next_sig;
                                                     i += 1;
                                                 }
                                                 _ => break,
@@ -651,12 +666,19 @@ impl VaracSession {
                                     }
                                     self.last_raw = raw_part.clone();
                                     self.side_info(&m, &raw_part);
+                                    self.check_signature(&m, &raw_part, sig);
                                     self.handshake_step(m).await;
                                     i += 1;
                                 }
                             } else {
-                                let m = self.complete(msg);
+                                let (unsigned, sig) = crate::varac::secure::split_signature(&raw);
+                                let (unsigned, sig) = (unsigned.to_string(), sig.map(str::to_string));
+                                let (m, raw) = match sig {
+                                    Some(_) => (self.complete(parse_application_message(&unsigned)), unsigned),
+                                    None => (self.complete(msg), raw),
+                                };
                                 self.side_info(&m, &raw);
+                                self.check_signature(&m, &raw, sig.as_deref());
                                 self.last_raw = raw;
                                 self.handshake_step(m).await;
                             }
@@ -888,7 +910,7 @@ impl VaracSession {
             return Ok(());
         }
         let minute = now.timestamp() / 60;
-        let queued = self.tx_inflight_text.iter().chain(self.tx_queue.iter().map(|(t, _)| t)).any(|t| t.starts_with("<R"));
+        let queued = self.tx_inflight_text.iter().chain(self.tx_queue.iter().map(|(t, ..)| t)).any(|t| t.starts_with("<R"));
         if self.vsnr_minute == Some(minute) || queued {
             return Ok(());
         }
@@ -1371,6 +1393,17 @@ impl VaracSession {
                 // Ping = link to the `-T` alias VarAC registers with MYCALL
                 let my_test = format!("{}-T", base_call(&self.config.callsign));
                 self.ping = if we_called { partner.to_uppercase().ends_with("-T") } else { me.to_uppercase() == my_test };
+                // Openslot encryption / signing: our key announcement goes first (nothing when
+                // both options are off; a ping carries no messages)
+                let (link, key) = if self.ping {
+                    (crate::varac::secure::Link::default(), None)
+                } else {
+                    crate::varac::secure::Link::start(&self.config.policy.secure, &base_call(&self.config.callsign), &base_call(&partner))
+                };
+                self.secure = link;
+                if let Some(key) = key {
+                    let _ = self.send_framed(&key).await;
+                }
                 if self.ping {
                     self.handshake = Handshake::Done;
                     self.handshake_deadline = None;
@@ -1414,6 +1447,8 @@ impl VaracSession {
                         }
                     }
                 }
+                // (what's queued from here on waits for the partner's key, when encryption is on)
+                self.secure.connect_done();
                 // Always `source` = us, `destination` = the other station.
                 SessionEvent::Connected { source: me, destination: partner, bandwidth }
             }
@@ -1435,6 +1470,7 @@ impl VaracSession {
                 self.state = SessionState::Idle;
                 self.connected_to = None;
                 self.data_buf.clear();
+                self.secure = crate::varac::secure::Link::default();
                 // Drop anything still queued for the old link so it can't leak into the next one
                 let _ = self.vara.send_command(&crate::vara::commands::VaraCommand::CleanTxBuffer).await;
                 SessionEvent::Disconnected
@@ -1525,6 +1561,10 @@ impl VaracSession {
                     }
                 }
 
+                // Openslot key announcement / encrypted frame (unchanged otherwise)
+                let Some(message) = self.secure_in(message) else {
+                    return Some(SessionEvent::Handshake("Openslot key exchange".into()));
+                };
                 self.number_frame(false, message.clone());
                 // (VarAC's sender numbers a file frame that carries a VMail twice)
                 if message.starts_with("<SFB") && message.contains("<SM") {
@@ -1543,6 +1583,80 @@ impl VaracSession {
                 None
             }
         }
+    }
+
+    /// A frame from the partner, before anything else reads it: take in its key
+    /// announcement, note when its first frame has none, and decrypt an encrypted frame.
+    /// None when nothing is left to read.
+    fn secure_in(&mut self, mut message: String) -> Option<String> {
+        use crate::varac::secure::{ENC_TAG, KEY_TAG, SHARED_TAG};
+        let mut notes = Vec::new();
+        // (an announcement is only ever the partner's first frame, and only an encrypted
+        // link has <OSE:> frames: anything else that starts so is just text, as typed)
+        let announced = self.secure.expects_announcement().then(|| {
+            message.strip_prefix(KEY_TAG).map(|r| (r, false))
+                .or_else(|| message.strip_prefix(SHARED_TAG).map(|r| (r, true)))
+        }).flatten();
+        if let Some((rest, shared)) = announced {
+            let (payload, after) = rest.split_once('>').unwrap_or((rest, ""));
+            notes = if shared {
+                self.secure.partner_shared(payload)
+            } else {
+                self.secure.partner_key(&self.config.policy.secure, payload)
+            };
+            let after = after.trim_start_matches("\r\n").to_string();
+            // (VarAC numbers every frame: so do we, this one too)
+            if after.trim().is_empty() {
+                self.number_frame(false, message);
+                message = String::new();
+            } else {
+                message = after;
+            }
+        } else {
+            notes.extend(self.secure.no_partner_key());
+        }
+        let sealed = message.starts_with(ENC_TAG) && self.secure.is_encrypted();
+        self.frame_was_clear = !sealed;
+        if sealed {
+            match self.secure.open(&message) {
+                Ok(plain) => message = plain,
+                Err(note) => {
+                    notes.push(note);
+                    self.number_frame(false, message);
+                    message = String::new();
+                }
+            }
+        }
+        self.pending.extend(notes.into_iter().map(SessionEvent::Secure));
+        // (settled, what waited for the partner's key goes out with the pump that follows
+        // every data frame)
+        (!message.is_empty()).then_some(message)
+    }
+
+    /// A signed message from the partner (`text` without its signature), or one that came
+    /// unencrypted on an encrypted link: tell the app, just before the message itself (the
+    /// app ties it to the next message event only).
+    fn check_signature(&mut self, msg: &IncomingMessage, text: &str, sig: Option<&str>) {
+        // (the callee's <Q> and opening go out on CONNECTED, in the clear when our key
+        // hasn't reached it yet: not worth a warning — anything typed or a VMail still is)
+        let early_handshake = self.handshake != Handshake::Done
+            && !matches!(msg, IncomingMessage::RawText(_) | IncomingMessage::Chat(_) | IncomingMessage::VMail(_));
+        let note = match sig {
+            _ if self.frame_was_clear && self.secure.is_encrypted() => self.secure.unencrypted(text, early_handshake),
+            Some(sig) => Some(self.secure.verify(&self.config.policy.secure, text, sig)),
+            None => None,
+        };
+        self.pending.extend(note.map(SessionEvent::Secure));
+    }
+
+    /// `text` signed when signing is on (an encrypted link already proves who sent it).
+    fn signed(&self, text: &str) -> String {
+        let p = &self.config.policy.secure;
+        if !p.sign_on() || self.secure.is_encrypted() || self.ping {
+            return text.to_string();
+        }
+        let (me, partner) = (base_call(&self.config.callsign), base_call(self.connected_to.as_deref().unwrap_or("")));
+        p.sign_text(&me, &partner, text).unwrap_or_else(|| text.to_string())
     }
 
     // === Sending ===
@@ -1586,10 +1700,16 @@ impl VaracSession {
         self.send_framed(text).await
     }
 
-    /// Send a VMail.
+    /// Send what the operator typed: like `send_chat`, signed when signing is on.
+    pub async fn send_typed(&mut self, text: &str) -> Result<(), std::io::Error> {
+        let text = self.signed(text);
+        self.send_own(&text).await
+    }
+
+    /// Send a VMail (signed when signing is on).
     pub async fn send_vmail(&mut self, vmail: &VMail) -> Result<(), std::io::Error> {
-        let wire = self.vmail_wire(vmail);
-        self.send_framed(&wire).await
+        let wire = self.signed(&self.vmail_wire(vmail));
+        self.send_own(&wire).await
     }
 
     /// VMail as VarAC sends it: `<SM>`, `<TME:>` only for mail written over
@@ -1661,8 +1781,8 @@ impl VaracSession {
     #[allow(dead_code)]
     pub async fn send_away(&mut self, message: Option<&str>) -> Result<(), std::io::Error> {
         match message {
-            Some(msg) => self.send_framed(&format!("<AWAY>{msg}")).await,
-            None => self.send_framed("<AWAY>").await,
+            Some(msg) => self.send_own(&format!("<AWAY>{msg}")).await,
+            None => self.send_own("<AWAY>").await,
         }
     }
 
@@ -1715,7 +1835,7 @@ impl VaracSession {
 
     /// File data frame, as VarAC sends it: `<SFB>` + base64 of the gzip.
     pub async fn send_file_payload(&mut self, base64_data: &str) -> Result<(), std::io::Error> {
-        self.send_framed(&format!("<SFB>{base64_data}")).await
+        self.send_own(&format!("<SFB>{base64_data}")).await
     }
 
     /// Offer a file the VarAC way: `<SF:name.VarAC_gzip|size|MD5>`, then send the data
@@ -1745,7 +1865,7 @@ impl VaracSession {
             self.file_in_progress = true;
             self.outgoing_is_vmail = offer.starts_with("<SFM:");
             self.outgoing_file = Some(data);
-            self.send_framed(&offer).await?;
+            self.send_own(&offer).await?;
         }
         Ok(())
     }
@@ -2080,7 +2200,7 @@ impl VaracSession {
         if !matches!(self.state, SessionState::Connected | SessionState::AwaitingDisconnect) {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "no VARA link"));
         }
-        self.tx_queue.push_front((text.to_string(), framing::encode_frame(text)));
+        self.tx_queue.push_front((text.to_string(), framing::encode_frame(text), self.secure.holds_new_frames(), false));
         self.pump_tx().await
     }
 
@@ -2158,12 +2278,17 @@ impl VaracSession {
 
     /// What waits to be sent (VarAC's "In queue"): the frame in the modem first, then the queue.
     pub fn queued_texts(&self) -> Vec<String> {
-        self.tx_inflight_text.iter().chain(self.tx_queue.iter().map(|(t, _)| t)).cloned().collect()
+        self.tx_inflight_text.iter().chain(self.tx_queue.iter().map(|(t, ..)| t))
+            .filter(|t| !crate::varac::secure::is_announcement(t))
+            .map(|t| crate::varac::secure::strip_signatures(t)).collect()
     }
 
     /// CLR / EDIT: drop what hasn't been handed to the modem yet, returning its texts.
     pub fn take_queue(&mut self) -> Vec<String> {
-        self.tx_queue.drain(..).map(|(t, _)| t).collect()
+        // (a signature is made again when the text is sent again)
+        let (key, rest): (Vec<_>, Vec<_>) = self.tx_queue.drain(..).partition(|(t, ..)| crate::varac::secure::is_announcement(t));
+        self.tx_queue.extend(key);
+        rest.into_iter().map(|(t, ..)| crate::varac::secure::strip_signatures(&t)).collect()
     }
 
     async fn pump_tx(&mut self) -> Result<(), std::io::Error> {
@@ -2171,23 +2296,37 @@ impl VaracSession {
             return Ok(());
         }
         self.tx_resume_at = None;
+        // Encryption on and the partner hasn't shown yet whether it can: hold what we'd say
+        // (only our key announcement and the callee's first handshake frames go out), so
+        // nothing that should be encrypted goes out in the clear
+        let waiting = self.secure.state() == crate::varac::secure::LinkState::Waiting;
+        if waiting && self.tx_queue.front().is_some_and(|(_, _, held, _)| *held) {
+            return Ok(());
+        }
+        // Encryption is on and the link settled without it: what the operator wrote stays here
+        if self.withholding() && self.tx_queue.iter().any(|(.., own)| *own) {
+            let (own, rest): (Vec<_>, Vec<_>) = self.tx_queue.drain(..).partition(|(.., own)| *own);
+            self.tx_queue.extend(rest);
+            self.withheld(own.into_iter().map(|(t, ..)| t).collect());
+        }
         // VarAC drops a waiting "is typing" when real text is queued behind it
-        if self.tx_queue.len() > 1 && self.tx_queue.front().is_some_and(|(t, _)| t.starts_with("&IT&")) {
+        if self.tx_queue.len() > 1 && self.tx_queue.front().is_some_and(|(t, ..)| t.starts_with("&IT&")) {
             self.tx_queue.pop_front();
         }
-        if let Some((mut text, mut frame)) = self.tx_queue.pop_front() {
+        if let Some((mut text, mut frame, ..)) = self.tx_queue.pop_front() {
             // ...and sends up to three queued messages as one frame, joined by a line break —
             // not when the first is typing, a file, a QSY invitation, a reply, a like, a BBS
             // list or an AI question, and the next can't be a file frame, a reply, a like,
             // typing or an AI question (as VarAC does)
-            let head_ok = |t: &str| !["&IT&", "<SF:", "<SFM:", "<QSYU>", "<QSYD>", "<QSYF>", "<Q:", "<QF:", "<C:", "&L", "<BL:"]
+            // (Openslot's key announcement always goes alone: it's never encrypted)
+            let head_ok = |t: &str| !["&IT&", "<SF:", "<SFM:", "<QSYU>", "<QSYD>", "<QSYF>", "<Q:", "<QF:", "<C:", "&L", "<BL:", crate::varac::secure::KEY_TAG, crate::varac::secure::SHARED_TAG]
                 .iter().any(|p| t.starts_with(p)) && !t.to_ascii_uppercase().starts_with("AI:");
-            let next_ok = |t: &str| !["<SF", "<C:", "&L", "&IT&"].iter().any(|p| t.starts_with(p))
+            let next_ok = |t: &str| !["<SF", "<C:", "&L", "&IT&", crate::varac::secure::KEY_TAG, crate::varac::secure::SHARED_TAG].iter().any(|p| t.starts_with(p))
                 && !t.to_ascii_uppercase().starts_with("AI:");
             if head_ok(&text) && !text.starts_with("<SF") {
                 let mut joined = 1;
-                while joined < 3 && self.tx_queue.front().is_some_and(|(t, _)| next_ok(t)) {
-                    let (next, _) = self.tx_queue.pop_front().unwrap_or_default();
+                while joined < 3 && self.tx_queue.front().is_some_and(|(t, _, held, _)| next_ok(t) && !(waiting && *held)) {
+                    let (next, ..) = self.tx_queue.pop_front().unwrap_or_default();
                     text = format!("{text}\r\n{next}");
                     joined += 1;
                 }
@@ -2195,9 +2334,18 @@ impl VaracSession {
                     frame = framing::encode_frame(&text);
                 }
             }
+            // (our key announcement and a station ID on its own stay in the clear)
+            if self.secure.is_encrypted() && !crate::varac::secure::is_announcement(&text) && !crate::varac::secure::is_station_id(&text) {
+                // (signed while the link wasn't settled yet: the encrypted link proves who
+                // sent it, so the signature doesn't go along)
+                text = crate::varac::secure::strip_signatures(&text);
+                let sealed = self.secure.seal(&text).ok_or_else(|| std::io::Error::other("encryption failed: frame not sent"))?;
+                frame = framing::encode_frame(&sealed);
+            }
             self.tx_inflight_since = Some(tokio::time::Instant::now());
             // (the app shows the line on the air, filling as the modem's buffer empties)
-            self.pending.push_back(SessionEvent::TxStarted { text: text.clone(), bytes: frame.len() });
+            let shown = crate::varac::secure::strip_signatures(&text);
+            self.pending.push_back(SessionEvent::TxStarted { text: shown, bytes: frame.len() });
             self.tx_inflight_text = Some(text);
             self.vara.send_data(&frame).await?;
         }
@@ -2205,6 +2353,60 @@ impl VaracSession {
     }
 
     async fn send_framed(&mut self, text: &str) -> Result<(), std::io::Error> {
+        self.send_framed_as(text, false).await
+    }
+
+    /// What the operator wrote (typed text, a VMail, a file, an away message): while
+    /// encryption is on for this partner it goes out only on an encrypted link — held until
+    /// the partner's key settles it, and not sent at all when the link isn't encrypted.
+    async fn send_own(&mut self, text: &str) -> Result<(), std::io::Error> {
+        if self.withholding() {
+            self.withheld(vec![text.to_string()]);
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not sent: encryption is on and this link isn't encrypted"));
+        }
+        self.send_framed_as(text, true).await
+    }
+
+    /// Encryption is on for this partner and the link settled without it.
+    fn withholding(&self) -> bool {
+        use crate::varac::secure::LinkState;
+        !self.ping
+            && matches!(self.secure.state(), LinkState::Off | LinkState::Clear)
+            && self.connected_to.as_deref().is_some_and(|p| self.config.policy.secure.wants_encryption_with(&base_call(p)))
+    }
+
+    /// Tell the app what wasn't sent (and give typed text back); a file offer or payload
+    /// that isn't sent ends that transfer.
+    fn withheld(&mut self, texts: Vec<String>) {
+        let mut typed = Vec::new();
+        let mut what: Vec<&str> = Vec::new();
+        for t in texts {
+            let w = if t.starts_with("<SFM:") || (t.starts_with("<SFB") && self.outgoing_is_vmail) {
+                "a VMail with attachments (it stays in the Outbox)"
+            } else if t.starts_with("<SF") {
+                "a file"
+            } else if t.starts_with("<SM") {
+                "a VMail (it stays in the Outbox)"
+            } else if t.starts_with("<AWAY>") {
+                "your away message"
+            } else {
+                typed.push(crate::varac::secure::strip_signatures(&t));
+                "what you typed (back in the message box)"
+            };
+            if t.starts_with("<SF") {
+                (self.file_in_progress, self.outgoing_is_vmail, self.outgoing_file) = (false, false, None);
+                self.file_jobs.clear();
+            }
+            if !what.contains(&w) {
+                what.push(w);
+            }
+        }
+        let p = self.connected_to.as_deref().map(base_call).unwrap_or_default();
+        let text = format!("🔒 NOT SENT: encryption is on and this link with {p} is NOT encrypted: {}. Turn encryption off to send unencrypted.", what.join(", "));
+        self.pending.push_back(SessionEvent::Secure(crate::varac::secure::SecureNote::Withheld { text, typed }));
+    }
+
+    async fn send_framed_as(&mut self, text: &str, own: bool) -> Result<(), std::io::Error> {
         if text.contains("<S:") {
             self.services_announced = true;
         }
@@ -2213,7 +2415,7 @@ impl VaracSession {
         if !matches!(self.state, SessionState::Connected | SessionState::AwaitingDisconnect) {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "no VARA link"));
         }
-        self.tx_queue.push_back((text.to_string(), framing::encode_frame(text)));
+        self.tx_queue.push_back((text.to_string(), framing::encode_frame(text), self.secure.holds_new_frames(), own));
         self.pump_tx().await
     }
 
@@ -2224,6 +2426,7 @@ impl VaracSession {
             return;
         }
         self.chat_id += 1;
+        let text = crate::varac::secure::strip_signatures(&text);
         self.pending.push_back(SessionEvent::FrameId { outgoing, id: self.chat_id, text });
     }
 
@@ -2766,16 +2969,20 @@ pub enum SessionEvent {
     /// Partner allows auto-QSY: ask the operator for a slot, then call
     /// `send_qsy_invitation` (VarAC's "Send QSY Invitation" dialog).
     QsyInvitationRequested,
+    /// Openslot encryption / signing: the link's state, or how the next message's
+    /// signature checked out (comes just before it).
+    Secure(crate::varac::secure::SecureNote),
     VaraEvent(VaraEvent),
 }
 
 /// The incoming `<SFB>` file frame at the head of `buf`, not complete yet: (bytes of it
 /// here, its declared length). The payload is base64, so one character is one byte.
+/// (On an encrypted link the file comes sealed in an `<OSE:…>` frame: that's counted.)
 pub fn partial_file_frame(buf: &[u8]) -> Option<(usize, usize)> {
     let space = buf.iter().take(12).position(|&b| b == b' ')?;
     let total: usize = std::str::from_utf8(&buf[..space]).ok()?.parse().ok()?;
     let payload = &buf[space + 1..];
-    if !payload.starts_with(b"<SFB") || total == 0 {
+    if !(payload.starts_with(b"<SFB") || payload.starts_with(crate::varac::secure::ENC_TAG.as_bytes())) || total == 0 {
         return None;
     }
     Some((payload.len().min(total), total))
@@ -2831,6 +3038,8 @@ mod tests {
         assert_eq!(partial_file_frame(b"9 <SFB>QUJD12 <Q>"), Some((9, 9)));
         assert_eq!(partial_file_frame(b"12 <Q>hello"), None);
         assert_eq!(partial_file_frame(b"<SFB>"), None);
+        // (sealed on an encrypted link)
+        assert_eq!(partial_file_frame(b"500 <OSE:AAAAAQabcdef"), Some((17, 500)));
         assert_eq!(partial_file_frame(b""), None);
     }
 
@@ -4378,3 +4587,366 @@ pub(crate) async fn accept_qsy_for_test(s: &mut VaracSession, ev: &SessionEvent)
         let _ = s.answer_qsy(true, false, *hz).await;
     }
 }
+
+/// Openslot encryption and signing, end to end: our session on a fake modem, the partner
+/// played by the test with `secure::Link`.
+#[cfg(test)]
+mod secure_tests {
+    use super::*;
+    use crate::varac::secure::{self, KeyTrust, SecureNote, SecurePolicy, SigCheck};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Our session (W5TST, called by NR5P off a calling frequency) and the modem's two sockets.
+    async fn linked(encrypt: bool, sign: bool) -> (VaracSession, TcpStream, TcpStream) {
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap().0, data.accept().await.unwrap().0) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (mut c, d) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: "W5TST".into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(0), bbs_dir: None, email_gate: None, bbs_gate: None, policy: Default::default(),
+        };
+        cfg.policy.on_calling_frequency.store(false, std::sync::atomic::Ordering::Relaxed);
+        cfg.policy.secure.set(encrypt, sign);
+        let s = VaracSession::new(vara, cfg);
+        c.write_all(b"CONNECTED NR5P W5TST 500\r").await.unwrap();
+        (s, c, d)
+    }
+
+    async fn run(s: &mut VaracSession, ms: u64) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                if let Some(ev) = s.poll().await {
+                    events.push(ev);
+                }
+            }
+        })
+        .await;
+        events
+    }
+
+    /// The next frame we sent (its text), or None when nothing came.
+    async fn sent(d: &mut TcpStream, ms: u64) -> Option<String> {
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_millis(ms), d.read(&mut buf)).await.ok()?.ok()?;
+        let f = String::from_utf8_lossy(&buf[..n]).into_owned();
+        Some(f.split_once(' ').map(|(_, t)| t.to_string()).unwrap_or(f))
+    }
+
+    async fn send(d: &mut TcpStream, text: &str) {
+        d.write_all(&framing::encode_frame(text)).await.unwrap();
+    }
+
+    /// Our key announcement and opening, as the callee sends them on CONNECTED.
+    async fn opening(s: &mut VaracSession, c: &mut TcpStream, d: &mut TcpStream) -> String {
+        run(s, 200).await;
+        let key = sent(d, 1000).await.expect("key announcement");
+        assert!(key.starts_with(secure::KEY_TAG), "{key}");
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        run(s, 1300).await;
+        assert!(sent(d, 1000).await.expect("opening").starts_with("de W5TST"));
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        run(s, 100).await;
+        key
+    }
+
+    fn payload(frame: &str) -> &str {
+        frame.strip_prefix(secure::KEY_TAG).and_then(|r| r.strip_suffix('>')).unwrap()
+    }
+
+    #[tokio::test]
+    async fn both_on_chat_is_held_then_encrypted_both_ways() {
+        let (mut s, mut c, mut d) = linked(true, false).await;
+        let key = opening(&mut s, &mut c, &mut d).await;
+        // typed before the partner's key: held, never sent in the clear
+        s.send_typed("secret plan").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 200).await, None);
+
+        let pp = SecurePolicy::default();
+        pp.set(true, false);
+        let (mut peer, peer_key) = secure::Link::start(&pp, "NR5P", "W5TST");
+        assert!(matches!(peer.partner_key(&pp, payload(&key))[..], [SecureNote::Link { encrypted: true, .. }]));
+        send(&mut d, &peer_key.unwrap()).await;
+        let events = run(&mut s, 300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: true, .. }))), "{events:?}");
+        let frame = sent(&mut d, 1000).await.unwrap();
+        assert!(frame.starts_with(secure::ENC_TAG) && !frame.contains("secret"), "{frame}");
+        assert_eq!(peer.open(&frame).unwrap(), "secret plan");
+
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        send(&mut d, &peer.seal("hello back").unwrap()).await;
+        let events = run(&mut s, 300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::RawText(t)) if t == "hello back")), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Secure(_))), "{events:?}");
+
+        // in the clear on this link: flagged (a station ID isn't)
+        send(&mut d, "de NR5P <R+05>").await;
+        send(&mut d, "sneaky").await;
+        let events = run(&mut s, 300).await;
+        let notes: Vec<_> = events.iter().filter(|e| matches!(e, SessionEvent::Secure(_))).collect();
+        assert!(matches!(notes[..], [SessionEvent::Secure(SecureNote::Unencrypted(_))]), "{events:?}");
+
+        // our station ID stays in the clear
+        s.send_chat("de W5TST <R+05>").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 1000).await.as_deref(), Some("de W5TST <R+05>"));
+    }
+
+    #[tokio::test]
+    async fn shared_key_link_sends_no_readable_key() {
+        let (mut s, mut c, mut d) = linked(false, false).await;
+        let secret = secure::generate_shared_secret();
+        s.config.policy.secure.set_shared(true);
+        s.config.policy.secure.add_shared(secure::SharedKey::new("club", "NR5P", &secret).unwrap());
+        run(&mut s, 300).await;
+        let ours = sent(&mut d, 1000).await.unwrap();
+        assert!(ours.starts_with(secure::SHARED_TAG), "{ours}");
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        run(&mut s, 1300).await;
+        assert!(sent(&mut d, 1000).await.unwrap().starts_with("de W5TST"));
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        s.send_typed("meet at the usual place").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 200).await, None);
+
+        let ps = SecurePolicy::default();
+        ps.set_shared(true);
+        ps.add_shared(secure::SharedKey::new("club", "W5TST", &secret).unwrap());
+        let (mut peer, theirs) = secure::Link::start(&ps, "NR5P", "W5TST");
+        let inner = ours.strip_prefix(secure::SHARED_TAG).and_then(|r| r.strip_suffix('>')).unwrap();
+        assert!(matches!(peer.partner_shared(inner)[..], [SecureNote::Link { encrypted: true, .. }]));
+        send(&mut d, &theirs.unwrap()).await;
+        let events = run(&mut s, 300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: true, .. }))), "{events:?}");
+        let frame = sent(&mut d, 1000).await.unwrap();
+        assert_eq!(peer.open(&frame).unwrap(), "meet at the usual place");
+    }
+
+    #[tokio::test]
+    async fn partner_without_key_gets_nothing_we_wrote() {
+        let (mut s, mut c, mut d) = linked(true, false).await;
+        opening(&mut s, &mut c, &mut d).await;
+        s.send_typed("hi there").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 200).await, None);
+        // VarAC answers with its opening: no key. What was held isn't sent, and comes back
+        send(&mut d, "de NR5P <R+18>").await;
+        let events = run(&mut s, 300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: false, .. }))), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Withheld { typed, .. }) if typed == &["hi there"])), "{events:?}");
+        assert_eq!(sent(&mut d, 1000).await, None);
+        assert!(s.queued_texts().is_empty());
+        // nor anything written later on this link
+        let err = s.send_typed("still there?").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let events = run(&mut s, 1300).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Withheld { typed, .. }) if typed == &["still there?"])), "{events:?}");
+        assert_eq!(sent(&mut d, 300).await, None);
+        // ...until encryption is turned off: then it goes out as it is
+        s.config.policy.secure.set(false, false);
+        s.send_typed("unencrypted now").await.unwrap();
+        run(&mut s, 1300).await;
+        assert_eq!(sent(&mut d, 1000).await.as_deref(), Some("unencrypted now"));
+    }
+
+    /// One of two real sessions on a pretend air: its modem's command and data sockets.
+    async fn station(call: &str, partner: &str, caller: bool, setup: impl FnOnce(&SecurePolicy)) -> (VaracSession, TcpStream, TcpStream) {
+        let cmd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cp, dp) = (cmd.local_addr().unwrap().port(), data.local_addr().unwrap().port());
+        let accept = tokio::spawn(async move { (cmd.accept().await.unwrap().0, data.accept().await.unwrap().0) });
+        let vara = VaraConnection::connect("127.0.0.1", cp, dp).await.unwrap();
+        let (mut c, d) = accept.await.unwrap();
+        let cfg = StationConfig {
+            callsign: call.into(), name: None, qth: None, locator: None,
+            services: ServiceFlags(0), bbs_dir: None, email_gate: None, bbs_gate: None, policy: Default::default(),
+        };
+        cfg.policy.on_calling_frequency.store(false, std::sync::atomic::Ordering::Relaxed);
+        setup(&cfg.policy.secure);
+        let s = VaracSession::new(vara, cfg);
+        let (from, to) = if caller { (call, partner) } else { (partner, call) };
+        c.write_all(format!("CONNECTED {from} {to} 500\r").as_bytes()).await.unwrap();
+        (s, c, d)
+    }
+
+    /// The air between two sessions: what one hands its modem reaches the other, and the
+    /// sender's modem then reports its buffer empty. Everything sent is kept in `heard`.
+    fn air(a: (TcpStream, TcpStream), b: (TcpStream, TcpStream)) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ac, ad) = a;
+        let (bc, bd) = b;
+        let (adr, adw) = ad.into_split();
+        let (bdr, bdw) = bd.into_split();
+        for (mut from, mut to, mut cmd, h) in [(adr, bdw, ac, heard.clone()), (bdr, adw, bc, heard.clone())] {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n @ 1..) = from.read(&mut buf).await {
+                    h.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    if to.write_all(&buf[..n]).await.is_err() || cmd.write_all(b"BUFFER 0\r").await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        heard
+    }
+
+    /// Both sessions' events for `ms`.
+    async fn run2(a: &mut VaracSession, b: &mut VaracSession, ms: u64) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                tokio::select! {
+                    Some(ev) = a.poll() => ea.push(ev),
+                    Some(ev) = b.poll() => eb.push(ev),
+                }
+            }
+        })
+        .await;
+        (ea, eb)
+    }
+
+    fn vmail(subject: &str, body: &str) -> VMail {
+        VMail {
+            guid: "t".into(), from: String::new(), to: String::new(), subject: subject.into(), body: body.into(),
+            compose_time: String::new(), timestamp: Utc::now(), urgent: false, is_parked: false,
+            has_attachment: false, reply_to: None, raw: false,
+        }
+    }
+
+    fn got_vmail(events: &[SessionEvent]) -> Option<VMail> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Message(IncomingMessage::VMail(v)) => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    fn signed_note(events: &[SessionEvent]) -> Option<SigCheck> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Secure(SecureNote::Signed { check, .. }) => Some(*check),
+            _ => None,
+        })
+    }
+
+    /// Two real sessions: a link with `setup` on each side, settled, then a VMail from the
+    /// caller (and what the air heard).
+    async fn vmail_between(
+        sa: impl FnOnce(&SecurePolicy),
+        sb: impl FnOnce(&SecurePolicy),
+    ) -> (Vec<SessionEvent>, Vec<SessionEvent>, Vec<String>) {
+        let (mut a, ac, ad) = station("N0AAA", "N0BBB", true, sa).await;
+        let (mut b, bc, bd) = station("N0BBB", "N0AAA", false, sb).await;
+        let heard = air((ac, ad), (bc, bd));
+        let (ea0, eb0) = run2(&mut a, &mut b, 3000).await;
+        a.send_vmail(&vmail("Meeting", "At the hall, 7 pm. Bring the antenna.")).await.unwrap();
+        let (mut ea, mut eb) = run2(&mut a, &mut b, 3000).await;
+        ea.splice(0..0, ea0);
+        eb.splice(0..0, eb0);
+        let h = heard.lock().unwrap().clone();
+        (ea, eb, h)
+    }
+
+    #[tokio::test]
+    async fn two_sessions_signed_vmail() {
+        let (_, eb, heard) = vmail_between(|p| p.set(false, true), |_| {}).await;
+        let v = got_vmail(&eb).expect("VMail arrives");
+        assert_eq!((v.subject.as_str(), v.body.as_str()), ("Meeting", "At the hall, 7 pm. Bring the antenna."));
+        assert_eq!(signed_note(&eb), Some(SigCheck::Valid(KeyTrust::FirstContact)), "{eb:?}");
+        assert!(heard.iter().any(|f| f.contains("<SM>") && f.contains(secure::SIG_TAG)), "{heard:?}");
+    }
+
+    #[tokio::test]
+    async fn two_sessions_encrypted_vmail_both_ciphers() {
+        for aes in [false, true] {
+            let on = move |p: &SecurePolicy| {
+                p.set(true, true);
+                p.set_aes(aes);
+            };
+            let (ea, eb, heard) = vmail_between(on, on).await;
+            let v = got_vmail(&eb).expect("VMail arrives");
+            assert_eq!(v.body, "At the hall, 7 pm. Bring the antenna.");
+            assert!(!heard.iter().any(|f| f.contains("hall") || f.contains("Meeting")), "readable on the air: {heard:?}");
+            assert!(!heard.iter().any(|f| f.contains(secure::SIG_TAG)), "no separate signature on an encrypted link");
+            let cipher = if aes { "AES-256-GCM" } else { "ChaCha20-Poly1305" };
+            for ev in [&ea, &eb] {
+                assert!(ev.iter().any(|e| matches!(e, SessionEvent::Secure(SecureNote::Link { encrypted: true, text }) if text.contains(cipher))), "{ev:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_sessions_shared_key_vmail_and_chat_both_ways() {
+        let secret = secure::generate_shared_secret();
+        let (s1, s2) = (secret.clone(), secret.clone());
+        let (mut a, ac, ad) = station("N0AAA", "N0BBB", true, |p| {
+            p.set_shared(true);
+            p.add_shared(secure::SharedKey::new("club", "N0BBB", &s1).unwrap());
+        }).await;
+        let (mut b, bc, bd) = station("N0BBB", "N0AAA", false, |p| {
+            p.set_shared(true);
+            p.add_shared(secure::SharedKey::new("club", "*", &s2).unwrap());
+        }).await;
+        let heard = air((ac, ad), (bc, bd));
+        // (typed as soon as the link is up: held until both keys are in)
+        while !matches!(a.state, SessionState::Connected) {
+            run2(&mut a, &mut b, 20).await;
+        }
+        a.send_typed("typed before the keys crossed").await.unwrap();
+        let (_, eb) = run2(&mut a, &mut b, 3000).await;
+        assert!(eb.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::RawText(t)) if t == "typed before the keys crossed")), "{eb:?}");
+        b.send_typed("and back").await.unwrap();
+        a.send_vmail(&vmail("Plan", "Net at 0200Z")).await.unwrap();
+        let (ea, eb) = run2(&mut a, &mut b, 3000).await;
+        assert!(ea.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::RawText(t)) if t == "and back")), "{ea:?}");
+        assert_eq!(got_vmail(&eb).map(|v| v.body), Some("Net at 0200Z".into()));
+        let h = heard.lock().unwrap().clone();
+        assert!(!h.iter().any(|f| f.contains(secure::KEY_TAG) || f.contains("crossed") || f.contains("0200Z") || f.contains("and back")), "{h:?}");
+    }
+
+    #[tokio::test]
+    async fn signed_both_ways() {
+        let (mut s, mut c, mut d) = linked(false, true).await;
+        let key = opening(&mut s, &mut c, &mut d).await;
+        // the partner needs nothing on to check our signature
+        let off = SecurePolicy::default();
+        let (mut peer, none) = secure::Link::start(&off, "NR5P", "W5TST");
+        assert!(none.is_none());
+        peer.partner_key(&off, payload(&key));
+        s.send_typed("73 de W5TST").await.unwrap();
+        run(&mut s, 1300).await;
+        let frame = sent(&mut d, 1000).await.unwrap();
+        let (text, sig) = secure::split_signature(&frame);
+        assert_eq!(text, "73 de W5TST");
+        assert!(matches!(peer.verify(&off, text, sig.unwrap()), SecureNote::Signed { check: SigCheck::Valid(KeyTrust::FirstContact), .. }));
+        // what the app is told about our line doesn't show the signature
+        c.write_all(b"BUFFER 0\r").await.unwrap();
+        let events = run(&mut s, 200).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::FrameId { outgoing: true, text, .. } if text == "73 de W5TST")), "{events:?}");
+
+        // the partner signs: we're told how it checked out, then get the message without it
+        let ps = SecurePolicy::default();
+        ps.set(false, true);
+        let (_, their_key) = secure::Link::start(&ps, "NR5P", "W5TST");
+        send(&mut d, &their_key.unwrap()).await;
+        send(&mut d, &ps.sign_text("NR5P", "W5TST", "good copy").unwrap()).await;
+        send(&mut d, &format!("forged<OSG:{}>", "A".repeat(86))).await;
+        let events = run(&mut s, 400).await;
+        let shown: Vec<String> = events.iter().filter_map(|e| match e {
+            SessionEvent::Secure(SecureNote::Signed { check, .. }) => Some(format!("{check:?}")),
+            SessionEvent::Message(IncomingMessage::RawText(t)) => Some(t.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(shown, ["Valid(FirstContact)", "good copy", "Bad", "forged"], "{events:?}");
+    }
+}
+
+/// Two real sessions on a pretend air, every encryption / signing combination.
+#[cfg(test)]
+#[path = "session_two_station_tests.rs"]
+mod two_station_tests;

@@ -26,9 +26,9 @@ How the sharing works:
   in. Phone screens are native because egui can't reliably bring up the on-screen keyboard
   on iOS, and because a phone app needs native audio-session, background-running and
   permission handling.
-- XARA comes from a checkout next to this one (`../xara`), used as a path dependency.
-  Its Windows support (WASAPI audio, COM ports, console Ctrl-C) is on that checkout's
-  `windows` branch.
+- XARA comes from a checkout next to this one (`../xara`, NR5P/xara), used as a path
+  dependency, on whatever branch is checked out there; the Release workflow uses NR5P/xara
+  `main` from GitHub instead. See [docs/building-and-releasing.md](docs/building-and-releasing.md).
 
 Each platform folder is its own Cargo/Xcode/Gradle project with its own `target/` or
 `build/` (git-ignored), so building one never touches the root's `target/`.
@@ -66,9 +66,19 @@ they have their own versions of the desktop's main-screen controls, on the Chat 
 3. **"Bandwidth not allowed!"**: a beacon, CQ, connect or ping refused at 2300 Hz on a
    calling frequency brings up VarAC's text with **Switch to 500 Hz** (desktop:
    `draw_bw_refused` in `src/gui/mod.rs`; mobile-core sends a `bw_refused` event).
+4. **Security settings** (desktop: `draw_security_settings` in `src/gui/mod.rs`): the
+   switches *Encrypt links with other Openslot stations*, *Sign my messages and VMail*
+   and *Use shared keys* (all off by default), applied with `policy.secure.set(encrypt,
+   sign)` and `set_shared(on)` after `policy.secure.open_keyring(<app data>/keys.json)`;
+   the shared keys list (`shared_keys`, `add_shared(SharedKey::new(..))`, `remove_shared`,
+   `generate_shared_secret`); your key's fingerprint and the
+   saved stations' keys (`stations()`, `accept_new_key`, `forget`). The phones already
+   send typed chat through `send_typed` and show the partner's key and signature notes as
+   system lines, so with this they work like the desktop. Desktop chat lines also get a
+   🔒 / ✔ / ⚠ mark.
 
 VARA HF starts at 500 Hz when the modem connects on every platform (as VarAC does).
 
-Note: the macOS and Windows crates were not compiled after this change on the Linux
-machine (they need the `../xara` checkout with `xara-ffi`). The change there is the same
-one line as in `src/main.rs`.
+Note: the macOS crate builds with this change (checked when it was merged into main);
+the Windows crate wasn't compiled on a Windows machine (it needs the `../xara` checkout
+with `xara-ffi`), and the change there is the same one line as in `src/main.rs`.
