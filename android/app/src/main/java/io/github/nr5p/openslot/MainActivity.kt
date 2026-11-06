@@ -388,13 +388,14 @@ fun CqSlotSelector() {
 
 /**
  * The dial frequency (tap it for the picker) and VARA HF's bandwidth buttons, as on the
- * desktop's main screen. The phone doesn't tune the radio: picking a frequency logs it and
+ * desktop's main screen (VARA FM has no bandwidth: an FM label instead). The phone doesn't tune the radio: picking a frequency logs it and
  * applies the calling-frequency rules there.
  */
 @Composable
 fun FrequencyBar() {
     val hz by Core.frequency.collectAsState()
     val bw by Core.bandwidth.collectAsState()
+    val fm by Core.fm.collectAsState()
     var picker by remember { mutableStateOf(false) }
     val band = remember(hz) { Core.bandOf(hz) }
     val onCf = remember(hz) { Core.isCallingFrequency(hz) }
@@ -409,7 +410,9 @@ fun FrequencyBar() {
             Pill("CF", Color(0xFFE8742A))
         }
         Spacer(Modifier.weight(1f))
-        Row(Modifier.clip(RoundedCornerShape(50)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(50))) {
+        // (VARA FM has no bandwidth: a label instead)
+        if (fm) Pill("VARA FM", Color(0xFF8E44AD))
+        else Row(Modifier.clip(RoundedCornerShape(50)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(50))) {
             listOf("500", "2300", "2750").forEach { b ->
                 val on = bw == b
                 Text(
@@ -710,7 +713,7 @@ fun StationsScreen() {
                 Row(Modifier.fillMaxWidth().clickable { picked = h }.padding(horizontal = 16.dp, vertical = 10.dp)) {
                     Column(Modifier.weight(1f)) {
                         Text(h.call, fontWeight = FontWeight.SemiBold)
-                        Text("${if (h.beacon) "Beacon" else "CQ"} · ${h.bandwidth} Hz", style = MaterialTheme.typography.bodySmall)
+                        Text((if (h.beacon) "Beacon" else "CQ") + (if (h.bandwidth in listOf("", "0")) "" else " · ${h.bandwidth} Hz"), style = MaterialTheme.typography.bodySmall)
                         if (h.slot != 0 && !h.beacon) {
                             Text("Waits on ${h.slotLabel}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFE8742A))
                         }

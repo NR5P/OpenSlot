@@ -3,12 +3,14 @@
 A Jetpack Compose app around the Rust core (`../mobile-core`), with the **XARA modem
 built in**. Same screens and features as the iOS app: Chat, Stations, VMail, Modem,
 Settings. The Modem tab is the NR5P XARA app inside Openslot: Start/Stop, the modem's
-settings (XARA here or VARA on the network, audio, PTT, TX drive, **Registered (I hold a
+settings (XARA here or VARA on the network, VARA HF or FM — FM with XARA's narrow or wide
+mode and digipeaters for CQs and beacons — audio, PTT, TX drive, **Registered (I hold a
 VARA licence)**, showing other stations' traffic, debug log and recording, clients on the
 local network, web UI control), and its Web UI (waterfall and status), Received and Log
 pages.
 The Chat screen has the desktop's dial frequency picker (type one, pick a VarAC calling
-frequency or one of your own) and the 500/2300/2750 Hz bandwidth buttons, and sends files
+frequency or one of your own) and the 500/2300/2750 Hz bandwidth buttons (a VARA FM label
+on FM, which has no bandwidth), and sends files
 and photos as the iOS app does (the paperclip; a photo goes through VarAC's image shrinker).
 
 Plug the radio's USB audio interface (a Digirig or similar) into the phone and pick it

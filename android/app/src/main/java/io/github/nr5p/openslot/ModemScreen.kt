@@ -100,6 +100,9 @@ fun ModemSettingsPage() {
     var host by remember { mutableStateOf(prefs.host) }
     var port by remember { mutableStateOf(prefs.port.toString()) }
     var bandwidth by remember { mutableStateOf(prefs.bandwidth) }
+    var modemType by remember { mutableStateOf(prefs.modemType) }
+    var fmWidth by remember { mutableStateOf(prefs.fmWidthArg) }
+    var digipeatVia by remember { mutableStateOf(prefs.digipeatVia) }
     var ptt by remember { mutableStateOf(prefs.ptt) }
     var rigctld by remember { mutableStateOf(prefs.rigctld) }
     var drive by remember { mutableStateOf(prefs.driveDb.toFloat()) }
@@ -138,6 +141,8 @@ fun ModemSettingsPage() {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
+                            // (settings changed while stopped: the engine takes them before going on the air)
+                            if (!online && changed) Core.reloadEngine()
                             if (online) {
                                 Core.goOffline(context)
                             } else {
@@ -163,11 +168,40 @@ fun ModemSettingsPage() {
         Header("Modem")
         Choice("XARA on this phone", source == "builtin") { set { source = "builtin"; prefs.source = source } }
         Choice("VARA on the network", source == "network") { set { source = "network"; prefs.source = source } }
-        Text("Bandwidth", style = MaterialTheme.typography.labelLarge)
+        Text("VARA", style = MaterialTheme.typography.labelLarge)
         Row {
-            listOf("500", "2300", "2750").forEach { bw ->
-                // (applies at once: the modem switches when connected)
-                Choice("$bw Hz", bandwidth == bw) { bandwidth = bw; Core.setBandwidth(bw) }
+            listOf("hf" to "HF", "fm" to "FM").forEach { (t, label) ->
+                Choice(label, modemType == t) { set { modemType = t; prefs.modemType = t; Core.fm.value = t == "fm" } }
+            }
+        }
+        if (modemType == "fm") {
+            if (source == "builtin") {
+                Text("FM mode", style = MaterialTheme.typography.labelLarge)
+                Row {
+                    Choice("Narrow", fmWidth == "narrow") { set { fmWidth = "narrow"; prefs.fmWidth = fmWidth } }
+                    Choice("Wide", fmWidth == "wide") { set { fmWidth = "wide"; prefs.fmWidth = fmWidth } }
+                }
+            }
+            OutlinedTextField(digipeatVia, { digipeatVia = it.uppercase(); set { prefs.digipeatVia = digipeatVia } }, Modifier.fillMaxWidth(),
+                label = { Text("Digipeat via (optional)") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters, autoCorrectEnabled = false))
+            Note(
+                if (source == "builtin") {
+                    "VARA FM, for VHF/UHF radios: narrow for most FM radios through the mic and speaker jacks, wide for a " +
+                        "9600-baud data port. CQs and beacons go through the digipeaters you list (space between them); to " +
+                        "connect through one, call \"CALL VIA DIGI\". No 500/2300 Hz choice and no calling-frequency rules on FM."
+                } else {
+                    "Run VARA FM on the network computer. CQs and beacons go through the digipeaters you list (space between " +
+                        "them); to connect through one, call \"CALL VIA DIGI\"."
+                },
+            )
+        } else {
+            Text("Bandwidth", style = MaterialTheme.typography.labelLarge)
+            Row {
+                listOf("500", "2300", "2750").forEach { bw ->
+                    // (applies at once: the modem switches when connected)
+                    Choice("$bw Hz", bandwidth == bw) { bandwidth = bw; Core.setBandwidth(bw) }
+                }
             }
         }
         if (source != "builtin") {

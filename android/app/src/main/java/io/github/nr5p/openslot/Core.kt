@@ -72,6 +72,10 @@ class Prefs(context: Context) {
     var host by string("host", "192.168.1.10")
     var port by int("port", 8300)
     var bandwidth by string("bandwidth", "500")
+    /** VARA HF or FM ("hf" / "fm"); FM: XARA's narrow or wide, and the digipeaters for CQs and beacons. */
+    var modemType by string("modemType", "hf")
+    var fmWidth by string("fmWidth", "narrow")
+    var digipeatVia by string("digipeatVia", "")
     var frequency by long("frequency", 14_105_000)
     var ptt by string("ptt", "vox")
     var rigctld by string("rigctld", "192.168.1.10:4532")
@@ -128,6 +132,10 @@ class Prefs(context: Context) {
         .put("multi_band_last_heard", multiBandLastHeard)
 
     val builtIn get() = source == "builtin"
+    /** VARA FM instead of VARA HF (no bandwidth choice, no calling-frequency rules). */
+    val fm get() = modemType == "fm"
+    val fmWidthArg get() = if (fmWidth == "wide") "wide" else "narrow"
+    val digipeatViaClean get() = digipeatVia.uppercase().split(' ', ',').filter { it.isNotBlank() }.joinToString(" ")
     val callUpper get() = call.trim().uppercase()
     val callValid: Boolean
         get() = callUpper.matches(Regex("^[A-Z0-9]{3,7}(-[0-9]{1,2})?$")) && callUpper.any { it.isDigit() } &&
@@ -138,12 +146,14 @@ class Prefs(context: Context) {
         .put("name", name).put("qth", qth).put("locator", locator)
         .put("host", if (builtIn) "127.0.0.1" else host).put("cmd_port", if (builtIn) 8300 else port)
         .put("bandwidth", bandwidth).put("frequency", frequency)
+        .put("modem_type", if (fm) "FM" else "HF").put("digipeat_via", digipeatViaClean)
         .let { policy(it) }
         .toString()
 
     /** XARA's options: audio in and out through the chosen devices (by AAudio id). */
     fun modemArguments(): String {
-        val a = mutableListOf("--call", callUpper, "--hf", bandwidth)
+        val a = mutableListOf("--call", callUpper)
+        a += if (fm) listOf("--fm", fmWidthArg) else listOf("--hf", bandwidth)
         a += listOf("--audio", "aaudio", "--capture", "$capture", "--playback", "$playback", "--radio")
         a += listOf("--ptt", if (ptt == "rigctld") "rigctld:$rigctld" else "vox")
         a += listOf("--drive-db", "$driveDb")
@@ -355,6 +365,8 @@ object Core {
     /** The dial frequency (Hz) and VARA HF bandwidth, as the main screen shows them. */
     val frequency = MutableStateFlow(14_105_000L)
     val bandwidth = MutableStateFlow("500")
+    /** VARA FM is set up (the main screen shows that instead of the bandwidth buttons). */
+    val fm = MutableStateFlow(false)
     /** VarAC's "Bandwidth not allowed!": a wide link was refused on a calling frequency. */
     val bwRefused = MutableStateFlow(false)
     private var typingUntil = 0L
@@ -366,6 +378,7 @@ object Core {
         prefs = Prefs(context.applicationContext)
         frequency.value = prefs.frequency
         bandwidth.value = prefs.bandwidth
+        fm.value = prefs.fm
         startEngine()
         scope.launch {
             while (isActive) {
@@ -411,7 +424,7 @@ object Core {
      *  the link, the time it takes, and for a picture the shrinker's result at [pct] (null:
      *  the largest size that fits). Shrinking a photo takes a moment: off the main thread. */
     suspend fun fileInfo(path: String, pct: Int?, quality: Int): JSONObject = withContext(Dispatchers.Default) {
-        val q = JSONObject().put("q", "file_info").put("path", path).put("bandwidth", fileBandwidth)
+        val q = JSONObject().put("q", "file_info").put("path", path).put("bandwidth", fileBandwidth).put("fm", prefs.fm)
             .put("snr", lastSnr).put("quality", quality).put("minutes", prefs.photoMinutes)
         if (pct != null) q.put("pct", pct)
         runCatching { JSONObject(query(q)) }.getOrElse { JSONObject().put("error", "The file couldn't be read.") }
@@ -521,6 +534,14 @@ object Core {
         }
     }
 
+    /** Settings changed while off the air: the engine takes them before going on the air. */
+    fun reloadEngine() {
+        if (!engineRunning.value) return
+        Native.stop()
+        engineRunning.value = false
+        startEngine()
+    }
+
     fun applySettings(context: Context) {
         goOffline(context)
         scope.launch {
@@ -555,6 +576,7 @@ object Core {
     fun settingsSaved() {
         frequency.value = prefs.frequency
         bandwidth.value = prefs.bandwidth
+        fm.value = prefs.fm
     }
 
     /** A frequency typed by the operator (MHz, kHz or Hz, as the desktop reads it), in Hz. */
