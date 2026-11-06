@@ -516,8 +516,13 @@ pub struct SettingsForm {
     pub encrypt_link: bool,
     pub sign_messages: bool,
     pub use_shared_keys: bool,
+    /// "Use encryption": the encryption options and the main page's lock are available
+    pub use_encryption: bool,
+    pub use_aes: bool,
     /// A shared key being added: name, callsigns, key, and why it wasn't taken
     pub shared_new: (String, String, String, Option<String>),
+    /// "Make a new key" pressed: asking to be sure before the old key is thrown away
+    pub confirm_new_identity: bool,
     pub incoming_files_size_limit: String,
     pub emcomm_auto_reply_checkin: bool,
     pub email: String,
@@ -554,6 +559,12 @@ pub struct SettingsForm {
 pub struct GuiState {
     /// The current link is encrypted (Openslot)
     pub link_encrypted: bool,
+    /// The lock above SEND: encryption on or off (Openslot; kept as it was left)
+    pub encryption_lock: bool,
+    /// The lock was clicked: to apply and save
+    pub encryption_lock_toggled: bool,
+    /// The saved Security choices the lock needs: Use encryption, Encrypt links, Use shared keys
+    pub encryption_saved: (bool, bool, bool),
     /// How the partner's next message's signature checked out (Openslot)
     pub pending_signature: Option<crate::varac::secure::SecureNote>,
     pub chat_lines: VecDeque<ChatLine>,
@@ -1101,6 +1112,9 @@ impl GuiState {
         };
         Self {
             link_encrypted: false,
+            encryption_lock: false,
+            encryption_lock_toggled: false,
+            encryption_saved: (false, false, false),
             pending_signature: None,
             chat_lines: VecDeque::with_capacity(500),
             cq_entries: VecDeque::with_capacity(200),
@@ -1423,7 +1437,10 @@ impl GuiState {
                 encrypt_link: false,
                 sign_messages: false,
                 use_shared_keys: false,
+                use_encryption: false,
+                use_aes: false,
                 shared_new: Default::default(),
+                confirm_new_identity: false,
                 incoming_files_size_limit: "5000".into(),
                 emcomm_auto_reply_checkin: true,
                 email: String::new(),

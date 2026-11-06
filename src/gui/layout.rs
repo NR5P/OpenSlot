@@ -297,6 +297,7 @@ fn draw_chat_window(ctx: &egui::Context, state: &mut GuiState, db: &Storage, qso
                 if ui.add_sized([120.0, 30.0], theme::primary_button("SEND", theme::GREEN)).clicked() {
                     state.send_requested = true;
                 }
+                encryption_lock_button(ui, state, Vec2::new(150.0, 30.0));
                 if matches!(state.session_state, SessionState::Connected | SessionState::AwaitingDisconnect) {
                     disconnect_button(ui, state, Vec2::new(120.0, 30.0));
                 }
@@ -1573,6 +1574,39 @@ const SIDE_PANEL_MARGIN_Y: f32 = 12.0;
 ///
 /// `compact` (a window too short for that, the column wider): the options two by two, the
 /// buttons three to a row, the in-QSO requests on one row and Auto log QSO beside LOG.
+/// The lock beside SEND: encryption on or off, there only with "Use encryption" checked in
+/// Settings → Security. It can't change during a link (encryption is agreed at its start).
+fn encryption_lock_button(ui: &mut egui::Ui, state: &mut GuiState, size: Vec2) {
+    let (use_encryption, encrypt_link, shared) = state.encryption_saved;
+    if !use_encryption {
+        return;
+    }
+    let lock = state.encryption_lock;
+    let (text, color) = if lock { ("🔒 Encryption ON", theme::YELLOW) } else { ("🔓 Encryption off", theme::MUTED) };
+    let linked = state.session_state != SessionState::Idle;
+    let chosen = encrypt_link || shared;
+    let button = egui::Button::new(RichText::new(text).color(color).strong()).selected(lock);
+    let r = ui.add_enabled_ui(!linked && chosen, |ui| ui.add_sized(size, button)).inner;
+    let r = if !chosen {
+        r.on_disabled_hover_text("Pick Encrypt links or Use shared keys in Settings → Security first")
+    } else if linked {
+        r.on_disabled_hover_text(if lock {
+            "Encryption is on for links. It can't be changed while you're connected: disconnect first"
+        } else {
+            "Encryption is off for links. It can't be changed while you're connected: disconnect first"
+        })
+    } else {
+        r.on_hover_text(if lock {
+            "Encryption is on for your next link. Click to turn it off. ⚠ Not allowed on amateur radio frequencies"
+        } else {
+            "Click to turn encryption on for your next link. ⚠ Not allowed on amateur radio frequencies"
+        })
+    };
+    if r.clicked() {
+        state.encryption_lock_toggled = true;
+    }
+}
+
 fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState, compact: bool) {
     let connected = state.session_state == SessionState::Connected;
     // Heights measured last frame, for each layout: the options card, and the LOG … SEND
@@ -1779,6 +1813,7 @@ fn draw_side_column(ui: &mut egui::Ui, state: &mut GuiState, compact: bool) {
         if ui.add_sized([w, 30.0], theme::primary_button("SEND", theme::GREEN)).clicked() {
             state.send_requested = true;
         }
+        encryption_lock_button(ui, state, Vec2::new(w, 26.0));
         ui.spacing_mut().interact_size.y = 20.0;
         let mut enter_to_send = !state.multiline_input;
         if ui.checkbox(&mut enter_to_send, label("Enter to send"))

@@ -343,30 +343,42 @@ Right-click **FREQ SCHEDULE** to edit the lists. All three need rig control.
 
 ## Encryption and signing
 
-Three separate options in **Settings → Security**, all off unless you turn them on. They
-work only between Openslot stations. With all three off, Openslot works exactly as it always
-has. For the first two, turning one on is all there is to it: your key is made for you,
-and keys are swapped by themselves when you link. Shared keys are for when you'd rather
-arrange a key with the other station beforehand.
+Options in **Settings → Security**, all off unless you turn them on. They work only
+between Openslot stations. With them all off, Openslot works exactly as it always has.
+
+**Turning encryption on.** Check **Use encryption** first: until it's checked, the
+encryption options are greyed out and nothing is ever encrypted. Under it are two
+choices: **1. How the key is agreed** (*Encrypt links*, *Use shared keys*, or both) and
+**2. Encryption method** (*ChaCha20-Poly1305* or *AES-256-GCM*), which is used whichever
+way the key was agreed. Pick *Encrypt links*, *Use shared keys* or both, and press
+**Save**. A **🔓 Encryption off** button then appears above **SEND** on the main page (and
+beside SEND in the big chat window). Click it to turn encryption on (**🔒 Encryption ON**)
+or off again. It applies from your next link, so it's greyed out while you're connected.
+Openslot remembers how you left it. *Sign my messages* is separate: signing hides nothing,
+so it doesn't need *Use encryption* or the lock.
+
+For *Encrypt links* and signing, turning the option on is all there is to it: your key is
+made for you, and keys are swapped by themselves when you link. Shared keys are for when
+you'd rather arrange a key with the other station beforehand.
 
 > **Encryption is not allowed on amateur radio frequencies** (FCC §97.113(a)(4) in the US,
 > and the rules of most countries). Use it only where it is permitted, such as MARS, SHARES
 > or other licensed services. Signing hides nothing and is not encryption.
 
-- **Encrypt links with other Openslot stations.** When the station you link with has it on
+- **Encrypt links with other Openslot stations** (X25519 key exchange). When the station you link with has it on
   too, everything on the link (chat, VMail, files) is encrypted. Until its key arrives at
   the start of the link, what you type waits, so nothing meant to be private goes out in
   the clear. Your periodic station ID (`de CALL`) still goes in the clear. If the other
   station isn't Openslot, or has encryption off, the chat says **🔓 this link is NOT
   encrypted** and everything goes out as normal. Encrypted lines show a **🔒** beside the
   time.
-- **Sign my messages and VMail.** Adds a signature to what you type and to your VMail
+- **Sign my messages and VMail** (Ed25519 digital signatures). Adds a signature to what you type and to your VMail
   (VMail with attachments isn't signed). The text stays readable. Openslot stations check
   it even with all the options off: **✔** in green means it's from that station's key, **⚠**
   means it isn't the key saved for that station, or the text was changed. On an encrypted
   link no separate signature is sent: the encryption already proves who is talking.
 
-- **Use shared keys.** For stations you've arranged a key with beforehand. Add a key under
+- **Use shared keys** (pre-shared key with PBKDF2, X25519 link keys). For stations you've arranged a key with beforehand. Add a key under
   this option: a name, the callsigns it's for (or `*` for any station without a key of its
   own), and the key itself. **Generate** makes a strong one to pass on. Give it to the other
   operator some other way (in person, by phone or email), never over the radio. Letter
@@ -378,6 +390,12 @@ arrange a key with the other station beforehand.
   chat says **🔓 this link is NOT encrypted**. Like the option above, what you typed waits
   until that's known, then goes out in the clear. This option works on its own, whether or
   not *Encrypt links* is on.
+- **Encryption method: ChaCha20-Poly1305 or AES-256-GCM.** The cipher for either kind of
+  encrypted link above; choosing it doesn't turn encryption on. Both are 256-bit and
+  equally strong, and either runs fine on a normal computer. ChaCha20-Poly1305 is the
+  default; AES-256 is the better-known standard, for when a rule you work under asks for
+  it. If either station picks AES-256-GCM, the link uses it. The chat names the cipher when
+  the link is encrypted (**🔒 Encrypted link with K1ABC (AES-256-GCM; …)**).
 
 **Keys.** Each station's key is saved the first time you link with it (Settings →
 Security lists them). If a station later sends a different key, the chat warns you, and
@@ -386,6 +404,12 @@ checked with them, for example after they reinstalled. To be sure who you're tal
 compare fingerprints (the `1A2B 3C4D …` code) with the other station some other way, by
 voice or email. Your own key is kept in `keys.json` next to the config file. Keep it
 private.
+
+**Making a new key.** Your own key is made once and kept. If your computer or `keys.json`
+may have been seen by someone else, click **Make a new key…** next to your fingerprint in
+Settings → Security (disconnect first). The old key is thrown away for good. Every station
+you've linked with is warned that you sent a new key on your next link, and won't trust it
+until they accept it, so tell them your new fingerprint some other way.
 
 Stations running VarAC see Openslot's key and signature tags (`<OSK:…>`, `<OSG:…>`) as
 text, so leave the options off when you work VarAC stations.

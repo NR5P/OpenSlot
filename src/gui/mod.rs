@@ -331,6 +331,10 @@ impl VaracApp {
                 f.encrypt_link = cfg.encryption.unwrap_or(false);
                 f.sign_messages = cfg.signing.unwrap_or(false);
                 f.use_shared_keys = cfg.shared_keys.unwrap_or(false);
+                f.use_encryption = cfg.use_encryption.unwrap_or(false);
+                state.encryption_lock = cfg.encryption_lock.unwrap_or(false);
+                state.encryption_saved = (f.use_encryption, f.encrypt_link, f.use_shared_keys);
+                f.use_aes = cfg.encryption_aes.unwrap_or(false);
                 f.incoming_files_size_limit = cfg.incoming_files_size_limit.unwrap_or(5000).to_string();
                 f.emcomm_auto_reply_checkin = cfg.emcomm_auto_reply_checkin.unwrap_or(true);
                 if let Some(v) = cfg.call_id_minutes { f.call_id_minutes = v.to_string(); }
@@ -1602,6 +1606,22 @@ impl VaracApp {
         }
     }
 
+    /// The lock above SEND was clicked: encryption on or off from the next link, kept for
+    /// the next start.
+    fn encryption_lock_tick(&mut self) {
+        if !std::mem::take(&mut self.state.encryption_lock_toggled) {
+            return;
+        }
+        let lock = !self.state.encryption_lock;
+        self.state.encryption_lock = lock;
+        crate::config::update_config_file(|c| c.encryption_lock = Some(lock));
+        let (use_encryption, encrypt_link, shared) = self.state.encryption_saved;
+        let on = use_encryption && lock;
+        self.station_config.policy.secure.set_encrypt(on && encrypt_link);
+        self.station_config.policy.secure.set_shared(on && shared);
+        self.state.add_log(format!("Encryption {} (from the next link)", if on { "ON" } else { "off" }));
+    }
+
     fn freq_schedule_tick(&mut self) {
         use crate::varac::scheduler::{self as sch, Mode, ScanAction};
         if std::mem::take(&mut self.state.fsr_dirty) {
@@ -2812,6 +2832,7 @@ impl VaracApp {
 
 
         self.freq_schedule_tick();
+        self.encryption_lock_tick();
 
         // Rig control event processing
         if let Some(ref mut rig) = self.rig {
@@ -4219,53 +4240,105 @@ fn our_lines_in_frame(lines: &std::collections::VecDeque<ChatLine>, text: &str, 
 }
 
 /// Openslot's encryption and signing switches, our key and the stations' keys.
-fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy) {
+fn draw_security_settings(ui: &mut egui::Ui, form: &mut state::SettingsForm, secure: &crate::varac::secure::SecurePolicy, linked: bool) {
     // (what a box does, under it in small type)
     let explain = |ui: &mut egui::Ui, text: &str| {
         ui.indent(text, |ui| ui.label(RichText::new(text).small().color(theme::MUTED)));
     };
-    ui.heading("Encryption and signing");
-    ui.label(RichText::new("Three separate options, all off unless you turn them on. They work only between Openslot stations. \
-        With all three off, Openslot works exactly as before.").small().color(theme::MUTED));
-    ui.label(RichText::new("⚠ Encryption (the first and third options) is not allowed on amateur radio frequencies \
-        (FCC §97.113(a)(4), and most countries' rules). Use it only where it's permitted, such as MARS, SHARES or other \
-        licensed services. Signing hides nothing and is not encryption.").small().color(theme::YELLOW));
-    ui.add_space(6.0);
-    ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations");
-    explain(ui, "Scrambles everything on the link (chat, VMail and files) so only the station you're linked with can read it. \
-        It works only when that station is Openslot and has this on too. Keys are made and swapped by themselves at the start \
-        of the link; until the other station's key arrives, what you type waits, so nothing private goes out in the clear. \
-        Encrypted lines show 🔒 beside the time. If the other station isn't Openslot, or has this off, the chat says \
-        \"🔓 this link is NOT encrypted\" and everything goes out as normal. Your station ID (de CALL) always goes in the clear.");
+    ui.heading("Encryption");
+    ui.label(RichText::new("⚠ Encryption is not allowed on amateur radio frequencies (FCC §97.113(a)(4), and most countries' \
+        rules). Use it only where it's permitted, such as MARS, SHARES or other licensed services. It works only between \
+        Openslot stations.").small().color(theme::YELLOW));
     ui.add_space(4.0);
-    ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail");
-    explain(ui, "Adds a digital signature to what you type and to your VMail (not VMail with attachments), so other Openslot \
-        stations can check it really came from you and wasn't changed. The text stays readable to everyone. On their side, \
-        a green ✔ means it's from your key; ⚠ means it isn't the key they saved for you, or the text was changed. On an \
-        encrypted link no separate signature is sent: the encryption already proves who's talking.");
-    ui.label(RichText::new("With either option above on, VarAC stations see Openslot's key and signature tags (<OSK:…>, <OSG:…>) \
-        as text, so leave them off when you work VarAC stations.").small().color(theme::MUTED));
-    ui.add_space(4.0);
-    ui.checkbox(&mut form.use_shared_keys, "Use shared keys");
-    explain(ui, "Encryption with a key you and the other operator arranged beforehand, for the stations listed below. With \
-        the same key on both sides, the link is encrypted from the very first frame, and nothing about either station's key \
-        can be read on the air. A fresh link key is made every time, so even if a shared key leaks later, recordings of \
-        earlier links can't be read with it alone. If the other station has no key for you, or a different one, the chat \
-        says \"🔓 this link is NOT encrypted\", and what you typed goes out in the clear. Works on its own, whether or not \
-        the first option is on.");
-    if form.use_shared_keys {
-        draw_shared_keys(ui, form, secure);
-    }
+    ui.checkbox(&mut form.use_encryption, RichText::new("Use encryption").strong());
+    explain(ui, "Makes the options below available, and puts a 🔒 button above SEND on the main page to turn encryption \
+        on and off from there. With this off, nothing is ever encrypted and the options are greyed out.");
+    ui.add_enabled_ui(form.use_encryption, |ui| {
+        ui.indent("encryption_options", |ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("1. How the key is agreed").strong());
+            ui.label(RichText::new("Pick one or both. This decides how the two stations end up with the same secret key.")
+                .small().color(theme::MUTED));
+            ui.add_space(2.0);
+            ui.checkbox(&mut form.encrypt_link, "Encrypt links with other Openslot stations (X25519 key exchange)");
+            explain(ui, "Scrambles everything on the link (chat, VMail and files) so only the station you're linked with can read it. \
+                It works only when that station is Openslot and has this on too. Keys are made and swapped by themselves at the start \
+                of the link; until the other station's key arrives, what you type waits, so nothing private goes out in the clear. \
+                Encrypted lines show 🔒 beside the time. If the other station isn't Openslot, or has this off, the chat says \
+                \"🔓 this link is NOT encrypted\" and everything goes out as normal. Your station ID (de CALL) always goes in the clear.");
+            ui.add_space(4.0);
+            ui.checkbox(&mut form.use_shared_keys, "Use shared keys (pre-shared key with PBKDF2, X25519 link keys)");
+            explain(ui, "Encryption with a key you and the other operator arranged beforehand, for the stations listed below. With \
+                the same key on both sides, the link is encrypted from the very first frame, and nothing about either station's key \
+                can be read on the air. A fresh link key is made every time, so even if a shared key leaks later, recordings of \
+                earlier links can't be read with it alone. If the other station has no key for you, or a different one, the chat \
+                says \"🔓 this link is NOT encrypted\", and what you typed goes out in the clear. Works on its own, whether or not \
+                the option above is on.");
+            if form.use_shared_keys {
+                draw_shared_keys(ui, form, secure);
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("2. Encryption method (cipher)").strong());
+            ui.label(RichText::new("Pick one. This is what scrambles the messages with that key, whichever way above was used.")
+                .small().color(theme::MUTED));
+            ui.add_space(2.0);
+            ui.radio_value(&mut form.use_aes, false, "ChaCha20-Poly1305 (256-bit, the default)");
+            explain(ui, "A modern cipher used by HTTPS, Signal and WireGuard.");
+            ui.radio_value(&mut form.use_aes, true, "AES-256-GCM (256-bit)");
+            explain(ui, "The better-known standard, equally strong. Pick it when a rule you work under asks for AES.");
+            ui.label(RichText::new("If either station picks AES-256-GCM, the link uses it. The chat names the cipher when the link \
+                is encrypted (🔒 Encrypted link with … (AES-256-GCM; …)).").small().color(theme::MUTED));
+        });
+    });
     ui.add_space(8.0);
+    ui.heading("Signing");
+    ui.checkbox(&mut form.sign_messages, "Sign my messages and VMail (Ed25519 digital signatures)");
+    explain(ui, "Adds a digital signature to what you type and to your VMail (not VMail with attachments), so other Openslot \
+        stations can check it really came from you and wasn't changed. The text stays readable to everyone: signing hides \
+        nothing and is not encryption, so it doesn't need the box above. On their side, a green ✔ means it's from your key; \
+        ⚠ means it isn't the key they saved for you, or the text was changed. On an encrypted link no separate signature is \
+        sent: the encryption already proves who's talking.");
+    ui.label(RichText::new("With encryption or signing on, VarAC stations see Openslot's key and signature tags (<OSK:…>, \
+        <OSG:…>) as text, so leave them off when you work VarAC stations.").small().color(theme::MUTED));
+    ui.add_space(8.0);
+    let mine = secure.my_fingerprint();
     ui.horizontal(|ui| {
-        ui.label("Your key:");
-        match secure.my_fingerprint() {
+        ui.label("Your key (Ed25519 identity):");
+        match &mine {
             Some(fp) => { ui.label(RichText::new(fp).monospace().strong()); }
-            None => { ui.label(RichText::new("made when you save with either option on").color(theme::MUTED)); }
+            None => { ui.label(RichText::new("made when you save with Encrypt links or signing on").color(theme::MUTED)); }
+        }
+        if mine.is_some() && !form.confirm_new_identity {
+            let button = ui.add_enabled(!linked, egui::Button::new("Make a new key…").small());
+            let button = if linked {
+                button.on_disabled_hover_text("Disconnect first: the station you're linked with has your current key for this link")
+            } else {
+                button.on_hover_text("Throw this key away and make a new one, if it may have been seen by someone else")
+            };
+            if button.clicked() {
+                form.confirm_new_identity = true;
+            }
         }
     });
-    ui.label(RichText::new("Keys are swapped by themselves when you link. To be sure who you're talking to, compare the fingerprints \
-        with the other station some other way (voice, email).").small().color(theme::MUTED));
+    ui.label(RichText::new("Your station's permanent key, used by Encrypt links and signing (not by shared keys). It proves your \
+        messages and links come from you. It's swapped by itself when you link; to be sure who you're talking to, compare the \
+        fingerprints with the other station some other way (voice, email).").small().color(theme::MUTED));
+    if form.confirm_new_identity {
+        ui.add_space(4.0);
+        ui.label(RichText::new("⚠ Make a new key? The current one is thrown away for good. Do this if your computer or keys.json \
+            may have been seen by someone else. Every station you've linked with will be warned that you sent a new key, and \
+            won't trust it until they accept it, so tell them your new fingerprint some other way (voice, email).")
+            .small().color(theme::YELLOW));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!linked, egui::Button::new("Yes, make a new key")).clicked() {
+                secure.replace_identity();
+                form.confirm_new_identity = false;
+            }
+            if ui.button("Cancel").clicked() {
+                form.confirm_new_identity = false;
+            }
+        });
+    }
     ui.add_space(8.0);
     ui.heading("Stations' keys");
     let stations = secure.stations();
@@ -7448,7 +7521,10 @@ fn draw_settings_window(
                         });
                     }
                     7 => features::draw_ai_settings(ui, &mut state.settings_form),
-                    8 => draw_security_settings(ui, &mut state.settings_form, &station_config.policy.secure),
+                    8 => {
+                        let linked = state.connected_to.is_some();
+                        draw_security_settings(ui, &mut state.settings_form, &station_config.policy.secure, linked)
+                    }
                     _ => {}
                 }
             });
@@ -7483,8 +7559,12 @@ fn draw_settings_window(
                     station_config.policy.file_size_limit.store(f.incoming_files_size_limit.trim().parse().unwrap_or(5000), std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.auto_file.store(f.emcomm_mode && f.emcomm_auto_file_approval, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.allow_parking.store(f.allow_parking, std::sync::atomic::Ordering::Relaxed);
-                    station_config.policy.secure.set(f.encrypt_link, f.sign_messages);
-                    station_config.policy.secure.set_shared(f.use_shared_keys);
+                    // (encryption only with Use encryption checked and the main page's lock on)
+                    let on = f.use_encryption && state.encryption_lock;
+                    station_config.policy.secure.set(on && f.encrypt_link, f.sign_messages);
+                    station_config.policy.secure.set_shared(on && f.use_shared_keys);
+                    state.encryption_saved = (f.use_encryption, f.encrypt_link, f.use_shared_keys);
+                    station_config.policy.secure.set_aes(f.use_aes);
                     station_config.policy.ai_gateway.store(f.ai_enabled && f.ai_announce, std::sync::atomic::Ordering::Relaxed);
                     station_config.policy.set_emcomm(
                         f.emcomm_mode && f.emcomm_disable_snr,
@@ -7861,6 +7941,9 @@ fn save_config_file(state: &GuiState) {
         encryption: Some(form.encrypt_link),
         signing: Some(form.sign_messages),
         shared_keys: Some(form.use_shared_keys),
+        use_encryption: Some(form.use_encryption),
+        encryption_lock: Some(state.encryption_lock),
+        encryption_aes: Some(form.use_aes),
         incoming_files_size_limit: form.incoming_files_size_limit.trim().parse().ok(),
         mute_all_sounds: existing.mute_all_sounds,
         sounds_off: existing.sounds_off.clone(),

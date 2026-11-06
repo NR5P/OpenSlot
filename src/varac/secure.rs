@@ -18,6 +18,8 @@
 //!   (typed in beforehand): a fresh X25519 key for this link, itself encrypted with the
 //!   shared key, so no key of any kind is readable on the air. The link keys come from
 //!   both the shared key and the X25519 exchange.
+//! - AES-256-GCM in place of ChaCha20-Poly1305, for the link and the `<OSP:>` key, when
+//!   either station has "Use AES-256" on (flag 4 in `<OSK:>`, version 2 of `<OSP:>`).
 //!
 //! Keys travel as unpadded URL-safe base64 (no `<`, `>` or `/`, so they can't close a tag
 //! or form VarAC's `//n`). Station keys are trusted on first use, per base callsign.
@@ -45,6 +47,11 @@ pub fn is_announcement(text: &str) -> bool {
 const VERSION: u8 = 1;
 const FLAG_ENCRYPT: u8 = 1;
 const FLAG_SIGN: u8 = 2;
+/// Encrypt the link with AES-256-GCM (either side asking is enough)
+const FLAG_AES: u8 = 4;
+/// `<OSP:>` versions: the link key hidden with ChaCha20-Poly1305, or with AES-256-GCM
+const SHARED_CHACHA: u8 = 1;
+const SHARED_AES: u8 = 2;
 const SIG_LEN: usize = 64;
 /// Largest frame we inflate (a file frame is base64, a third bigger than the file).
 const MAX_PLAIN: u64 = 4_000_000;
@@ -72,6 +79,8 @@ pub struct SecurePolicy {
     pub sign: Arc<AtomicBool>,
     /// Use the shared keys typed in for stations (encrypted from the first frame)
     pub shared: Arc<AtomicBool>,
+    /// Encrypt with AES-256-GCM instead of ChaCha20-Poly1305
+    pub aes: Arc<AtomicBool>,
     pub keyring: Arc<RwLock<Keyring>>,
 }
 
@@ -94,12 +103,25 @@ impl SecurePolicy {
         }
     }
 
+    /// Encryption on or off (the main page's lock), leaving signing as it is.
+    pub fn set_encrypt(&self, encrypt: bool) {
+        self.set(encrypt, self.sign_on());
+    }
+
     pub fn shared_on(&self) -> bool {
         self.shared.load(Relaxed)
     }
 
     pub fn set_shared(&self, on: bool) {
         self.shared.store(on, Relaxed);
+    }
+
+    pub fn aes_on(&self) -> bool {
+        self.aes.load(Relaxed)
+    }
+
+    pub fn set_aes(&self, on: bool) {
+        self.aes.store(on, Relaxed);
     }
 
     pub fn shared_keys(&self) -> Vec<SharedKey> {
@@ -143,6 +165,12 @@ impl SecurePolicy {
     /// Our key's fingerprint, once there is a key.
     pub fn my_fingerprint(&self) -> Option<String> {
         self.keyring.read().ok()?.my_fingerprint()
+    }
+
+    /// Throw our key away and make a new one (if the old one may have been seen). Stations
+    /// that saved the old one are warned on the next link and asked to accept the new one.
+    pub fn replace_identity(&self) -> Option<String> {
+        self.keyring.write().ok()?.replace_identity()
     }
 
     pub fn stations(&self) -> Vec<StationKey> {
@@ -322,6 +350,13 @@ impl Keyring {
             self.save();
         }
         Identity::from_seed(&b64().decode(self.file.identity.as_deref()?).ok()?)
+    }
+
+    /// A new key in place of ours; the old one is gone for good. Its fingerprint.
+    fn replace_identity(&mut self) -> Option<String> {
+        self.file.identity = None;
+        self.identity()?;
+        self.my_fingerprint()
     }
 
     pub fn my_fingerprint(&self) -> Option<String> {
@@ -519,6 +554,8 @@ pub struct Link {
     partner_key: Option<([u8; 32], KeyTrust)>,
     /// The shared key this link uses (its name, its bytes)
     shared: Option<(String, [u8; 32])>,
+    /// We asked for AES-256-GCM (else ChaCha20-Poly1305, unless the partner asks)
+    aes: bool,
     tx: Option<(aead::LessSafeKey, u32)>,
     rx: Option<(aead::LessSafeKey, Option<u32>)>,
 }
@@ -534,6 +571,7 @@ impl Default for Link {
             eph: None,
             partner_key: None,
             shared: None,
+            aes: false,
             tx: None,
             rx: None,
         }
@@ -545,19 +583,35 @@ fn new_link_key() -> Option<([u8; 32], agreement::EphemeralPrivateKey)> {
     Some((key32(k.compute_public_key().ok()?.as_ref())?, k))
 }
 
+/// The cipher for a link: AES-256-GCM, or ChaCha20-Poly1305.
+fn cipher(aes: bool) -> &'static aead::Algorithm {
+    if aes { &aead::AES_256_GCM } else { &aead::CHACHA20_POLY1305 }
+}
+
+fn cipher_name(aes: bool) -> &'static str {
+    if aes { "AES-256-GCM" } else { "ChaCha20-Poly1305" }
+}
+
 /// The key that hides a `<OSP:>` link key: from the shared key and the announcement's salt.
-fn announcement_key(psk: &[u8; 32], salt: &[u8], from: &str, to: &str) -> Option<aead::LessSafeKey> {
+/// (Each cipher has its own label, so the two never share a key.)
+fn announcement_key(psk: &[u8; 32], salt: &[u8], from: &str, to: &str, aes: bool) -> Option<aead::LessSafeKey> {
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(psk);
-    let info = [b"OSP1 ".as_slice(), from.as_bytes(), b">", to.as_bytes()];
-    let okm = prk.expand(&info, &aead::CHACHA20_POLY1305).ok()?;
+    let label: &[u8] = if aes { b"OSP2 " } else { b"OSP1 " };
+    let info = [label, from.as_bytes(), b">", to.as_bytes()];
+    let okm = prk.expand(&info, cipher(aes)).ok()?;
     Some(aead::LessSafeKey::new(aead::UnboundKey::from(okm)))
+}
+
+fn announcement_aad(aes: bool) -> aead::Aad<&'static [u8; 4]> {
+    aead::Aad::from(if aes { b"OSP2" } else { b"OSP1" })
 }
 
 impl Link {
     /// A new link between `me` and `partner` (base callsigns), with our key announcement to
     /// send first when an option is on.
     pub fn start(policy: &SecurePolicy, me: &str, partner: &str) -> (Self, Option<String>) {
-        let mut link = Self { me: me.to_string(), partner: partner.to_string(), connecting: true, ..Self::default() };
+        let aes = policy.aes_on();
+        let mut link = Self { me: me.to_string(), partner: partner.to_string(), connecting: true, aes, ..Self::default() };
         // A shared key for this station: our link key goes hidden under it
         if let Some(sk) = policy.shared_on().then(|| policy.shared_for(partner)).flatten() {
             let psk = shared_key_bytes(&sk.secret);
@@ -565,9 +619,10 @@ impl Link {
             let announced = SystemRandom::new().fill(&mut salt).ok().and_then(|_| {
                 let (public, private) = new_link_key()?;
                 let mut sealed = public.to_vec();
-                announcement_key(&psk, &salt, me, partner)?
-                    .seal_in_place_append_tag(nonce(0), aead::Aad::from(b"OSP1"), &mut sealed).ok()?;
-                Some(((private, public), [&[VERSION][..], &salt, &sealed].concat()))
+                announcement_key(&psk, &salt, me, partner, aes)?
+                    .seal_in_place_append_tag(nonce(0), announcement_aad(aes), &mut sealed).ok()?;
+                let version = if aes { SHARED_AES } else { SHARED_CHACHA };
+                Some(((private, public), [&[version][..], &salt, &sealed].concat()))
             });
             if let Some((eph, body)) = announced {
                 (link.eph, link.shared, link.state) = (Some(eph), Some((sk.name, psk)), LinkState::Waiting);
@@ -579,7 +634,8 @@ impl Link {
             return (link, None);
         }
         let Some(id) = policy.identity() else { return (link, None) };
-        let mut body = vec![VERSION, if encrypt { FLAG_ENCRYPT } else { 0 } | if sign { FLAG_SIGN } else { 0 }];
+        let flags = if encrypt { FLAG_ENCRYPT } else { 0 } | if sign { FLAG_SIGN } else { 0 } | if encrypt && aes { FLAG_AES } else { 0 };
+        let mut body = vec![VERSION, flags];
         body.extend_from_slice(&id.public());
         if encrypt {
             let Some((public, private)) = new_link_key() else { return (link, None) };
@@ -664,13 +720,15 @@ impl Link {
             }
             LinkState::Waiting if partner_encrypts => {
                 let theirs = key32(&b[34..66]);
+                let aes = self.aes || b[1] & FLAG_AES != 0;
                 let keys = self.eph.take().zip(theirs).and_then(|((mine, my_pub), theirs)| {
-                    derive_keys(mine, &my_pub, &theirs, &self.me, &self.partner, b"openslot link v1")
+                    derive_keys(mine, &my_pub, &theirs, &self.me, &self.partner, b"openslot link v1", aes)
                 });
                 match keys {
                     Some((tx, rx)) => {
                         (self.tx, self.rx, self.state) = (Some((tx, 0)), Some((rx, None)), LinkState::Encrypted);
-                        notes.push(SecureNote::Link { encrypted: true, text: format!("🔒 Encrypted link with {} ({about_key})", self.partner) });
+                        let c = cipher_name(aes);
+                        notes.push(SecureNote::Link { encrypted: true, text: format!("🔒 Encrypted link with {} ({c}; {about_key})", self.partner) });
                     }
                     None => {
                         self.state = LinkState::Clear;
@@ -710,21 +768,25 @@ impl Link {
         let Some((name, psk)) = self.shared.clone().filter(|_| self.state == LinkState::Waiting) else {
             return clear(self, format!("{p} uses a shared key, but you have none for {p} turned on (Settings → Security)"));
         };
+        // (version 1 or 2: which cipher hid their link key, and whether they ask for AES)
         let theirs = b64().decode(payload.trim()).ok()
-            .filter(|b| b.len() == 1 + 16 + 32 + aead::CHACHA20_POLY1305.tag_len() && b[0] == VERSION)
+            .filter(|b| matches!(b.first(), Some(&SHARED_CHACHA | &SHARED_AES)) && b.len() == 1 + 16 + 32 + cipher(b[0] == SHARED_AES).tag_len())
             .and_then(|mut b| {
+                let their_aes = b[0] == SHARED_AES;
                 let (salt, sealed) = b[1..].split_at_mut(16);
-                let key = announcement_key(&psk, salt, &p, &self.me)?;
-                key32(key.open_in_place(nonce(0), aead::Aad::from(b"OSP1"), sealed).ok()?)
+                let key = announcement_key(&psk, salt, &p, &self.me, their_aes)?;
+                Some((key32(key.open_in_place(nonce(0), announcement_aad(their_aes), sealed).ok()?)?, their_aes))
             });
-        let Some(theirs) = theirs else {
+        let Some((theirs, their_aes)) = theirs else {
             return clear(self, format!("{p}'s shared key isn't the same as yours (“{name}”)"));
         };
-        let keys = self.eph.take().and_then(|(mine, my_pub)| derive_keys(mine, &my_pub, &theirs, &self.me, &p, &psk));
+        let aes = self.aes || their_aes;
+        let keys = self.eph.take().and_then(|(mine, my_pub)| derive_keys(mine, &my_pub, &theirs, &self.me, &p, &psk, aes));
         match keys {
             Some((tx, rx)) => {
                 (self.tx, self.rx, self.state) = (Some((tx, 0)), Some((rx, None)), LinkState::Encrypted);
-                vec![SecureNote::Link { encrypted: true, text: format!("🔒 Encrypted link with {p} (shared key “{name}”)") }]
+                let c = cipher_name(aes);
+                vec![SecureNote::Link { encrypted: true, text: format!("🔒 Encrypted link with {p} ({c}; shared key “{name}”)") }]
             }
             None => clear(self, "Key exchange failed".into()),
         }
@@ -751,7 +813,7 @@ impl Link {
         let Some((key, last)) = self.rx.as_mut() else { return Err(fail("no key on this link")) };
         let payload = frame.trim().strip_prefix(ENC_TAG).and_then(|r| r.strip_suffix('>')).unwrap_or("");
         let mut bytes = b64().decode(payload).map_err(|_| fail("damaged"))?;
-        if bytes.len() < 4 + 1 + aead::CHACHA20_POLY1305.tag_len() {
+        if bytes.len() < 4 + 1 + key.algorithm().tag_len() {
             return Err(fail("too short"));
         }
         let counter = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -811,14 +873,17 @@ fn derive_keys(
     me: &str,
     partner: &str,
     salt: &[u8],
+    aes: bool,
 ) -> Option<(aead::LessSafeKey, aead::LessSafeKey)> {
     let peer = agreement::UnparsedPublicKey::new(&agreement::X25519, theirs);
     agreement::agree_ephemeral(mine, &peer, |shared| {
         let (lo, hi) = if my_pub <= theirs { (my_pub, theirs) } else { (theirs, my_pub) };
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(shared);
         let key = |from: &str, to: &str| {
-            let info = [b"OSE1 ".as_slice(), from.as_bytes(), b">", to.as_bytes(), lo, hi];
-            let okm = prk.expand(&info, &aead::CHACHA20_POLY1305).ok()?;
+            // (each cipher has its own label, so the two never share a key)
+            let label: &[u8] = if aes { b"OSE2 " } else { b"OSE1 " };
+            let info = [label, from.as_bytes(), b">", to.as_bytes(), lo, hi];
+            let okm = prk.expand(&info, cipher(aes)).ok()?;
             Some(aead::LessSafeKey::new(aead::UnboundKey::from(okm)))
         };
         Some((key(me, partner)?, key(partner, me)?))
@@ -971,6 +1036,38 @@ mod tests {
         assert!(pb.stations().is_empty());
     }
 
+    #[test]
+    fn a_replaced_key_is_new_and_flagged_at_the_other_end() {
+        let (pa, pb) = (policy(false, true), SecurePolicy::default());
+        let old = pa.my_fingerprint().unwrap();
+        let link = |pb: &SecurePolicy| {
+            let (_, ka) = Link::start(&pa, "W1AW", "K1ABC");
+            let mut b = Link::start(pb, "K1ABC", "W1AW").0;
+            b.partner_key(pb, payload(&ka.unwrap()));
+            b.partner_key.unwrap().1
+        };
+        assert_eq!(link(&pb), KeyTrust::FirstContact);
+        let new = pa.replace_identity().unwrap();
+        assert_ne!(new, old);
+        assert_eq!(pa.my_fingerprint().as_deref(), Some(new.as_str()), "the new key is the one kept");
+        assert_eq!(link(&pb), KeyTrust::Changed, "the other station is warned");
+        assert_eq!(pb.stations()[0].new_fingerprint.as_deref(), Some(new.as_str()));
+        // signed with the new key, checked against it once accepted
+        pb.accept_new_key("W1AW");
+        assert_eq!(link(&pb), KeyTrust::Known);
+        // and it's saved to the key file
+        let dir = std::env::temp_dir().join(format!("openslot-keys-{}", std::process::id()));
+        let path = dir.join("keys.json");
+        let pc = SecurePolicy::default();
+        pc.open_keyring(path.clone());
+        pc.set(false, true);
+        let saved = pc.replace_identity().unwrap();
+        let again = SecurePolicy::default();
+        again.open_keyring(path);
+        assert_eq!(again.my_fingerprint(), Some(saved));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn shared(secret: &str, calls: &str) -> SecurePolicy {
         let p = SecurePolicy::default();
         p.set_shared(true);
@@ -1001,6 +1098,55 @@ mod tests {
         let (mut c, _) = Link::start(&shared("ZZZZ-ZZZZ-ZZZZ-ZZZZ", "W1AW"), "K1ABC", "W1AW");
         assert!(matches!(c.partner_shared(shared_payload(&ka))[..], [SecureNote::Link { encrypted: false, .. }]));
         assert_eq!(c.state(), LinkState::Clear);
+    }
+
+    fn link_text(notes: &[SecureNote]) -> String {
+        match notes {
+            [SecureNote::Link { encrypted: true, text }] => text.clone(),
+            other => panic!("not encrypted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aes_when_either_side_asks() {
+        // (a asks, b doesn't, either way round; or both; or neither: ChaCha20)
+        for (a_aes, b_aes) in [(true, false), (false, true), (true, true), (false, false)] {
+            let want = if a_aes || b_aes { "AES-256-GCM" } else { "ChaCha20-Poly1305" };
+            let (pa, pb) = (policy(true, false), policy(true, false));
+            pa.set_aes(a_aes);
+            pb.set_aes(b_aes);
+            let (mut a, ka) = Link::start(&pa, "W1AW", "K1ABC");
+            let (mut b, kb) = Link::start(&pb, "K1ABC", "W1AW");
+            let ta = link_text(&a.partner_key(&pa, payload(&kb.unwrap())));
+            let tb = link_text(&b.partner_key(&pb, payload(&ka.unwrap())));
+            assert!(ta.contains(want) && tb.contains(want), "{ta} / {tb}");
+            assert_eq!(b.open(&a.seal("hello de W1AW").unwrap()).unwrap(), "hello de W1AW");
+            assert_eq!(a.open(&b.seal("roger").unwrap()).unwrap(), "roger");
+            assert_eq!(a.tx.as_ref().unwrap().0.algorithm(), cipher(a_aes || b_aes));
+        }
+    }
+
+    #[test]
+    fn aes_with_a_shared_key() {
+        let secret = generate_shared_secret();
+        for (a_aes, b_aes) in [(true, false), (false, true), (true, true)] {
+            let (pa, pb) = (shared(&secret, "K1ABC"), shared(&secret, "W1AW"));
+            pa.set_aes(a_aes);
+            pb.set_aes(b_aes);
+            let (mut a, ka) = Link::start(&pa, "W1AW", "K1ABC");
+            let (mut b, kb) = Link::start(&pb, "K1ABC", "W1AW");
+            let ta = link_text(&a.partner_shared(shared_payload(&kb.unwrap())));
+            let tb = link_text(&b.partner_shared(shared_payload(&ka.unwrap())));
+            assert!(ta.contains("AES-256-GCM") && tb.contains("AES-256-GCM"), "{ta} / {tb}");
+            assert_eq!(b.open(&a.seal("from the first frame").unwrap()).unwrap(), "from the first frame");
+            assert_eq!(a.open(&b.seal("roger").unwrap()).unwrap(), "roger");
+        }
+        // an AES announcement still can't be read without the key
+        let pa = shared(&secret, "K1ABC");
+        pa.set_aes(true);
+        let (_, ka) = Link::start(&pa, "W1AW", "K1ABC");
+        let (mut c, _) = Link::start(&shared("ZZZZ-ZZZZ-ZZZZ-ZZZZ", "W1AW"), "K1ABC", "W1AW");
+        assert!(matches!(c.partner_shared(shared_payload(&ka.unwrap()))[..], [SecureNote::Link { encrypted: false, .. }]));
     }
 
     #[test]

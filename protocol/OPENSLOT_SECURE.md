@@ -20,7 +20,7 @@ never encrypted and never joined with other messages.
     version (1) = 1 | flags (1) | Ed25519 identity public key (32)
       | X25519 public key for this link (32, only with flag 1) | Ed25519 signature (64)
 
-Flags: 1 = encryption on, 2 = signing on. The signature covers
+Flags: 1 = encryption on, 2 = signing on, 4 = AES-256-GCM asked for (only with flag 1). The signature covers
 `"OSK1\n" FROM "\n" TO "\n"` + everything before it. 130 bytes (174 characters) with
 encryption, 98 bytes without.
 
@@ -36,7 +36,9 @@ identity key is sent.
     version (1) = 1 | salt (16, random)
       | ChaCha20-Poly1305(key, nonce = 12 zero bytes, aad = "OSP1", X25519 link key (32))
 
-`key` = HKDF-SHA256(salt, shared key bytes), info `"OSP1 " FROM ">" TO`. The shared key's
+`key` = HKDF-SHA256(salt, shared key bytes), info `"OSP1 " FROM ">" TO`. Version 2 is the
+same with AES-256-GCM in place of ChaCha20-Poly1305, aad `"OSP2"` and info `"OSP2 " FROM ">" TO`:
+the sender asks for AES-256-GCM on the link. The shared key's
 bytes are PBKDF2-HMAC-SHA256 (100 000 rounds, salt `openslot shared key v1`) of the key as
 typed, upper-cased, with whitespace and `-` removed. 65 bytes, 87 characters.
 
@@ -56,6 +58,11 @@ as they are.
 Keys: X25519 of the two link keys → HKDF-SHA256, salt `openslot link v1`, then one
 ChaCha20-Poly1305 key per direction with info
 `"OSE1 " FROM ">" TO || lower X25519 key || higher X25519 key`.
+
+**AES-256-GCM** instead, when either side asked for it (flag 4 in its `<OSK:>`, or a version 2
+`<OSP:>`): the same, with info `"OSE2 " …` and AES-256-GCM in place of ChaCha20-Poly1305
+everywhere below. Asking is covered by the announcement's signature (`<OSK:>`) or can't be
+changed without the shared key (`<OSP:>`), so it can't be stripped on the way.
 
     counter (4, big-endian, from 1, strictly increasing per direction)
       | ChaCha20-Poly1305(nonce = 8 zero bytes || counter, aad = "OSE1",
