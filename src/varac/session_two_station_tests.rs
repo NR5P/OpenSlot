@@ -278,6 +278,11 @@ impl Mode {
 }
 
 /// Should a link between these two be encrypted?
+/// Does this station want what it writes encrypted?
+fn wants(m: Mode) -> bool {
+    m.encrypts() || m.shared().is_some()
+}
+
 fn expect_encrypted(a: Mode, b: Mode) -> bool {
     (a.encrypts() && b.encrypts()) || matches!((a.shared(), b.shared()), (Some(x), Some(y)) if x == y)
 }
@@ -297,36 +302,61 @@ async fn qso(ma: Mode, mb: Mode, delay_ab: u64, delay_ba: u64) {
         ea.extend(x);
         eb.extend(y);
     }
-    a.send_typed("alpha one").await.unwrap();
-    b.send_typed("bravo one").await.unwrap();
+    // (a station with encryption on that ends up on a clear link sends nothing it wrote)
+    let enc = expect_encrypted(ma, mb);
+    let (a_blocked, b_blocked) = (wants(ma) && !enc, wants(mb) && !enc);
+    // (refused at once when the link has already settled in the clear, else held and then
+    // withheld: either way the operator is told and gets it back)
+    assert!(a.send_typed("alpha one").await.is_ok() || a_blocked, "{tag}");
+    assert!(b.send_typed("bravo one").await.is_ok() || b_blocked, "{tag}");
     let (x, y) = until_handshakes(&mut a, &mut b, 15_000).await;
     ea.extend(x);
     eb.extend(y);
     assert!(ea.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: A's handshake: {ea:?}");
     assert!(eb.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: B's handshake: {eb:?}");
 
-    a.send_typed("alpha two\r\nsecond line").await.unwrap();
-    a.send_vmail(&vmail("Meeting", "At the hall, 7 pm. Bring the antenna.")).await.unwrap();
-    b.send_typed("bravo two").await.unwrap();
-    b.send_vmail(&vmail("Re: Meeting", "Copy, will be there")).await.unwrap();
+    for (r, blocked) in [
+        (a.send_typed("alpha two\r\nsecond line").await, a_blocked),
+        (a.send_vmail(&vmail("Meeting", "At the hall, 7 pm. Bring the antenna.")).await, a_blocked),
+        (b.send_typed("bravo two").await, b_blocked),
+        (b.send_vmail(&vmail("Re: Meeting", "Copy, will be there")).await, b_blocked),
+    ] {
+        assert_eq!(r.is_err(), blocked, "{tag}: {r:?}");
+    }
     let (x, y) = run2(&mut a, &mut b, 6000 + 4 * (delay_ab + delay_ba)).await;
     ea.extend(x);
     eb.extend(y);
 
-    // everything arrived, once, as sent (lines of one frame show as one message)
+    // everything arrived, once, as sent (lines of one frame show as one message) — or,
+    // from a station that withholds, nothing did, and it was told
     let (ta, tb) = (texts(&ea).join("\n"), texts(&eb).join("\n"));
-    for (got, want) in [(&tb, "alpha one"), (&tb, "alpha two\nsecond line"), (&ta, "bravo one"), (&ta, "bravo two")] {
-        assert_eq!(got.matches(want).count(), 1, "{tag}: {want:?} in {got:?}\nA: {ea:?}\nB: {eb:?}");
+    for (got, want, blocked) in [(&tb, "alpha one", a_blocked), (&tb, "alpha two\nsecond line", a_blocked), (&ta, "bravo one", b_blocked), (&ta, "bravo two", b_blocked)] {
+        assert_eq!(got.matches(want).count(), usize::from(!blocked), "{tag}: {want:?} in {got:?}\nA: {ea:?}\nB: {eb:?}");
         assert!(!got.contains(secure::SIG_TAG) && !got.contains("<OS"), "{tag}: a tag shows: {got:?}");
     }
     let (va, vb) = (vmails(&ea), vmails(&eb));
-    assert_eq!(vb.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(),
-        [("Meeting", "At the hall, 7 pm. Bring the antenna.")], "{tag}: {eb:?}");
-    assert_eq!(va.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(),
-        [("Re: Meeting", "Copy, will be there")], "{tag}: {ea:?}");
+    let want_b: &[(&str, &str)] = if a_blocked { &[] } else { &[("Meeting", "At the hall, 7 pm. Bring the antenna.")] };
+    let want_a: &[(&str, &str)] = if b_blocked { &[] } else { &[("Re: Meeting", "Copy, will be there")] };
+    assert_eq!(vb.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(), want_b, "{tag}: {eb:?}");
+    assert_eq!(va.iter().map(|v| (v.subject.as_str(), v.body.as_str())).collect::<Vec<_>>(), want_a, "{tag}: {ea:?}");
+    for (who, e, blocked) in [("A", &ea, a_blocked), ("B", &eb, b_blocked)] {
+        let withheld: Vec<String> = notes(e).into_iter().filter_map(|n| match n {
+            SecureNote::Withheld { typed, .. } => Some(typed),
+            _ => None,
+        }).flatten().collect();
+        let want: Vec<String> = match (blocked, who) {
+            (false, _) => vec![],
+            (true, "A") => vec!["alpha one".into(), "alpha two\r\nsecond line".into()],
+            (true, _) => vec!["bravo one".into(), "bravo two".into()],
+        };
+        assert_eq!(withheld, want, "{tag}: {who} was given back {withheld:?}");
+    }
+    let heard_now = air.heard().join("|");
+    for (secret, blocked) in [("alpha", a_blocked), ("At the hall", a_blocked), ("bravo", b_blocked), ("Copy, will", b_blocked)] {
+        assert!(!(blocked && heard_now.contains(secret)), "{tag}: {secret:?} went out unencrypted: {heard_now}");
+    }
 
     // the link is what both settings say, on both sides
-    let enc = expect_encrypted(ma, mb);
     assert_eq!((a.secure.is_encrypted(), b.secure.is_encrypted()), (enc, enc), "{tag}");
     let (na, nb) = (notes(&ea), notes(&eb));
     for (who, n, mine) in [("A", &na, ma), ("B", &nb, mb)] {
@@ -353,7 +383,7 @@ async fn qso(ma: Mode, mb: Mode, delay_ab: u64, delay_ba: u64) {
             SecureNote::Signed { check, .. } => Some(*check),
             _ => None,
         }).collect();
-        if sender.signs() && !enc {
+        if sender.signs() && !enc && !wants(sender) {
             // (three signed messages: two typed, one VMail)
             assert_eq!(checks.len(), 3, "{tag}: {who} checked {checks:?}");
             assert!(checks.iter().all(|c| matches!(c, SigCheck::Valid(KeyTrust::FirstContact | KeyTrust::Known))), "{tag}: {who} checked {checks:?}");
@@ -467,12 +497,13 @@ async fn calling_frequency_handshake() {
         let (mut ea, mut eb) = until_handshakes(&mut a, &mut b, 30_000).await;
         assert!(ea.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: A {ea:?}");
         assert!(eb.iter().any(|e| matches!(e, SessionEvent::HandshakeComplete)), "{tag}: B {eb:?}");
-        a.send_typed("after the move").await.unwrap();
+        let enc = expect_encrypted(ma, mb);
+        let blocked = wants(ma) && !enc;
+        assert_eq!(a.send_typed("after the move").await.is_err(), blocked, "{tag}");
         let (x, y) = run2(&mut a, &mut b, 3000).await;
         ea.extend(x);
         eb.extend(y);
-        assert_eq!(texts(&eb), ["after the move"], "{tag}: {eb:?}");
-        let enc = expect_encrypted(ma, mb);
+        assert_eq!(texts(&eb), if blocked { vec![] } else { vec!["after the move".to_string()] }, "{tag}: {eb:?}");
         assert_eq!((a.secure.is_encrypted(), b.secure.is_encrypted()), (enc, enc), "{tag}");
         for (who, e) in [("A", &ea), ("B", &eb)] {
             let alarms: Vec<_> = notes(e).into_iter().filter(|n| matches!(n, SecureNote::Unencrypted(_) | SecureNote::Warning(_))).collect();
@@ -731,14 +762,16 @@ async fn settings_changed_mid_link() {
     }).collect();
     assert_eq!(checks, [SigCheck::NoKey], "{eb:?}");
 
-    // encryption turned on during a clear QSO: nothing changes until the next link
+    // encryption turned on during a clear QSO: the link stays clear, so nothing typed goes
+    // out from then on; the next link is encrypted
     let (mut a, mut b, air) = two_stations(|_| {}, |_| {}, Duration::ZERO, Duration::ZERO).await;
     connect(&mut a, &mut b, "N0BBB").await;
     a.config.policy.secure.set(true, false);
     b.config.policy.secure.set(true, false);
-    a.send_typed("clear still").await.unwrap();
-    let (_, eb) = run2(&mut a, &mut b, 2500).await;
-    assert_eq!(texts(&eb), ["clear still"], "{eb:?}");
+    assert!(a.send_typed("not on a clear link").await.is_err());
+    let (ea, eb) = run2(&mut a, &mut b, 2500).await;
+    assert!(texts(&eb).is_empty(), "{eb:?}");
+    assert!(notes(&ea).iter().any(|n| matches!(n, SecureNote::Withheld { .. })), "{ea:?}");
     a.send_disconnect().await.unwrap();
     run2(&mut a, &mut b, 500).await;
     connect(&mut a, &mut b, "N0BBB").await;
@@ -925,5 +958,42 @@ async fn typed_text_that_looks_like_a_tag() {
             }
         }
         assert!(lost.is_empty(), "{tag}: {lost:#?}");
+    }
+}
+
+/// Encryption on, the partner can't: no file, VMail with attachments or away message of
+/// ours goes out either, and a file job doesn't stay stuck. With encryption off, they do.
+#[tokio::test]
+async fn files_vmail_and_away_withheld_on_a_clear_link() {
+    for mb in [Mode::Off, Mode::Sign, Mode::Shared(1)] {
+        let tag = format!("Enc -> {mb:?}");
+        let (mut a, mut b, air) = two_stations(|p| Mode::Enc.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        connect(&mut a, &mut b, "N0BBB").await;
+        assert!(!a.secure.is_encrypted(), "{tag}");
+        let prepared = crate::varac::bbs::prepare_file("plan.txt", b"the plan, in full").unwrap();
+        assert!(a.send_file(prepared.clone()).await.is_err(), "{tag}");
+        assert!(!a.file_in_progress, "{tag}: the file job is stuck");
+        let mut v = vmail("Photos", "See attached");
+        v.has_attachment = true;
+        assert!(a.send_vmail_with_attachments(&v, &[("map.txt".into(), b"grid EM12kp".to_vec())]).await.is_err(), "{tag}");
+        assert!(a.send_away(Some("back at 1800z")).await.is_err(), "{tag}");
+        let (ea, eb) = run2(&mut a, &mut b, 3000).await;
+        let withheld: Vec<String> = notes(&ea).iter().filter_map(|n| match n {
+            SecureNote::Withheld { text, .. } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(withheld.len(), 3, "{tag}: {withheld:?}");
+        assert!(withheld[0].contains("a file") && withheld[1].contains("Outbox") && withheld[2].contains("away"), "{tag}: {withheld:?}");
+        let heard = air.heard().join("|");
+        for secret in ["plan.txt", "Photos", "1800z", "<SF", "<AWAY>"] {
+            assert!(!heard.contains(secret), "{tag}: {secret} went out: {heard}");
+        }
+        assert!(!eb.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::BbsFileOffer(_)))), "{tag}");
+
+        // the operator turns encryption off: now it goes, unencrypted, as asked
+        a.config.policy.secure.set(false, false);
+        a.send_file(prepared).await.unwrap();
+        let (_, eb) = run2(&mut a, &mut b, 4000).await;
+        assert!(eb.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::BbsFilePayload(_)))), "{tag}: {eb:?}");
     }
 }

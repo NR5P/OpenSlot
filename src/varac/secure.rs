@@ -144,6 +144,12 @@ impl SecurePolicy {
         }
     }
 
+    /// With these settings, may what the operator writes to `call` go out only encrypted?
+    /// (Encryption on, or a shared key for that station in use.)
+    pub fn wants_encryption_with(&self, call: &str) -> bool {
+        self.encrypt_on() || (self.shared_on() && self.shared_for(call).is_some())
+    }
+
     /// The shared key for this station: one that names it, else one for any station.
     fn shared_for(&self, call: &str) -> Option<SharedKey> {
         let k = self.keyring.read().ok()?;
@@ -534,12 +540,16 @@ pub enum SecureNote {
     Unencrypted(String),
     /// Something went wrong (a frame that won't decrypt, a bad key announcement).
     Warning(String),
+    /// Encryption is on and this link isn't encrypted: what we wrote wasn't sent. `typed`
+    /// is what the operator typed, to give back to the message box.
+    Withheld { text: String, typed: Vec<String> },
 }
 
 impl SecureNote {
     pub fn text(&self) -> &str {
         match self {
-            Self::Link { text, .. } | Self::Signed { text, .. } | Self::Unencrypted(text) | Self::Warning(text) => text,
+            Self::Link { text, .. } | Self::Signed { text, .. } | Self::Unencrypted(text) | Self::Warning(text)
+            | Self::Withheld { text, .. } => text,
         }
     }
 }

@@ -1236,6 +1236,15 @@ impl VaracApp {
                         }
                         SecureNote::Signed { .. } | SecureNote::Unencrypted(_) => self.state.pending_signature = Some(note),
                         SecureNote::Warning(text) => self.state.add_system_chat(text),
+                        // (what wasn't sent goes back to the message box, as EDIT does)
+                        SecureNote::Withheld { text, typed } => {
+                            self.state.add_system_chat(text);
+                            if !typed.is_empty() {
+                                let mut back = typed.iter().map(|t| t.replace("//n", "\n")).collect::<Vec<_>>().join("\n");
+                                back.push('\n');
+                                self.state.input_text = back + &self.state.input_text;
+                            }
+                        }
                     }
                 }
                 SessionMsg::Log(text) => {

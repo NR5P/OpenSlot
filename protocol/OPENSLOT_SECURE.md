@@ -49,15 +49,21 @@ typed, upper-cased, with whitespace and `-` removed. 65 bytes, 87 characters.
 When both sides sent one that opens with their key, the link is encrypted as below, with
 the shared key's bytes as the HKDF salt (so both the shared key and the exchange are
 needed). An `<OSP:>` that doesn't open, an `<OSK:>` in answer to ours, or no announcement
-at all leaves the link in the clear, and what was held goes out as it is.
+at all leaves the link in the clear, and what was held is not sent (see below).
 
 ## Encrypted link `<OSE:…>`
 
 Only when both announcements carry flag 1, or both sides opened each other's `<OSP:>`. Until the partner's first frame arrives, the
 side with encryption on holds everything it would send, except its announcement and the
 callee's own first handshake frames (`<Q>` / opening, queued on `CONNECTED`). If that first
-frame is not an `<OSK:>` with flag 1, the link stays in the clear and the held frames go out
-as they are.
+frame is not an `<OSK:>` with flag 1, the link stays in the clear.
+
+**Nothing the operator wrote goes out in the clear while encryption is on** (encryption on,
+or a shared key in use for that station): what they typed, a VMail (with or without
+attachments), a file, an away message. On a link that settled in the clear it is not sent:
+the operator is told, and typed text goes back to the message box (a VMail stays in the
+Outbox). Turning encryption off sends from then on, unencrypted. The rest of the QSO
+(openings, QSY, receipts, station IDs) goes on as usual.
 
 Keys: X25519 of the two link keys → HKDF-SHA256, salt `openslot link v1`, then one
 ChaCha20-Poly1305 key per direction with info

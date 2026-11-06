@@ -370,7 +370,10 @@ you'd rather arrange a key with the other station beforehand.
   the start of the link, what you type waits, so nothing meant to be private goes out in
   the clear. Your periodic station ID (`de CALL`) still goes in the clear. If the other
   station isn't Openslot, or has encryption off, the chat says **🔓 this link is NOT
-  encrypted** and everything goes out as normal. Encrypted lines show a **🔒** beside the
+  encrypted**, and **nothing you write is sent on that link**: not what you typed (it goes
+  back to the message box), not a VMail (it stays in the Outbox), not a file or your away
+  message. The chat says **🔒 NOT SENT** each time. To send it unencrypted anyway, turn
+  encryption off (the lock on the main page). Encrypted lines show a **🔒** beside the
   time.
 - **Sign my messages and VMail** (Ed25519 digital signatures). Adds a signature to what you type and to your VMail
   (VMail with attachments isn't signed). The text stays readable. Openslot stations check
@@ -388,8 +391,8 @@ you'd rather arrange a key with the other station beforehand.
   time also means that even if a shared key leaks later, recordings of earlier links can't
   be read with it alone. If the other station has no key for you, or a different one, the
   chat says **🔓 this link is NOT encrypted**. Like the option above, what you typed waits
-  until that's known, then goes out in the clear. This option works on its own, whether or
-  not *Encrypt links* is on.
+  until that's known, and nothing you write is sent on a link that isn't encrypted. This
+  option works on its own, whether or not *Encrypt links* is on.
 - **Encryption method: ChaCha20-Poly1305 or AES-256-GCM.** The cipher for either kind of
   encrypted link above; choosing it doesn't turn encryption on. Both are 256-bit and
   equally strong, and either runs fine on a normal computer. ChaCha20-Poly1305 is the
