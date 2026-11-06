@@ -232,6 +232,19 @@ pub const GATHERING_FREQUENCIES_HZ: &[u64] = &[
     24_927_000, 27_195_000, 28_105_000, 50_330_000,
 ];
 
+/// A link's width as VARA reports it on CONNECTED, for people: VARA HF gives the bandwidth
+/// in Hz ("500" → "500 Hz"), VARA FM its mode ("NARROW" → "FM narrow").
+pub fn link_width_text(bw: &str) -> String {
+    let bw = bw.trim();
+    if !bw.is_empty() && bw.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{bw} Hz")
+    } else if bw.eq_ignore_ascii_case("narrow") || bw.eq_ignore_ascii_case("wide") {
+        format!("FM {}", bw.to_ascii_lowercase())
+    } else {
+        bw.to_string()
+    }
+}
+
 pub fn is_calling_frequency(hz: u64) -> bool {
     GATHERING_FREQUENCIES_HZ.contains(&hz)
 }
@@ -899,6 +912,18 @@ mod callsign_tests {
         assert!(!is_valid_callsign("12345"));
         assert!(!is_valid_callsign("ABCDEF"));
         assert!(!is_valid_callsign("A"));
+    }
+}
+
+#[cfg(test)]
+mod link_width_tests {
+    #[test]
+    fn hf_in_hz_and_fm_by_mode() {
+        assert_eq!(super::link_width_text("500"), "500 Hz");
+        assert_eq!(super::link_width_text(" 2300 "), "2300 Hz");
+        assert_eq!(super::link_width_text("NARROW"), "FM narrow");
+        assert_eq!(super::link_width_text("WIDE"), "FM wide");
+        assert_eq!(super::link_width_text("?"), "?");
     }
 }
 

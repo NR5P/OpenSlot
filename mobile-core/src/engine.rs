@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::storage::{ChatRecord, CqFrameRecord, QsoExtra, QsoRecord, Storage, VMailFolder, VMailRecord};
-use crate::vara::commands::{Bandwidth, ListenMode, VaraCommand};
+use crate::vara::commands::{Bandwidth, ListenMode, ModemType, VaraCommand};
 use crate::vara::connection::VaraConnection;
 use crate::varac::bbs;
 use crate::varac::messages::{BbsFileOffer, IncomingMessage, ServiceFlags, VMail};
@@ -101,6 +101,44 @@ pub struct Config {
     /// ...for every band, not just the one we're on
     #[serde(default)]
     pub multi_band_last_heard: bool,
+    /// VarAC's VaraModemType: "HF" (the default) or "FM"
+    #[serde(default)]
+    pub modem_type: String,
+    /// VARA FM: digipeaters our CQs and beacons go through ("DIGI1 DIGI2"; VarAC DigipeatVia)
+    #[serde(default)]
+    pub digipeat_via: String,
+}
+
+impl Config {
+    pub fn modem(&self) -> ModemType {
+        ModemType::from_key(&self.modem_type)
+    }
+    /// VARA HF: the only modem with a bandwidth choice and the calling-frequency rules
+    pub fn hf(&self) -> bool {
+        self.modem() == ModemType::Hf
+    }
+    /// The digipeaters for CQs and beacons: VARA FM only, None when there are none
+    pub fn via(&self) -> Option<String> {
+        (self.modem() == ModemType::Fm)
+            .then(|| self.digipeat_via.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase())
+            .filter(|v| !v.is_empty())
+    }
+    /// The station to call as typed: on VARA FM "CALL VIA DIGI1 DIGI2" connects through
+    /// digipeaters (VarAC lets FM users type spaces there); everywhere else the call alone.
+    pub fn destination(&self, typed: &str) -> String {
+        let words = typed.to_uppercase();
+        let words = words.split_whitespace();
+        if self.modem() == ModemType::Fm { words.collect::<Vec<_>>().join(" ") } else { words.collect() }
+    }
+    /// A CQ or beacon frame as VarAC sends it: VARA HF announces its bandwidth, VARA FM
+    /// goes through the digipeaters instead.
+    pub fn cq_frame(&self, source: String) -> VaraCommand {
+        if self.hf() {
+            VaraCommand::CqFrame { source, bandwidth: self.bandwidth.parse().unwrap_or(500) }
+        } else {
+            VaraCommand::CqFrameNoBw { source, via: self.via() }
+        }
+    }
 }
 
 fn default_call_id() -> u64 {
@@ -544,8 +582,9 @@ impl Bridge {
         let result = async {
             let mut vara = VaraConnection::connect(&c.host, c.cmd_port, c.cmd_port + 1).await?;
             // As the desktop's modem connect (as in VarAC): VARA HF always
-            // starts at 500 Hz; one MYCALL, with the -T ping alias only when pings are allowed
-            vara.initialize_for(&self.station.callsign, Bandwidth::Bw500, crate::vara::commands::ModemType::Hf, c.allow_pings).await?;
+            // starts at 500 Hz (FM has no bandwidth command); one MYCALL, with the -T ping
+            // alias only when pings are allowed
+            vara.initialize_for(&self.station.callsign, Bandwidth::Bw500, c.modem(), c.allow_pings).await?;
             Ok::<_, std::io::Error>(vara)
         }
         .await;
@@ -560,7 +599,7 @@ impl Bridge {
                 }
                 self.session = Some(sess);
                 // (the modem is at 500 Hz now: our CQ frames and the calling-frequency checks say so)
-                if self.config.bandwidth.trim() != "500" {
+                if self.config.hf() && self.config.bandwidth.trim() != "500" {
                     self.config.bandwidth = "500".into();
                     system("Modem bandwidth set to 500 Hz (VARA HF starts at 500)");
                     // (so the app's bandwidth buttons show it)
@@ -632,7 +671,8 @@ impl Bridge {
         }
         // Off the air the bandwidth is just remembered: the modem gets it when it connects
         if let Command::Bandwidth { bw } = &cmd {
-            if self.session.is_none() {
+            // (VARA FM has no bandwidth: remembered for when the modem is HF again)
+            if self.session.is_none() || !self.config.hf() {
                 self.config.bandwidth = bw.clone();
                 return;
             }
@@ -645,7 +685,7 @@ impl Bridge {
         let sess = &mut session;
         let r = match cmd {
             Command::Connect { call: dest, .. } => {
-                let dest = dest.trim().to_uppercase();
+                let dest = self.config.destination(&dest);
                 system(format!("CALLING {dest}"));
                 sess.vara.send_command(&VaraCommand::Connect { source: call, destination: dest }).await
             }
@@ -675,8 +715,7 @@ impl Bridge {
                 // bare callsign); the move there follows once the CQ is out
                 let slot = if slots::offset_hz(slot, slots::DEFAULT_SLOT_STEP_HZ).is_some() { slot } else { 0 };
                 let source = slots::cq_source(&call, slot);
-                let bw = self.config.bandwidth.parse().unwrap_or(500);
-                let r = sess.vara.send_command(&VaraCommand::CqFrame { source: source.clone(), bandwidth: bw }).await;
+                let r = sess.vara.send_command(&self.cq_frame(source.clone())).await;
                 if r.is_ok() {
                     self.leave_slot("returned");
                     if slot == 0 {
@@ -689,8 +728,7 @@ impl Bridge {
                 r
             }
             Command::Beacon => {
-                let bw = self.config.bandwidth.parse().unwrap_or(500);
-                let r = sess.vara.send_command(&VaraCommand::CqFrame { source: format!("{call}-9"), bandwidth: bw }).await;
+                let r = sess.vara.send_command(&self.cq_frame(format!("{call}-9"))).await;
                 if r.is_ok() {
                     system("Beacon sent");
                 }
@@ -995,7 +1033,12 @@ impl Bridge {
 
     /// VarAC refuses CQ, connect, ping and beacon at 2300/2750 Hz on a calling frequency.
     fn wide_on_calling_freq(&self) -> bool {
-        self.config.bandwidth.trim() == "2300" && crate::varac::messages::is_calling_frequency(self.frequency)
+        // (VARA HF only: FM has no 500/2300/2750 Hz choice)
+        self.config.hf() && self.config.bandwidth.trim() == "2300" && crate::varac::messages::is_calling_frequency(self.frequency)
+    }
+
+    fn cq_frame(&self, source: String) -> VaraCommand {
+        self.config.cq_frame(source)
     }
 
     async fn queue_vmail(&mut self, to: String, subject: String, body: String, urgent: bool) {
@@ -1193,7 +1236,7 @@ impl Bridge {
             Err(e) => return refuse(&e.to_string()),
         };
         // VARA HF's limits on the compressed file (VarAC's words)
-        if let Some(limit) = crate::varac::session::attachment_limit(self.link_bw) {
+        if let Some(limit) = crate::varac::session::attachment_limit(self.link_bw).filter(|_| self.config.hf()) {
             if prepared.compressed_size >= limit {
                 let (k, bw) = if limit == 100_000 { ("100K", 500) } else { ("1M", 2300) };
                 return refuse(&format!("VARA HF doesn't allow files over {k} compressed at {bw} Hz ({} bytes)", prepared.compressed_size));
@@ -1281,7 +1324,7 @@ impl Bridge {
                 };
                 let extra = QsoExtra {
                     mode: "DYNAMIC".into(),
-                    submode: crate::vara::commands::ModemType::from_key("").submode().into(),
+                    submode: self.config.modem().submode().into(),
                     me_away: self.away,
                     is_ping: ping,
                     version: env!("CARGO_PKG_VERSION").into(),
@@ -1292,7 +1335,7 @@ impl Bridge {
                     system(format!("PING {partner}"));
                     return;
                 }
-                system(format!("CONNECTED TO {partner} ({bw} Hz)"));
+                system(format!("CONNECTED TO {partner} ({})", crate::varac::messages::link_width_text(&bw)));
                 self.qso_guid = Some(guid);
             }
             SessionEvent::Disconnected => {
@@ -1445,6 +1488,15 @@ impl Bridge {
                 self.last_snr = Some(db);
                 emit(json!({"type": "snr", "db": db}));
             }
+            // As the desktop: check the modem is the VARA (HF or FM) the app is set up for
+            SessionEvent::VaraEvent(crate::vara::events::VaraEvent::Version(v))
+                if !v.to_uppercase().contains(self.config.modem().version_word()) =>
+            {
+                system(format!(
+                    "The modem says \"{v}\" but the Modem tab has VARA {}: check HF or FM there.",
+                    self.config.modem().version_word()
+                ));
+            }
             SessionEvent::VaraEvent(e) => log(format!("{e:?}")),
         }
     }
@@ -1546,7 +1598,7 @@ impl Bridge {
                     "<LHJ>".to_string()
                 } else {
                     let band = (!self.config.multi_band_last_heard).then(|| band_of(self.frequency)).filter(|b| !b.is_empty());
-                    self.with_db(|d| d.last_heard(Utc::now() - chrono::Duration::hours(24), band, 10).ok())
+                    self.with_db(|d| d.last_heard(Utc::now() - chrono::Duration::hours(24), band, if self.config.hf() { 10 } else { 20 }).ok())
                         .and_then(|e| crate::varac::messages::last_heard_reply(&e))
                         .unwrap_or_else(|| "<LHE>".into())
                 };
@@ -1903,7 +1955,38 @@ pub fn query(db: &Storage, q: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::mhz;
+    use super::{Config, mhz};
+
+    fn config(extra: serde_json::Value) -> Config {
+        let mut c = serde_json::json!({"data_dir": "/tmp", "callsign": "W5TST"});
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(c).unwrap()
+    }
+
+    #[test]
+    fn hf_is_the_default_modem() {
+        let c = config(serde_json::json!({"bandwidth": "2300", "digipeat_via": "W5DIG"}));
+        assert!(c.hf());
+        assert_eq!(c.modem().submode(), "VARA HF");
+        // (no digipeaters on HF: the setting is kept for FM)
+        assert_eq!(c.via(), None);
+        assert_eq!(c.cq_frame("W5TST-9".into()).serialize(), "CQFRAME W5TST-9 2300\r");
+        // (a stray space in the call box doesn't reach the modem)
+        assert_eq!(c.destination(" k5xyz -1"), "K5XYZ-1");
+    }
+
+    #[test]
+    fn fm_cqs_go_without_a_bandwidth_and_through_the_digipeaters() {
+        let c = config(serde_json::json!({"modem_type": "FM", "bandwidth": "2300", "digipeat_via": " w5dig   k5abc "}));
+        assert!(!c.hf());
+        assert_eq!(c.modem().submode(), "VARA FM 1200");
+        assert_eq!(c.via().as_deref(), Some("W5DIG K5ABC"));
+        assert_eq!(c.cq_frame("W5TST-9".into()).serialize(), "CQFRAME W5TST-9 W5DIG K5ABC\r");
+        assert_eq!(c.destination(" k5xyz  via w5dig "), "K5XYZ VIA W5DIG");
+        let c = config(serde_json::json!({"modem_type": "fm", "digipeat_via": "  "}));
+        assert_eq!(c.via(), None);
+        assert_eq!(c.cq_frame("W5TST-12".into()).serialize(), "CQFRAME W5TST-12\r");
+    }
 
     #[test]
     fn mhz_keeps_the_digits_a_slot_needs() {

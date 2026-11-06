@@ -56,7 +56,7 @@ pub fn outgoing(path: &Path, shrink: Option<(u32, u8)>) -> Result<Outgoing, Stri
 }
 
 /// What the preview says about one version of the file.
-fn describe(name: &str, data: &[u8], limit: Option<usize>, snr: i32, bandwidth: u32) -> Value {
+fn describe(name: &str, data: &[u8], limit: Option<usize>, snr: i32, bandwidth: u32, fm: bool) -> Value {
     let compressed = bbs::compress(data).map(|c| c.len()).unwrap_or(data.len());
     // On the air it's base64 of the gzip
     let air = images::air_bytes(compressed);
@@ -65,14 +65,15 @@ fn describe(name: &str, data: &[u8], limit: Option<usize>, snr: i32, bandwidth: 
         "bytes": data.len(),
         "compressed": compressed,
         "fits": limit.is_none_or(|l| compressed < l),
-        "estimate": images::time_estimate(air, snr, bandwidth, false),
+        "estimate": images::time_estimate(air, snr, bandwidth, fm),
     })
 }
 
-/// `file_info {path, bandwidth, snr?, pct?, quality?, minutes?}`: the file picker's preview.
+/// `file_info {path, bandwidth, fm?, snr?, pct?, quality?, minutes?}`: the file picker's preview.
 ///   {name, bytes, compressed, fits, estimate, limit, image, w?, h?,
 ///    shrunk?: {pct, quality, name, bytes, compressed, fits, estimate, w, h}}
-/// `limit` is VARA HF's limit on the compressed file at that bandwidth (null: none).
+/// `limit` is VARA HF's limit on the compressed file at that bandwidth (null: none; VARA FM
+/// has none, and `fm` times the send at VARA FM's speeds).
 /// For a picture `shrunk` is the shrinker's result: at `pct` if given, else at the largest
 /// size that fits and goes in about `minutes` (0: the largest that fits; default 5).
 /// `error` when the file can't be read.
@@ -83,13 +84,14 @@ pub fn file_info(q: &Value) -> Value {
         v => v.as_u64().unwrap_or(500) as u32,
     };
     let snr = q["snr"].as_i64().unwrap_or(0) as i32;
-    let limit = attachment_limit(u16::try_from(bandwidth).ok());
+    let fm = q["fm"].as_bool().unwrap_or(false);
+    let limit = if fm { None } else { attachment_limit(u16::try_from(bandwidth).ok()) };
     let data = match std::fs::read(path) {
         Ok(d) if !d.is_empty() => d,
         Ok(_) => return json!({"error": format!("{} is empty", wire_name(path))}),
         Err(e) => return json!({"error": format!("can't read {}: {e}", wire_name(path))}),
     };
-    let mut info = describe(&wire_name(path), &data, limit, snr, bandwidth);
+    let mut info = describe(&wire_name(path), &data, limit, snr, bandwidth, fm);
     info["limit"] = json!(limit);
     info["image"] = json!(false);
     if images::is_image(path) {
@@ -105,12 +107,12 @@ pub fn file_info(q: &Value) -> Value {
                 }
                 None => {
                     let minutes = q["minutes"].as_u64().map_or(images::PHOTO_MINUTES_DEFAULT, |m| m as u32);
-                    images::starting_size(&img, quality, limit, minutes, snr, bandwidth, false)
+                    images::starting_size(&img, quality, limit, minutes, snr, bandwidth, fm)
                 }
             };
             match shrunk {
                 Ok((pct, jpg, w, h)) => {
-                    let mut s = describe(&resized_name(path), &jpg, limit, snr, bandwidth);
+                    let mut s = describe(&resized_name(path), &jpg, limit, snr, bandwidth, fm);
                     s["pct"] = json!(pct);
                     s["quality"] = json!(quality);
                     s["w"] = json!(w);
@@ -170,6 +172,26 @@ mod tests {
         assert_eq!(i["fits"], true);
         assert!(i["estimate"].as_str().unwrap().contains("min at"), "{i}");
         assert!(i.get("shrunk").is_none());
+    }
+
+    #[test]
+    fn vara_fm_has_no_size_limit_and_is_faster() {
+        let p = temp("IMG_0002.JPG", &photo(1600, 1200));
+        let hf = file_info(&json!({"path": p, "bandwidth": 500, "snr": 10}));
+        let fm = file_info(&json!({"path": p, "bandwidth": 500, "fm": true, "snr": 10}));
+        assert_eq!(fm["limit"], Value::Null, "{fm}");
+        assert_eq!(fm["fits"], true, "{fm}");
+        // (a picture at its starting size: bigger on FM, where it goes faster and nothing caps it)
+        assert!(fm["shrunk"]["pct"].as_u64().unwrap() >= hf["shrunk"]["pct"].as_u64().unwrap(), "{hf}\n{fm}");
+        // (the fast end of "a-b min" / "a-b h", in minutes)
+        let mins = |v: &Value| -> u64 {
+            let e = v["estimate"].as_str().unwrap();
+            let a: u64 = e.split(['-', ' ']).next().unwrap().parse().unwrap();
+            if e.contains(" h ") { a * 60 } else { a }
+        };
+        assert!(mins(&fm) < mins(&hf), "{hf}\n{fm}");
+        // the shared limit check doesn't stop it either
+        assert!(fm["compressed"].as_u64().unwrap() > 100_000, "the test photo should be over HF's 500 Hz limit: {fm}");
     }
 
     #[test]

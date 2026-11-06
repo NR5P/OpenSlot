@@ -228,12 +228,13 @@ struct Pill: View {
 }
 
 /// The dial frequency (tap it for the picker) and VARA HF's bandwidth buttons, as on the
-/// desktop's main screen. The phone doesn't tune the radio: picking a frequency logs it and
-/// applies the calling-frequency rules there.
+/// desktop's main screen (VARA FM has no bandwidth: an FM label instead). The phone doesn't
+/// tune the radio: picking a frequency logs it and applies the calling-frequency rules there.
 struct FrequencyBar: View {
     @EnvironmentObject var core: Core
     @AppStorage(Keys.frequency) private var frequency = 14_105_000
     @AppStorage(Keys.bandwidth) private var bandwidth = "500"
+    @AppStorage(Keys.modemType) private var modemType = "hf"
     @State private var picking = false
 
     var body: some View {
@@ -249,14 +250,18 @@ struct FrequencyBar: View {
             if let band = core.bandOf(frequency) { Pill(text: band, color: .accentColor) }
             if core.isCallingFrequency(frequency) { Pill(text: "CF", color: .orange) }
             Spacer(minLength: 4)
-            Picker("Bandwidth", selection: Binding(get: { bandwidth }, set: { core.setBandwidth($0) })) {
-                Text("500").tag("500")
-                Text("2300").tag("2300")
-                Text("2750").tag("2750")
+            if modemType == "fm" {
+                Pill(text: "VARA FM", color: .purple)
+            } else {
+                Picker("Bandwidth", selection: Binding(get: { bandwidth }, set: { core.setBandwidth($0) })) {
+                    Text("500").tag("500")
+                    Text("2300").tag("2300")
+                    Text("2750").tag("2750")
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .fixedSize()
             }
-            .pickerStyle(.segmented)
-            .controlSize(.small)
-            .fixedSize()
         }
         .padding(.horizontal).padding(.vertical, 4)
         .sheet(isPresented: $picking) { FrequencyPicker(current: frequency).environmentObject(core) }
@@ -784,7 +789,7 @@ struct StationsView: View {
                             HStack {
                                 VStack(alignment: .leading) {
                                     Text(h.call).font(.headline)
-                                    Text("\(h.beacon ? "Beacon" : "CQ") · \(h.bandwidth) Hz").font(.caption).foregroundStyle(.secondary)
+                                    Text("\(h.beacon ? "Beacon" : "CQ")" + (["", "0"].contains(h.bandwidth) ? "" : " · \(h.bandwidth) Hz")).font(.caption).foregroundStyle(.secondary)
                                     if h.slot != 0 && !h.beacon {
                                         Text("Waits on \(h.slotLabel)").font(.caption).foregroundStyle(.orange)
                                     }
@@ -1148,6 +1153,9 @@ struct ModemSettingsPage: View {
     @AppStorage(Keys.host) private var host = "192.168.1.10"
     @AppStorage(Keys.port) private var port = 8300
     @AppStorage(Keys.bandwidth) private var bandwidth = "500"
+    @AppStorage(Keys.modemType) private var modemType = "hf"
+    @AppStorage(Keys.fmWidth) private var fmWidth = "narrow"
+    @AppStorage(Keys.digipeatVia) private var digipeatVia = ""
     @AppStorage(Keys.ptt) private var ptt = "vox"
     @AppStorage(Keys.rigctld) private var rigctld = "192.168.1.10:4532"
     @AppStorage(Keys.driveDb) private var driveDb = -5.0
@@ -1166,7 +1174,7 @@ struct ModemSettingsPage: View {
     private var online: Bool { core.modemConnected || core.modemRunning }
     /// Everything that takes a restart, to notice a change.
     private var restartKey: String {
-        "\(source) \(host) \(port) \(ptt) \(rigctld) \(driveDb) \(allowBuiltIn) \(registered) \(monitor) " +
+        "\(source) \(modemType) \(fmWidth) \(digipeatVia) \(host) \(port) \(ptt) \(rigctld) \(driveDb) \(allowBuiltIn) \(registered) \(monitor) " +
             "\(monitorFrames) \(monitorCalls) \(debugLog) \(recordAudio) \(lan) \(uiControl)"
     }
 
@@ -1179,8 +1187,15 @@ struct ModemSettingsPage: View {
                 }
                 if source == "builtin" { Text("Audio: \(core.route)").font(.caption).foregroundStyle(.secondary) }
                 Button(online ? "Stop" : "Start", role: online ? .destructive : nil) {
+                    // (settings changed while stopped: the engine takes them before going on the air)
+                    let restart = changed && !online
                     changed = false
-                    Task { if online { await core.goOffline() } else { await core.goOnline() } }
+                    Task {
+                        if online { await core.goOffline() } else {
+                            if restart { core.startEngine() }
+                            await core.goOnline()
+                        }
+                    }
                 }
                 if online && changed {
                     Button("Restart with the new settings") {
@@ -1192,20 +1207,42 @@ struct ModemSettingsPage: View {
                 if online && changed { Text("The modem uses the new settings once it restarts.") }
             }
 
-            Section("Modem") {
+            Section {
                 Picker("Modem", selection: $source) {
                     Text("XARA on this phone").tag("builtin")
                     Text("VARA on the network").tag("network")
                 }
-                Picker("Bandwidth", selection: $bandwidth) {
-                    Text("500 Hz").tag("500")
-                    Text("2300 Hz").tag("2300")
-                    Text("2750 Hz").tag("2750")
+                Picker("VARA", selection: $modemType) {
+                    Text("HF").tag("hf")
+                    Text("FM").tag("fm")
                 }
-                .onChange(of: bandwidth) { core.setBandwidth(bandwidth) }
+                .pickerStyle(.segmented)
+                if modemType == "fm" {
+                    if source == "builtin" {
+                        Picker("FM mode", selection: $fmWidth) {
+                            Text("Narrow").tag("narrow")
+                            Text("Wide").tag("wide")
+                        }
+                    }
+                    TextField("Digipeat via (optional)", text: $digipeatVia)
+                        .textInputAutocapitalization(.characters).autocorrectionDisabled()
+                } else {
+                    Picker("Bandwidth", selection: $bandwidth) {
+                        Text("500 Hz").tag("500")
+                        Text("2300 Hz").tag("2300")
+                        Text("2750 Hz").tag("2750")
+                    }
+                    .onChange(of: bandwidth) { core.setBandwidth(bandwidth) }
+                }
                 if source != "builtin" {
                     TextField("Host", text: $host).autocorrectionDisabled().textInputAutocapitalization(.never).keyboardType(.URL)
                     TextField("Command port", value: $port, format: .number.grouping(.never)).keyboardType(.numberPad)
+                }
+            } header: { Text("Modem") } footer: {
+                if modemType == "fm" {
+                    Text(source == "builtin"
+                         ? "VARA FM, for VHF/UHF radios: narrow for most FM radios through the mic and speaker jacks, wide for a 9600-baud data port. CQs and beacons go through the digipeaters you list (space between them); to connect through one, call \"CALL VIA DIGI\". No 500/2300 Hz choice and no calling-frequency rules on FM."
+                         : "Run VARA FM on the network computer. CQs and beacons go through the digipeaters you list (space between them); to connect through one, call \"CALL VIA DIGI\".")
                 }
             }
 

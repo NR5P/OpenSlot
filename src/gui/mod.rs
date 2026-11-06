@@ -536,7 +536,7 @@ impl VaracApp {
                         });
                         continue;
                     }
-                    let bw_str = bandwidth.as_deref().unwrap_or("?");
+                    let bw_str = crate::varac::messages::link_width_text(bandwidth.as_deref().unwrap_or("?"));
                     self.state.session_state = SessionState::Connected;
                     self.state.connected_to = Some(destination.clone());
                     self.state.connection_start = Some(Utc::now());
@@ -544,13 +544,13 @@ impl VaracApp {
                     self.state.cq_active = false;
                     self.state.last_connect_callsign = None;
                     self.state.qso_alert_fired = false;
-                    self.state.status_msg = format!("Connected to {destination} ({bw_str} Hz)");
+                    self.state.status_msg = format!("Connected to {destination} ({bw_str})");
                     let band = &self.state.current_band;
                     let freq_mhz = self.state.current_frequency as f64 / 1_000_000.0;
                     self.state.add_system_chat(format!("CONNECTED TO {destination} on {band} ({freq_mhz:.3} MHz)"));
                     sound::narrate(sound::Topic::AlertsAndNotifications, format!("Connected to {}", sound::phonetic(&destination)));
                     if self.state.settings_form.notifications_enabled {
-                        send_notification("Connected", &format!("{destination} ({bw_str} Hz)"));
+                        send_notification("Connected", &format!("{destination} ({bw_str})"));
                     }
                     {
                         sound::play(if incoming_link { sound::Sound::IncomingConnection } else { sound::Sound::Connected });

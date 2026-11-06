@@ -7,6 +7,8 @@ enum Keys {
     static let call = "call", name = "name", qth = "qth", locator = "locator"
     static let modemSource = "modemSource"  // "builtin" (XARA on this phone) or "network"
     static let host = "host", port = "port", bandwidth = "bandwidth", frequency = "frequency"
+    // VARA HF or FM ("hf" / "fm"); FM: XARA's narrow or wide, and the digipeaters for CQs and beacons
+    static let modemType = "modemType", fmWidth = "fmWidth", digipeatVia = "digipeatVia"
     static let ptt = "ptt", rigctld = "rigctld", driveDb = "driveDb"
     static let allowBuiltIn = "allowBuiltIn", registered = "registered"
     static let allowInfo = "allowInfo", allowPings = "allowPings", verboseSnrAuto = "verboseSnrAuto"
@@ -75,6 +77,12 @@ struct Settings {
     var host: String { builtIn ? "127.0.0.1" : (Self.d.string(forKey: Keys.host) ?? "192.168.1.10") }
     var port: Int { builtIn ? 8300 : (Self.d.object(forKey: Keys.port) as? Int ?? 8300) }
     var bandwidth: String { Self.d.string(forKey: Keys.bandwidth) ?? "500" }
+    /// VARA FM instead of VARA HF (no bandwidth choice, no calling-frequency rules)
+    var fm: Bool { Self.d.string(forKey: Keys.modemType) == "fm" }
+    var fmWidth: String { Self.d.string(forKey: Keys.fmWidth) == "wide" ? "wide" : "narrow" }
+    var digipeatVia: String {
+        (Self.d.string(forKey: Keys.digipeatVia) ?? "").uppercased().split(whereSeparator: { $0 == " " || $0 == "," }).joined(separator: " ")
+    }
     var frequency: Int { Self.d.object(forKey: Keys.frequency) as? Int ?? 14_105_000 }
     var ptt: String { Self.d.string(forKey: Keys.ptt) ?? "vox" }
     var rigctld: String { Self.d.string(forKey: Keys.rigctld) ?? "192.168.1.10:4532" }
@@ -141,13 +149,14 @@ struct Settings {
 
     var engineConfig: [String: Any] {
         ["data_dir": Self.documents.path, "callsign": call, "name": name, "qth": qth, "locator": locator,
-         "host": host, "cmd_port": port, "bandwidth": bandwidth, "frequency": frequency]
+         "host": host, "cmd_port": port, "bandwidth": bandwidth, "frequency": frequency,
+         "modem_type": fm ? "FM" : "HF", "digipeat_via": digipeatVia]
             .merging(policy) { a, _ in a }
     }
 
     /// XARA's options: audio through the current iOS route (the radio's USB interface).
     var modemArguments: [String] {
-        var a = ["--call", call, "--hf", bandwidth]
+        var a = ["--call", call] + (fm ? ["--fm", fmWidth] : ["--hf", bandwidth])
         a += ["--capture", "route", "--playback", "route", "--radio"]
         a += ["--ptt", ptt == "rigctld" ? "rigctld:\(rigctld)" : "vox"]
         a += ["--drive-db", String(format: "%.1f", driveDb)]
@@ -526,7 +535,8 @@ final class Core: ObservableObject {
     /// the link, the time it takes, and for a picture the shrinker's result at `pct` (nil:
     /// the largest size that fits). Shrinking a photo takes a moment: run off the main thread.
     nonisolated static func fileInfo(path: String, bandwidth: String, snr: Int, pct: Int?, quality: Int, minutes: Int) async -> [String: Any] {
-        var q: [String: Any] = ["q": "file_info", "path": path, "bandwidth": bandwidth, "snr": snr, "quality": quality, "minutes": minutes]
+        var q: [String: Any] = ["q": "file_info", "path": path, "bandwidth": bandwidth, "fm": Settings().fm,
+                                "snr": snr, "quality": quality, "minutes": minutes]
         if let pct { q["pct"] = pct }
         guard let data = try? JSONSerialization.data(withJSONObject: q),
               let json = String(data: data, encoding: .utf8) else { return ["error": "The file couldn't be read."] }

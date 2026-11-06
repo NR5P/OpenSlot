@@ -23,7 +23,9 @@ A SwiftUI app around the Rust core (`../mobile-core`), with the **XARA modem bui
 - **VMail**: Inbox, Outbox, Sent, Parked; read, reply, compose. VMail to a station you're
   not in a QSO with waits in the Outbox and goes out on your next QSO with it
 - **Modem**: the NR5P XARA app inside Openslot. Start/Stop; the modem (XARA on this
-  phone, or VARA on the network), PTT (VOX or rigctld), TX drive, **Registered (I hold a
+  phone, or VARA on the network); **VARA HF or FM** (FM: XARA's narrow or wide mode, the
+  digipeaters CQs and beacons go through, and "CALL VIA DIGI" to connect through one; no
+  bandwidth choice, calling-frequency rules or file size limits, as VarAC on FM); PTT (VOX or rigctld), TX drive, **Registered (I hold a
   VARA licence)**, showing other stations' traffic, debug log and recording, clients on
   the local network and web UI control; and its Web UI (waterfall and status), Received
   and Log pages
