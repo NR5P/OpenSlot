@@ -66,6 +66,17 @@ fn config(call: &str, name: &str) -> StationConfig {
     cfg
 }
 
+/// How the pretend air behaves.
+#[derive(Clone, Copy)]
+struct Opts {
+    /// The two stations' callsigns (as configured, SSID and all)
+    calls: (&'static str, &'static str),
+    /// Hand each frame over in small pieces, a moment apart (as VARA's data port does)
+    chunked: bool,
+}
+
+const PLAIN: Opts = Opts { calls: ("N0AAA", "N0BBB"), chunked: false };
+
 /// Two stations, N0AAA and N0BBB, on one air. `delay_ab` / `delay_ba`: how long a frame
 /// takes each way.
 async fn two_stations(
@@ -74,9 +85,19 @@ async fn two_stations(
     delay_ab: Duration,
     delay_ba: Duration,
 ) -> (VaracSession, VaracSession, Air) {
+    two_stations_with(PLAIN, sa, sb, delay_ab, delay_ba).await
+}
+
+async fn two_stations_with(
+    opts: Opts,
+    sa: impl FnOnce(&SecurePolicy),
+    sb: impl FnOnce(&SecurePolicy),
+    delay_ab: Duration,
+    delay_ba: Duration,
+) -> (VaracSession, VaracSession, Air) {
     let (va, ac, ad) = modem().await;
     let (vb, bc, bd) = modem().await;
-    let (ca, cb) = (config("N0AAA", "Alice"), config("N0BBB", "Bob"));
+    let (ca, cb) = (config(opts.calls.0, "Alice"), config(opts.calls.1, "Bob"));
     sa(&ca.policy.secure);
     sb(&cb.policy.secure);
     let (a, b) = (VaracSession::new(va, ca), VaracSession::new(vb, cb));
@@ -130,10 +151,24 @@ async fn two_stations(
                 let _ = tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
             }
         });
+        let chunked = opts.chunked;
         tokio::spawn(async move {
+            let mut rng = Rng(0x2545_F491_4F6C_DD1D);
             while let Some((at, bytes)) = rx.recv().await {
                 tokio::time::sleep_until(at).await;
-                if to.lock().await.write_all(&bytes).await.is_err() || sender_cmd.lock().await.write_all(b"BUFFER 0\r").await.is_err() {
+                let mut rest = &bytes[..];
+                let mut ok = true;
+                while !rest.is_empty() && ok {
+                    // (a few bytes at a time, a few ms apart: each lands as its own read)
+                    // (a big frame in proportionally bigger pieces, so it isn't slowed to a crawl)
+                    let n = if chunked { (1 + rng.next() as usize % (bytes.len() / 20).max(40)).min(rest.len()) } else { rest.len() };
+                    ok = to.lock().await.write_all(&rest[..n]).await.is_ok();
+                    rest = &rest[n..];
+                    if chunked && !rest.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                    }
+                }
+                if !ok || sender_cmd.lock().await.write_all(b"BUFFER 0\r").await.is_err() {
                     break;
                 }
             }
@@ -292,9 +327,13 @@ fn expect_encrypted(a: Mode, b: Mode) -> bool {
 /// once and as sent, the link must be what both settings say, nothing secret may be heard
 /// on the air when it's encrypted, and no false warnings.
 async fn qso(ma: Mode, mb: Mode, delay_ab: u64, delay_ba: u64) {
-    let tag = format!("{ma:?} -> {mb:?} (delay {delay_ab}/{delay_ba} ms)");
-    let (mut a, mut b, air) = two_stations(|p| ma.apply(p), |p| mb.apply(p), Duration::from_millis(delay_ab), Duration::from_millis(delay_ba)).await;
-    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: "N0BBB".into() }).await.unwrap();
+    qso_with(PLAIN, ma, mb, delay_ab, delay_ba).await;
+}
+
+async fn qso_with(opts: Opts, ma: Mode, mb: Mode, delay_ab: u64, delay_ba: u64) {
+    let tag = format!("{ma:?} -> {mb:?} (delay {delay_ab}/{delay_ba} ms, {:?}, chunked {})", opts.calls, opts.chunked);
+    let (mut a, mut b, air) = two_stations_with(opts, |p| ma.apply(p), |p| mb.apply(p), Duration::from_millis(delay_ab), Duration::from_millis(delay_ba)).await;
+    a.vara.send_command(&VaraCommand::Connect { source: opts.calls.0.into(), destination: opts.calls.1.into() }).await.unwrap();
     // (typed as soon as the link is up, before anything came from the other side)
     let (mut ea, mut eb) = (Vec::new(), Vec::new());
     while a.state != SessionState::Connected || b.state != SessionState::Connected {
@@ -656,7 +695,8 @@ async fn interference_on_an_encrypted_link() {
 
 /// A connected QSO between the two (caller A), handshakes done.
 async fn connect(a: &mut VaracSession, b: &mut VaracSession, to: &str) -> (Vec<SessionEvent>, Vec<SessionEvent>) {
-    a.vara.send_command(&VaraCommand::Connect { source: "N0AAA".into(), destination: to.into() }).await.unwrap();
+    let me = a.config.callsign.clone();
+    a.vara.send_command(&VaraCommand::Connect { source: me, destination: to.into() }).await.unwrap();
     until_handshakes(a, b, 15_000).await
 }
 
@@ -996,4 +1036,96 @@ async fn files_vmail_and_away_withheld_on_a_clear_link() {
         let (_, eb) = run2(&mut a, &mut b, 4000).await;
         assert!(eb.iter().any(|e| matches!(e, SessionEvent::Message(IncomingMessage::BbsFilePayload(_)))), "{tag}: {eb:?}");
     }
+}
+
+// === Round four: frames in pieces, SSIDs ===
+
+/// Frames handed over in small pieces (VARA's data port doesn't keep frame boundaries):
+/// every kind of link still reads them whole, both ways, slow air or not.
+#[tokio::test]
+async fn frames_in_pieces() {
+    let opts = Opts { chunked: true, ..PLAIN };
+    for (ma, mb, d_ab, d_ba) in [
+        (Mode::Off, Mode::Off, 0, 0), (Mode::Sign, Mode::Sign, 0, 0), (Mode::Enc, Mode::Enc, 0, 0),
+        (Mode::EncSign, Mode::EncAes, 0, 0), (Mode::Shared(0), Mode::SharedAes(0), 0, 0),
+        (Mode::Enc, Mode::Off, 0, 0), (Mode::Off, Mode::Sign, 0, 0), (Mode::Enc, Mode::Enc, 2000, 0),
+    ] {
+        qso_with(opts, ma, mb, d_ab, d_ba).await;
+    }
+}
+
+/// A file and a VMail with attachments, encrypted, in pieces: arrives whole, with the
+/// progress shown on the way.
+#[tokio::test]
+async fn encrypted_file_in_pieces() {
+    let opts = Opts { chunked: true, ..PLAIN };
+    let data: Vec<u8> = (0..1500u32).flat_map(|i| format!("row {i} {}\n", i.wrapping_mul(2_654_435_761)).into_bytes()).collect();
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Off, Mode::Off)] {
+        let tag = format!("{ma:?} -> {mb:?}");
+        let (mut a, mut b, _air) = two_stations_with(opts, |p| ma.apply(p), |p| mb.apply(p), Duration::ZERO, Duration::ZERO).await;
+        connect(&mut a, &mut b, "N0BBB").await;
+        let prepared = crate::varac::bbs::prepare_file("rows.txt", &data).unwrap();
+        let payload = prepared.base64_payload.clone();
+        a.send_file(prepared).await.unwrap();
+        let (_, eb) = run2(&mut a, &mut b, 12_000).await;
+        let got: Vec<&Vec<u8>> = eb.iter().filter_map(|e| match e {
+            SessionEvent::Message(IncomingMessage::BbsFilePayload(d)) => Some(d),
+            _ => None,
+        }).collect();
+        assert_eq!(got.len(), 1, "{tag}: {:?}", eb.iter().filter(|e| !matches!(e, SessionEvent::RxProgress { .. })).collect::<Vec<_>>());
+        assert_eq!(got[0].as_slice(), payload.as_bytes(), "{tag}");
+        let progress = eb.iter().filter(|e| matches!(e, SessionEvent::RxProgress { .. })).count();
+        assert!(progress > 3, "{tag}: progress shown {progress} times");
+        assert!(alarms(&eb).is_empty(), "{tag}: {:?}", alarms(&eb));
+        let mut v = vmail("Photos", "See attached");
+        v.has_attachment = true;
+        a.send_vmail_with_attachments(&v, &[("map.txt".into(), b"grid EM12kp".to_vec())]).await.unwrap();
+        let (_, eb) = run2(&mut a, &mut b, 8000).await;
+        assert_eq!(vmails(&eb).iter().map(|v| v.body.as_str()).collect::<Vec<_>>(), ["See attached"], "{tag}");
+    }
+}
+
+/// Stations with SSIDs: keys, signatures and shared keys go by the base callsign, so it
+/// all works whatever SSID either side uses, and a key saved from one SSID is known from
+/// another.
+#[tokio::test]
+async fn stations_with_ssids() {
+    let opts = Opts { calls: ("N0AAA-1", "N0BBB-7"), chunked: false };
+    for (ma, mb) in [(Mode::Enc, Mode::Enc), (Mode::Sign, Mode::Sign), (Mode::EncSign, Mode::Off), (Mode::Off, Mode::Off)] {
+        qso_with(opts, ma, mb, 0, 0).await;
+    }
+    // a shared key typed in for the base callsign, a station that calls with an SSID
+    let (mut a, mut b, air) = two_stations_with(opts, |p| {
+        p.set_shared(true);
+        p.add_shared(secure::SharedKey::new("net", "N0BBB", KEYS[0]).unwrap());
+    }, |p| {
+        p.set_shared(true);
+        p.add_shared(secure::SharedKey::new("net", "n0aaa-3", KEYS[0]).unwrap());
+    }, Duration::ZERO, Duration::ZERO).await;
+    connect(&mut a, &mut b, "N0BBB-7").await;
+    assert!(a.secure.is_encrypted() && b.secure.is_encrypted());
+    a.send_typed("by base call").await.unwrap();
+    let (_, eb) = run2(&mut a, &mut b, 2500).await;
+    assert_eq!(texts(&eb), ["by base call"]);
+    assert!(!air.heard().join("|").contains("by base call"));
+
+    // the key saved from N0AAA-1 is the one N0AAA-5 is checked against
+    let dir = std::env::temp_dir().join(format!("openslot-ssid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (fa, fb) = (dir.join("a.json"), dir.join("b.json"));
+    for (round, calls) in [("N0AAA-1", "N0BBB-7"), ("N0AAA-5", "N0BBB")].into_iter().enumerate() {
+        let (pa, pb) = (fa.clone(), fb.clone());
+        let (mut a, mut b, _air) = two_stations_with(Opts { calls, chunked: false }, move |p| {
+            p.open_keyring(pa);
+            p.set(true, false);
+        }, move |p| {
+            p.open_keyring(pb);
+            p.set(true, false);
+        }, Duration::ZERO, Duration::ZERO).await;
+        let (_, eb) = connect(&mut a, &mut b, calls.1).await;
+        let want = if round == 0 { "first contact" } else { "known since" };
+        assert!(notes(&eb).iter().any(|n| matches!(n, SecureNote::Link { encrypted: true, text } if text.contains(want))), "round {round}: {:?}", notes(&eb));
+        assert_eq!(b.config.policy.secure.stations().iter().map(|s| s.call.clone()).collect::<Vec<_>>(), ["N0AAA"]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

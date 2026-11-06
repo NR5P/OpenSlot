@@ -2302,6 +2302,9 @@ impl VaracSession {
             }
             // (our key announcement and a station ID on its own stay in the clear)
             if self.secure.is_encrypted() && !crate::varac::secure::is_announcement(&text) && !crate::varac::secure::is_station_id(&text) {
+                // (signed while the link wasn't settled yet: the encrypted link proves who
+                // sent it, so the signature doesn't go along)
+                text = crate::varac::secure::strip_signatures(&text);
                 let sealed = self.secure.seal(&text).ok_or_else(|| std::io::Error::other("encryption failed: frame not sent"))?;
                 frame = framing::encode_frame(&sealed);
             }

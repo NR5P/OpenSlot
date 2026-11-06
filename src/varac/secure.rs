@@ -325,9 +325,34 @@ impl std::fmt::Debug for Keyring {
 }
 
 impl Keyring {
+    /// The key file at `path` (none there yet: an empty one). It holds our private key and
+    /// what we know of other stations, so it's never overwritten when it can't be read: a
+    /// damaged one is set aside (`keys.json.damaged-…`) before starting afresh, and one that
+    /// can't be opened right now (locked by a sync, no access) is left alone for this run.
     pub fn open(path: PathBuf) -> Self {
-        let file = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        Self { path: Some(path), file }
+        match std::fs::read_to_string(&path) {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(file) => Self { path: Some(path), file },
+                Err(e) => {
+                    let aside = path.with_extension(format!("json.damaged-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => {
+                            tracing::warn!("{} is damaged ({e}): kept as {}, starting a new one", path.display(), aside.display());
+                            Self { path: Some(path), file: KeyringFile::default() }
+                        }
+                        Err(re) => {
+                            tracing::warn!("{} is damaged ({e}) and couldn't be set aside ({re}): keys kept in memory only", path.display());
+                            Self { path: None, file: KeyringFile::default() }
+                        }
+                    }
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self { path: Some(path), file: KeyringFile::default() },
+            Err(e) => {
+                tracing::warn!("{} can't be read ({e}): left as it is, keys kept in memory only this run", path.display());
+                Self { path: None, file: KeyringFile::default() }
+            }
+        }
     }
 
     fn save(&self) {
@@ -336,8 +361,11 @@ impl Keyring {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok(json) = serde_json::to_string_pretty(&self.file) else { return };
-        if let Err(e) = std::fs::write(path, json) {
+        // (written beside it, then swapped in: a crash or a full disk never leaves half a file)
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)) {
             tracing::warn!("keys not saved to {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
             return;
         }
         // (it holds our private key)
@@ -1243,6 +1271,47 @@ mod tests {
             assert_eq!(b.open(&a.seal("still").unwrap()).unwrap(), "still");
             assert_eq!(a.open(&b.seal("here").unwrap()).unwrap(), "here");
         }
+    }
+
+    /// The key file: saved and read back; a damaged one set aside, never overwritten; one
+    /// that can't be read left alone.
+    #[test]
+    fn key_file_is_never_lost() {
+        let dir = std::env::temp_dir().join(format!("openslot-keyfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("keys.json");
+        let p = SecurePolicy::default();
+        p.open_keyring(path.clone());
+        p.set(false, true);
+        let mine = p.my_fingerprint().unwrap();
+        let (_, kb) = Link::start(&policy(false, true), "K1ABC", "W1AW");
+        Link::start(&p, "W1AW", "K1ABC").0.partner_key(&p, payload(&kb.unwrap()));
+        assert!(!dir.join("keys.json.tmp").exists(), "no temporary file left behind");
+        let again = SecurePolicy::default();
+        again.open_keyring(path.clone());
+        assert_eq!((again.my_fingerprint(), again.stations().len()), (Some(mine.clone()), 1));
+
+        // damaged (half written by something else): set aside with everything in it
+        let good = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+        let fresh = SecurePolicy::default();
+        fresh.open_keyring(path.clone());
+        fresh.set(false, true);
+        assert_ne!(fresh.my_fingerprint(), Some(mine.clone()));
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("keys.json.damaged-")).collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(aside[0].path()).unwrap(), &good[..good.len() / 2]);
+
+        // can't be read (here: a folder where the file should be): left as it is
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let b = SecurePolicy::default();
+        b.open_keyring(blocked.clone());
+        b.set(true, true);
+        assert!(b.my_fingerprint().is_some(), "still works, in memory");
+        assert!(blocked.is_dir(), "not replaced");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

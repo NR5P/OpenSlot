@@ -952,6 +952,15 @@ async fn handle_session_event(
         }
         SessionEvent::Handshake(step) => app.add_log(format!("Handshake: {step}")),
         SessionEvent::Notice(m) => app.add_log(m),
+        // Encryption on, link not encrypted: say so in the chat, and give back what was typed
+        SessionEvent::Secure(crate::varac::secure::SecureNote::Withheld { text, typed }) => {
+            app.add_log(text.clone());
+            app.add_system_chat(text);
+            if !typed.is_empty() {
+                let back = typed.iter().map(|t| t.replace("\r\n", "\n")).collect::<Vec<_>>().join("\n");
+                app.input = if app.input.is_empty() { back } else { format!("{back}\n{}", app.input) };
+            }
+        }
         SessionEvent::Secure(n) => app.add_log(n.text().to_string()),
         // No countdown window here: accept straight away (a frequency we can't place, no)
         SessionEvent::QsyInvitation { target, .. } => {
